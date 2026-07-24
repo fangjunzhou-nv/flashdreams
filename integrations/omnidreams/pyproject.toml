@@ -70,6 +70,7 @@ interactive-drive = [
 ]
 dev = [
     "pytest>=8.0",
+    "pytest-benchmark>=5.1",
     "pytest-manual-marker>=2.0",
     # ``omnidreams.interactive_drive`` test-only deps.
     "pyvirtualdisplay>=3.0",
