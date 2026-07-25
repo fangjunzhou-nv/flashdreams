@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
+import nvtx
 from loguru import logger
 from omnidreams.interactive_drive.backends.base import RenderBackend
 from omnidreams.interactive_drive.config import (
@@ -119,14 +120,16 @@ class WorldModelRenderBackend(RenderBackend):
             f"total_ms={(prepare_end - load_start) * 1000.0:.1f}",
         )
 
+    @nvtx.annotate("render_first_chunk")
     def render_first_chunk(self, trajectory: TrajectoryChunk) -> FrameChunk:
         scene = self._require_scene()
         chunk_start = time.perf_counter()
         if self._debug_first_chunk_condition_frames is None:
-            raster_chunk = self._rasterizer.render_chunk(
-                rig_poses_world=trajectory.rig_poses_world,
-                timestamps_us=trajectory.timestamps_us,
-            )
+            with nvtx.annotate("rasterizer_chunk_rendering"):
+                raster_chunk = self._rasterizer.render_chunk(
+                    rig_poses_world=trajectory.rig_poses_world,
+                    timestamps_us=trajectory.timestamps_us,
+                )
             raster_end = time.perf_counter()
             condition_frames = [frame.rgb_host_uint8 for frame in raster_chunk.frames]
             display_frames = raster_chunk.frames
@@ -154,15 +157,17 @@ class WorldModelRenderBackend(RenderBackend):
                 f"dir={self._manifest.debug_condition_frame_dir}",
             )
         _log_prompt_handoff("first_chunk.start", scene)
-        model_frames = self._session.start(
-            scene.initial_rgb, condition_frames, scene.prompt
-        )
+        with nvtx.annotate("start_generation"):
+            model_frames = self._session.start(
+                scene.initial_rgb, condition_frames, scene.prompt
+            )
         model_end = time.perf_counter()
-        merged_frames = self._merge_frames(
-            display_frames,
-            model_frames,
-            annotate_first_transition=True,
-        )
+        with nvtx.annotate("merge_frames"):
+            merged_frames = self._merge_frames(
+                display_frames,
+                model_frames,
+                annotate_first_transition=True,
+            )
         merge_end = time.perf_counter()
         logger.info(
             "[world-model] first_chunk "
@@ -186,18 +191,22 @@ class WorldModelRenderBackend(RenderBackend):
             ),
         )
 
+    @nvtx.annotate("render_next_chunk")
     def render_next_chunk(self, trajectory: TrajectoryChunk) -> FrameChunk:
         self._require_scene()
         chunk_start = time.perf_counter()
-        raster_chunk = self._rasterizer.render_chunk(
-            rig_poses_world=trajectory.rig_poses_world,
-            timestamps_us=trajectory.timestamps_us,
-        )
+        with nvtx.annotate("rasterizer_chunk_rendering"):
+            raster_chunk = self._rasterizer.render_chunk(
+                rig_poses_world=trajectory.rig_poses_world,
+                timestamps_us=trajectory.timestamps_us,
+            )
         raster_end = time.perf_counter()
         condition_frames = [frame.rgb_host_uint8 for frame in raster_chunk.frames]
-        model_frames = self._session.continue_generation(condition_frames)
+        with nvtx.annotate("continue_generation"):
+            model_frames = self._session.continue_generation(condition_frames)
         model_end = time.perf_counter()
-        merged_frames = self._merge_frames(raster_chunk.frames, model_frames)
+        with nvtx.annotate("merge_frames"):
+            merged_frames = self._merge_frames(raster_chunk.frames, model_frames)
         merge_end = time.perf_counter()
         self._next_chunk_count += 1
         total_ms = (merge_end - chunk_start) * 1000.0

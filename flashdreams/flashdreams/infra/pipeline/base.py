@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Generic
 
+import nvtx
 import torch
 import torch.nn as nn
 from loguru import logger
@@ -147,6 +148,7 @@ class StreamInferencePipeline(
     def device(self) -> torch.device:
         return self.diffusion_model.device
 
+    @nvtx.annotate("initialize_cache")
     def initialize_cache(
         self,
         transformer_context: dict[str, Any] | None = None,
@@ -191,6 +193,7 @@ class StreamInferencePipeline(
         )
 
     @torch.no_grad()
+    @nvtx.annotate("generate")
     def generate(
         self,
         autoregressive_index: int,
@@ -227,41 +230,44 @@ class StreamInferencePipeline(
             events = EventProfiler()
             cache.event_profiler = events
 
-        if input is not None:
-            assert self.encoder is not None, (
-                "input was provided but the pipeline has no encoder. "
-                "Configure StreamInferencePipelineConfig.encoder (e.g. with "
-                "NullEncoderConfig() for an identity passthrough)."
-            )
-            assert cache.encoder_cache is not None  # invariant: paired with encoder
-            input = self.encoder(
-                input=input,
-                autoregressive_index=autoregressive_index,
-                cache=cache.encoder_cache,
-            )
+        with nvtx.annotate("encode"):
+            if input is not None:
+                assert self.encoder is not None, (
+                    "input was provided but the pipeline has no encoder. "
+                    "Configure StreamInferencePipelineConfig.encoder (e.g. with "
+                    "NullEncoderConfig() for an identity passthrough)."
+                )
+                assert cache.encoder_cache is not None  # invariant: paired with encoder
+                input = self.encoder(
+                    input=input,
+                    autoregressive_index=autoregressive_index,
+                    cache=cache.encoder_cache,
+                )
 
         if events is not None:
             events.record("encode")
 
-        clean_latent, final_state = self.diffusion_model.generate(
-            autoregressive_index=autoregressive_index,
-            cache=cache.transformer_cache,
-            input=input,
-        )
-        cache.final_state = final_state
+        with nvtx.annotate("diffuse"):
+            clean_latent, final_state = self.diffusion_model.generate(
+                autoregressive_index=autoregressive_index,
+                cache=cache.transformer_cache,
+                input=input,
+            )
+            cache.final_state = final_state
 
         if events is not None:
             events.record("diffuse")
 
-        if self.decoder is not None:
-            assert cache.decoder_cache is not None  # invariant: paired with decoder
-            output = self.decoder(
-                input=clean_latent,
-                autoregressive_index=autoregressive_index,
-                cache=cache.decoder_cache,
-            )
-        else:
-            output = clean_latent
+        with nvtx.annotate("decode"):
+            if self.decoder is not None:
+                assert cache.decoder_cache is not None  # invariant: paired with decoder
+                output = self.decoder(
+                    input=clean_latent,
+                    autoregressive_index=autoregressive_index,
+                    cache=cache.decoder_cache,
+                )
+            else:
+                output = clean_latent
 
         if events is not None:
             events.record("decode")
@@ -269,6 +275,7 @@ class StreamInferencePipeline(
         return output
 
     @torch.no_grad()
+    @nvtx.annotate("finalize")
     def finalize(
         self,
         autoregressive_index: int,

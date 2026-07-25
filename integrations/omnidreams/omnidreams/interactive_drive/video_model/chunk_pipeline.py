@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+import nvtx
 from loguru import logger
 from omnidreams.interactive_drive.types import (
     FrameChunk,
@@ -190,6 +191,7 @@ class ChunkPipeline:
 
         self._command_queue.put(load_scene_command)
 
+    @nvtx.annotate("request_pose_chunk")
     def request_pose_chunk(self, request: ChunkRequest) -> None:
         self._raise_worker_error_if_any()
 
@@ -198,6 +200,7 @@ class ChunkPipeline:
         trace_dependency_event = request.trace_dependency_event
         submit_generation = self.current_generation
 
+        @nvtx.annotate("render_command")
         def render_command(backend: VideoModelBackend) -> bool:
             trace_context = (
                 self._trace_context if chunk_times.chunk_index >= 1 else None
