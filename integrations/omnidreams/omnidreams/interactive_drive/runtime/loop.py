@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
+import nvtx
 from loguru import logger
 from omnidreams.interactive_drive.input.backend import InputBackend
 from omnidreams.interactive_drive.runtime.runtime_controls import RuntimeControls
@@ -451,7 +452,8 @@ def run_main_loop(
         reset_input_to_present_profile_window()
 
     while not presenter.should_close:
-        presenter.process_events()
+        with nvtx.annotate("process_events"):
+            presenter.process_events()
         if presenter.should_close:
             break
         if runtime_controls.consume_reset_request():
@@ -460,7 +462,8 @@ def run_main_loop(
             trace_context if state.last_consumed_chunk_index is not None else None
         )
         input_sample_begin = time.perf_counter()
-        sampled = input_backend.sample()
+        with nvtx.annotate("input_sample"):
+            sampled = input_backend.sample()
         input_sample_end = time.perf_counter()
         last_input_sample_event = _trace_main_range(
             active_trace,
@@ -472,40 +475,43 @@ def run_main_loop(
 
         # Keep one chunk in flight.
         if should_request_chunk(state):
-            chunk_request = make_chunk_request(
-                state=state,
-                simulation=simulation,
-                command=sampled.command,
-                input_sample_time=sampled.sample_time,
-                chunk_history=chunk_history,
-                config=config,
-                input_sample_event=last_input_sample_event,
-                trace_context=active_trace,
-            )
-            pipeline.request_pose_chunk(chunk_request)
-            # The pose chunk just advanced authoritative state, so refresh the
-            # OOB overlay from the new boundary frame and auto-respawn (same
-            # ``return True`` as a manual reset) when far enough off-map.
-            if update_oob_state(state, simulation, config):
-                return True
-            # Republish telemetry per chunk so read-side observers (e.g. the
-            # presenter's ``/state`` endpoint) see the latest state.
-            push_telemetry(runtime_controls, simulation)
+            with nvtx.annotate("request_chunk"):
+                chunk_request = make_chunk_request(
+                    state=state,
+                    simulation=simulation,
+                    command=sampled.command,
+                    input_sample_time=sampled.sample_time,
+                    chunk_history=chunk_history,
+                    config=config,
+                    input_sample_event=last_input_sample_event,
+                    trace_context=active_trace,
+                )
+                pipeline.request_pose_chunk(chunk_request)
+                # The pose chunk just advanced authoritative state, so refresh the
+                # OOB overlay from the new boundary frame and auto-respawn (same
+                # ``return True`` as a manual reset) when far enough off-map.
+                if update_oob_state(state, simulation, config):
+                    return True
+                # Republish telemetry per chunk so read-side observers (e.g. the
+                # presenter's ``/state`` endpoint) see the latest state.
+                push_telemetry(runtime_controls, simulation)
 
         view_mode = runtime_controls.view_mode
-        _drain_pipeline_frames(
-            pipeline=pipeline,
-            ready_frames=ready_frames,
-            presenter=presenter,
-            view_mode=view_mode,
-        )
+        with nvtx.annotate("drain_pipeline_frames"):
+            _drain_pipeline_frames(
+                pipeline=pipeline,
+                ready_frames=ready_frames,
+                presenter=presenter,
+                view_mode=view_mode,
+            )
 
         now = time.perf_counter()
         if now < state.next_present_time:
             wait_begin = now
-            time.sleep(
-                min(config.poll_timeout_s, max(0.0, state.next_present_time - now))
-            )
+            with nvtx.annotate("present_wait"):
+                time.sleep(
+                    min(config.poll_timeout_s, max(0.0, state.next_present_time - now))
+                )
             wait_end = time.perf_counter()
             last_present_wait_event = _trace_main_range(
                 active_trace,
@@ -529,17 +535,18 @@ def run_main_loop(
                 if is_warmup_index(queued_frame.chunk_times.chunk_index)
                 else trace_context
             )
-            present_queued_frame(
-                queued_frame,
-                presenter,
-                view_mode=view_mode,
-                oob_message=state.oob_message,
-                trace_context=present_trace,
-                trace_dependencies=event_dependencies(
-                    queued_frame.worker_ready_event_id,
-                    last_present_wait_event,
-                ),
-            )
+            with nvtx.annotate("present_queued_frame"):
+                present_queued_frame(
+                    queued_frame,
+                    presenter,
+                    view_mode=view_mode,
+                    oob_message=state.oob_message,
+                    trace_context=present_trace,
+                    trace_dependencies=event_dependencies(
+                        queued_frame.worker_ready_event_id,
+                        last_present_wait_event,
+                    ),
+                )
             last_present_wait_event = None
             last_presented_frame = queued_frame.frame
             state.frame_count += 1
@@ -565,10 +572,11 @@ def run_main_loop(
                 and state.frame_count == 0
             ):
                 overlay = loading_status()
-            presenter.present_frame(
-                _frame_with_overlay(last_presented_frame, overlay),
-                view_mode=view_mode,
-            )
+            with nvtx.annotate("represent_last_frame"):
+                presenter.present_frame(
+                    _frame_with_overlay(last_presented_frame, overlay),
+                    view_mode=view_mode,
+                )
 
         state.next_present_time += config.frame_interval_s
     return False
