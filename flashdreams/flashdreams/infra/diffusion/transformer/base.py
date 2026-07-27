@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Generic, cast
 
+import nvtx
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -87,20 +88,24 @@ class Transformer(nn.Module, ABC, Generic[TransformerCacheT]):
                 ...
     """
 
+    @nvtx.annotate("transformer.__init__")
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__()
         self.config = config
 
     @property
+    @nvtx.annotate("transformer.device")
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
     @property
+    @nvtx.annotate("transformer.dtype")
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
     @property
     @abstractmethod
+    @nvtx.annotate("transformer.latent_shape")
     def latent_shape(self) -> tuple[int, ...]:
         """Shape of the input/output latent tensor for this rank.
 
@@ -110,6 +115,7 @@ class Transformer(nn.Module, ABC, Generic[TransformerCacheT]):
         """
 
     @abstractmethod
+    @nvtx.annotate("transformer.predict_flow")
     def predict_flow(
         self,
         noisy_latent: Tensor,
@@ -131,6 +137,7 @@ class Transformer(nn.Module, ABC, Generic[TransformerCacheT]):
             Predicted flow tensor with the same shape as ``noisy_latent``.
         """
 
+    @nvtx.annotate("transformer.finalize_kv_cache")
     def finalize_kv_cache(
         self,
         noisy_latent: Tensor,
@@ -154,6 +161,7 @@ class Transformer(nn.Module, ABC, Generic[TransformerCacheT]):
         """
         _ = self.predict_flow(noisy_latent, timestep, cache, input)
 
+    @nvtx.annotate("transformer.initialize_autoregressive_cache")
     def initialize_autoregressive_cache(self, **context: Any) -> TransformerCacheT:
         """Build a fresh AR cache for a new rollout.
 
@@ -169,6 +177,7 @@ class Transformer(nn.Module, ABC, Generic[TransformerCacheT]):
         """
         return cast("TransformerCacheT", TransformerAutoregressiveCache())
 
+    @nvtx.annotate("transformer.postprocess_clean_latent")
     def postprocess_clean_latent(
         self,
         clean_latent: Tensor,
@@ -192,6 +201,7 @@ class Transformer(nn.Module, ABC, Generic[TransformerCacheT]):
         return clean_latent
 
     @abstractmethod
+    @nvtx.annotate("transformer.patchify_and_maybe_split_cp")
     def patchify_and_maybe_split_cp(self, x: Any) -> Any:
         """Patchify and (optionally) CP-split a noisy latent or encoder payload.
 
@@ -203,6 +213,7 @@ class Transformer(nn.Module, ABC, Generic[TransformerCacheT]):
         """
 
     @abstractmethod
+    @nvtx.annotate("transformer.unpatchify_and_maybe_gather_cp")
     def unpatchify_and_maybe_gather_cp(self, x: Tensor) -> Tensor:
         """Inverse of ``patchify_and_maybe_split_cp`` for the network output."""
 

@@ -18,6 +18,7 @@
 from dataclasses import dataclass, field
 from typing import Literal
 
+import nvtx
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -50,13 +51,17 @@ class CosmosDiTNetworkCache:
     def __getitem__(self, index: int) -> BlockCache:
         return self.block_caches[index]
 
+    @nvtx.annotate("cosmos_dit.cache.before_update")
     def before_update(self, chunk_idx: int) -> None:
-        for block_cache in self.block_caches:
-            block_cache.before_update(chunk_idx)
+        for block_idx, block_cache in enumerate(self.block_caches):
+            with nvtx.annotate(f"cosmos_dit.block.{block_idx}.cache.before_update"):
+                block_cache.before_update(chunk_idx)
 
+    @nvtx.annotate("cosmos_dit.cache.after_update")
     def after_update(self, chunk_idx: int) -> None:
-        for block_cache in self.block_caches:
-            block_cache.after_update(chunk_idx)
+        for block_idx, block_cache in enumerate(self.block_caches):
+            with nvtx.annotate(f"cosmos_dit.block.{block_idx}.cache.after_update"):
+                block_cache.after_update(chunk_idx)
 
 
 @dataclass
@@ -129,6 +134,7 @@ class CosmosDiTNetworkConfig(InstantiateConfig):
 class CosmosDiTNetwork(nn.Module):
     """DiT for autoregressive video generation with block-causal attention and KV-caching."""
 
+    @nvtx.annotate("cosmos_dit.initialize")
     def __init__(self, config: CosmosDiTNetworkConfig):
         super().__init__()
         self.config = config
@@ -217,6 +223,7 @@ class CosmosDiTNetwork(nn.Module):
         self._is_padding_mask_fused = False
         self._parameters_updated_after_loading_checkpoint = False
 
+    @nvtx.annotate("cosmos_dit.set_context_parallel_group")
     def set_context_parallel_group(
         self,
         self_attn_group: ProcessGroup | None,
@@ -226,6 +233,7 @@ class CosmosDiTNetwork(nn.Module):
             assert isinstance(block, Block)
             block.set_context_parallel_group(self_attn_group, cross_view_attn_group)
 
+    @nvtx.annotate("cosmos_dit.fuse_shuffle")
     def _fuse_shuffle_op_into_last_layer(self):
         """Fold the post-network channel-shuffle into ``final_layer.linear`` weights.
 
@@ -257,6 +265,7 @@ class CosmosDiTNetwork(nn.Module):
 
         self._is_shuffle_op_fused = True
 
+    @nvtx.annotate("cosmos_dit.fuse_padding_mask")
     def _fuse_padding_mask_into_patch_embed(self) -> None:
         """Fold the always-zero inference padding mask into ``x_embedder`` in place.
 
@@ -286,6 +295,7 @@ class CosmosDiTNetwork(nn.Module):
 
         self._is_padding_mask_fused = True
 
+    @nvtx.annotate("cosmos_dit.update_parameters_after_load")
     def update_parameters_after_loading_checkpoint(self) -> None:
         """Fuse load-time-known ops into weights; call once after loading the checkpoint."""
         if self._parameters_updated_after_loading_checkpoint:
@@ -295,6 +305,7 @@ class CosmosDiTNetwork(nn.Module):
         self._fuse_shuffle_op_into_last_layer()
         self._parameters_updated_after_loading_checkpoint = True
 
+    @nvtx.annotate("cosmos_dit.patchify_and_split_cp")
     def patchify_and_maybe_split_cp(
         self,
         x: Tensor,  # [B, V, T, C, H, W]
@@ -318,27 +329,32 @@ class CosmosDiTNetwork(nn.Module):
         else:
             pattern = "... v (t kt) c (h kh) (w kw) -> ... v t (h w) (c kt kh kw)"
 
-        x = rearrange(
-            x,
-            pattern,
-            kt=self.config.patch_temporal,
-            kh=self.config.patch_spatial,
-            kw=self.config.patch_spatial,
-        )
+        with nvtx.annotate("cosmos_dit.patchify"):
+            x = rearrange(
+                x,
+                pattern,
+                kt=self.config.patch_temporal,
+                kh=self.config.patch_spatial,
+                kw=self.config.patch_spatial,
+            )
 
         if process_groups is not None:
             assert cp_dims is not None and len(cp_dims) == len(process_groups), (
                 "Context parallel dimensions and process groups must be provided"
                 "and the number of dimensions must match the number of process groups"
             )
-            for cp_dim, process_group in zip(cp_dims, process_groups):
+            for group_idx, (cp_dim, process_group) in enumerate(
+                zip(cp_dims, process_groups)
+            ):
                 if process_group is not None:
                     assert cp_dim is not None, (
                         "Context parallel dimension must be provided if process group is provided"
                     )
-                    x = split_inputs_cp(x, seq_dim=cp_dim, cp_group=process_group)
+                    with nvtx.annotate(f"cosmos_dit.cp.{group_idx}.split"):
+                        x = split_inputs_cp(x, seq_dim=cp_dim, cp_group=process_group)
         return x
 
+    @nvtx.annotate("cosmos_dit.unpatchify_and_gather_cp")
     def unpatchify_and_maybe_gather_cp(
         self,
         pH: int,
@@ -369,24 +385,29 @@ class CosmosDiTNetwork(nn.Module):
                 "Context parallel dimensions and process groups must be provided"
                 "and the number of dimensions must match the number of process groups"
             )
-            for cp_dim, process_group in zip(cp_dims, process_groups):
+            for group_idx, (cp_dim, process_group) in enumerate(
+                zip(cp_dims, process_groups)
+            ):
                 if process_group is not None:
                     assert cp_dim is not None, (
                         "Context parallel dimension must be provided if process group is provided"
                     )
-                    x = cat_outputs_cp(x, seq_dim=cp_dim, cp_group=process_group)
+                    with nvtx.annotate(f"cosmos_dit.cp.{group_idx}.gather"):
+                        x = cat_outputs_cp(x, seq_dim=cp_dim, cp_group=process_group)
 
-        x = rearrange(
-            x,
-            pattern,
-            h=pH,
-            w=pW,
-            kt=self.config.patch_temporal,
-            kh=self.config.patch_spatial,
-            kw=self.config.patch_spatial,
-        )
+        with nvtx.annotate("cosmos_dit.unpatchify"):
+            x = rearrange(
+                x,
+                pattern,
+                h=pH,
+                w=pW,
+                kt=self.config.patch_temporal,
+                kh=self.config.patch_spatial,
+                kw=self.config.patch_spatial,
+            )
         return x  # [B, V, T, C, H, W]
 
+    @nvtx.annotate("cosmos_dit.initialize_cache")
     def initialize_cache(
         self,
         # self attn
@@ -398,16 +419,19 @@ class CosmosDiTNetwork(nn.Module):
     ) -> CosmosDiTNetworkCache:
         """Build a fresh autoregressive cache for the DiT given the chunk geometry."""
         if self.config.use_crossattn_projection:
-            context = self.crossattn_proj(context)
+            with nvtx.annotate("cosmos_dit.cross_attention_projection"):
+                context = self.crossattn_proj(context)
 
         block_caches: list[BlockCache] = []
-        for block in self.blocks:
+        for block_idx, block in enumerate(self.blocks):
             assert isinstance(block, Block)
-            block_caches.append(
-                block.initialize_cache(chunk_size, window_size, sink_size, context)
-            )
+            with nvtx.annotate(f"cosmos_dit.block.{block_idx}.initialize_cache"):
+                block_caches.append(
+                    block.initialize_cache(chunk_size, window_size, sink_size, context)
+                )
         return CosmosDiTNetworkCache(block_caches=block_caches)
 
+    @nvtx.annotate("cosmos_dit.forward")
     def forward(
         self,
         x: Tensor,
@@ -442,28 +466,32 @@ class CosmosDiTNetwork(nn.Module):
         assert timesteps.ndim == 0, (
             f"timesteps must be a scalar tensor, got shape {tuple(timesteps.shape)}"
         )
-        timesteps = timesteps * self.config.timestep_scale
+        with nvtx.annotate("cosmos_dit.scale_timestep"):
+            timesteps = timesteps * self.config.timestep_scale
 
         # Patch embedding
-        x = torch.cat([x, condition_video_input_mask], dim=-1)
-        x = self.x_embedder(x)
+        with nvtx.annotate("cosmos_dit.patch_embedding"):
+            x = torch.cat([x, condition_video_input_mask], dim=-1)
+            x = self.x_embedder(x)
 
         if self.config.additional_concat_ch > 0:
             assert hdmap_condition is not None, (
                 "hdmap is expected to be provided for additional concat channels"
             )
-            additional_x = self.additional_patch_embedding(hdmap_condition)
-            x = x + additional_x
+            with nvtx.annotate("cosmos_dit.hdmap_embedding"):
+                additional_x = self.additional_patch_embedding(hdmap_condition)
+                x = x + additional_x
 
         # Time embedding. ``timesteps`` is scalar; broadcast the resulting
         # embedding to the leading batch dim so downstream blocks/final
         # layer (which expect ``[B, D]`` and ``[B, 3D]``) work uniformly.
-        t_emb, adaln_lora = self.t_embedder(timesteps)
-        t_emb = self.t_embedding_norm(t_emb)
-        B = x.shape[0]
-        t_emb = t_emb.expand(B, -1)
-        if adaln_lora is not None:
-            adaln_lora = adaln_lora.expand(B, -1)
+        with nvtx.annotate("cosmos_dit.timestep_embedding"):
+            t_emb, adaln_lora = self.t_embedder(timesteps)
+            t_emb = self.t_embedding_norm(t_emb)
+            B = x.shape[0]
+            t_emb = t_emb.expand(B, -1)
+            if adaln_lora is not None:
+                adaln_lora = adaln_lora.expand(B, -1)
 
         # AdaLN view modulation if enabled
         if view_indices is not None:
@@ -473,8 +501,9 @@ class CosmosDiTNetwork(nn.Module):
             ), (
                 "adaln_view_embedder and adaln_view_proj must be provided if view_indices_B_V is provided"
             )
-            view_emb = self.adaln_view_embedder(view_indices)  # [B, V, D]
-            view_embedding_proj = self.adaln_view_proj(view_emb)  # [B, V, 9D]
+            with nvtx.annotate("cosmos_dit.view_embedding"):
+                view_emb = self.adaln_view_embedder(view_indices)  # [B, V, D]
+                view_embedding_proj = self.adaln_view_proj(view_emb)  # [B, V, 9D]
         else:
             view_embedding_proj = None
 
@@ -484,19 +513,21 @@ class CosmosDiTNetwork(nn.Module):
             cache.before_update(current_chunk_idx)
         for block_idx, block in enumerate(self.blocks):
             assert isinstance(block, Block)
-            x = block(
-                x=x,
-                emb=t_emb,
-                rope_freqs=rope_freqs,
-                adaln_lora=adaln_lora,
-                cache=cache[block_idx],
-                view_embedding_proj=view_embedding_proj,
-            )
+            with nvtx.annotate(f"cosmos_dit.block.{block_idx}.forward"):
+                x = block(
+                    x=x,
+                    emb=t_emb,
+                    rope_freqs=rope_freqs,
+                    adaln_lora=adaln_lora,
+                    cache=cache[block_idx],
+                    view_embedding_proj=view_embedding_proj,
+                )
         if eager_mode:
             cache.after_update(current_chunk_idx)
 
         # Final layer
-        x = self.final_layer(x, t_emb, adaln_lora)
+        with nvtx.annotate("cosmos_dit.final_layer"):
+            x = self.final_layer(x, t_emb, adaln_lora)
         return x
 
 

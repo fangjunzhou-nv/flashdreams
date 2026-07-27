@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Generic, cast
 
+import nvtx
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -141,6 +142,7 @@ class DiffusionModel(nn.Module, Generic[TransformerCacheT]):
     def latent_shape(self) -> tuple[int, ...]:
         return self.transformer.latent_shape
 
+    @nvtx.annotate("diffusion_model.generate")
     def generate(
         self,
         autoregressive_index: int,
@@ -161,33 +163,40 @@ class DiffusionModel(nn.Module, Generic[TransformerCacheT]):
             ``final_state`` should be passed to ``finalize``.
         """
         if input is not None:
-            input = self.transformer.patchify_and_maybe_split_cp(input)
-        cache.start(autoregressive_index)
+            with nvtx.annotate("patchify_input"):
+                input = self.transformer.patchify_and_maybe_split_cp(input)
 
-        if self.config.noise_in_unpatchified_shape:
-            # Draw noise at the unpatchified shape so the RNG sequence matches
-            # implementations that sample before patchify; ``self.latent_shape``
-            # is patchified, so go through ``unpatchify_and_maybe_gather_cp``
-            # first to recover the pixel-side latent shape.
-            dummy_latent = torch.empty(
-                self.latent_shape, device=self.device, dtype=self.dtype
-            )
-            dummy_latent = self.transformer.unpatchify_and_maybe_gather_cp(dummy_latent)
-            initial_noise = torch.randn(
-                dummy_latent.shape,
-                device=self.device,
-                dtype=self.dtype,
-                generator=self.rng,
-            )
+        with nvtx.annotate("cache.start"):
+            cache.start(autoregressive_index)
 
-        else:
-            initial_noise = torch.randn(
-                self.latent_shape,
-                device=self.device,
-                dtype=self.dtype,
-                generator=self.rng,
-            )
+        with nvtx.annotate("initialize_noise"):
+            if self.config.noise_in_unpatchified_shape:
+                # Draw noise at the unpatchified shape so the RNG sequence matches
+                # implementations that sample before patchify; ``self.latent_shape``
+                # is patchified, so go through ``unpatchify_and_maybe_gather_cp``
+                # first to recover the pixel-side latent shape.
+                dummy_latent = torch.empty(
+                    self.latent_shape, device=self.device, dtype=self.dtype
+                )
+                dummy_latent = self.transformer.unpatchify_and_maybe_gather_cp(
+                    dummy_latent
+                )
+                initial_noise = torch.randn(
+                    dummy_latent.shape,
+                    device=self.device,
+                    dtype=self.dtype,
+                    generator=self.rng,
+                )
 
+            else:
+                initial_noise = torch.randn(
+                    self.latent_shape,
+                    device=self.device,
+                    dtype=self.dtype,
+                    generator=self.rng,
+                )
+
+        @nvtx.annotate("predict_flow")
         def predict_flow(noisy_latent: Tensor, timestep: Tensor) -> Tensor:
             # Round-trip patchify/unpatchify around the network when the
             # scheduler is operating on unpatchified latents; the transformer
@@ -208,22 +217,27 @@ class DiffusionModel(nn.Module, Generic[TransformerCacheT]):
                 output = self.transformer.unpatchify_and_maybe_gather_cp(output)
             return output
 
-        clean_latent = self.scheduler.sample(
-            initial_noise=initial_noise,
-            predict_flow=predict_flow,
-            rng=self.rng,
-        )
+        with nvtx.annotate("scheduler.sample"):
+            clean_latent = self.scheduler.sample(
+                initial_noise=initial_noise,
+                predict_flow=predict_flow,
+                rng=self.rng,
+            )
 
         if self.config.noise_in_unpatchified_shape:
             # Scheduler emitted an unpatchified latent; patchify before
             # ``postprocess_clean_latent`` and the cache-update path.
-            clean_latent = self.transformer.patchify_and_maybe_split_cp(clean_latent)
+            with nvtx.annotate("patchify_clean_latent"):
+                clean_latent = self.transformer.patchify_and_maybe_split_cp(
+                    clean_latent
+                )
 
-        clean_latent = self.transformer.postprocess_clean_latent(
-            clean_latent=clean_latent,
-            cache=cache,
-            input=input,
-        )
+        with nvtx.annotate("postprocess_clean_latent"):
+            clean_latent = self.transformer.postprocess_clean_latent(
+                clean_latent=clean_latent,
+                cache=cache,
+                input=input,
+            )
 
         # Postpone KV cache update to the finalization step. No runtime
         # subscript: ``_FinalStateCacheT`` is bound from ``cache``'s type.
@@ -234,7 +248,8 @@ class DiffusionModel(nn.Module, Generic[TransformerCacheT]):
             input=input,
         )
 
-        clean_latent = self.transformer.unpatchify_and_maybe_gather_cp(clean_latent)
+        with nvtx.annotate("unpatchify_output"):
+            clean_latent = self.transformer.unpatchify_and_maybe_gather_cp(clean_latent)
         return clean_latent, final_state
 
     def finalize(
