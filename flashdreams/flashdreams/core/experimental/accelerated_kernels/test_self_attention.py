@@ -33,6 +33,7 @@ import torch
 from torch import Tensor
 
 from flashdreams.core.experimental.accelerated_kernels.self_attention import (
+    AcceleratedSelfAttention,
     FlashAttnSelfAttention,
     ReferenceSelfAttention,
 )
@@ -78,19 +79,20 @@ def _make_matching_attention_modules(
     head_dim: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[ReferenceSelfAttention, FlashAttnSelfAttention]:
-    """Create reference and FlashAttention modules with identical parameters."""
+    attention_type: type[ReferenceSelfAttention] = FlashAttnSelfAttention,
+) -> tuple[ReferenceSelfAttention, ReferenceSelfAttention]:
+    """Create reference and candidate modules with identical parameters."""
     torch.manual_seed(0)
     reference = ReferenceSelfAttention(query_dim, n_heads, head_dim).to(
         device=device, dtype=dtype
     )
-    flash = FlashAttnSelfAttention(query_dim, n_heads, head_dim).to(
+    candidate = attention_type(query_dim, n_heads, head_dim).to(
         device=device, dtype=dtype
     )
-    flash.load_state_dict(reference.state_dict())
+    candidate.load_state_dict(reference.state_dict())
     reference.eval()
-    flash.eval()
-    return reference, flash
+    candidate.eval()
+    return reference, candidate
 
 
 _CORRECTNESS_CASES = (
@@ -130,9 +132,7 @@ def test_flash_attention_matches_reference(
         dtype=dtype,
         generator=generator,
     )
-    rope_freqs = _make_rope_freqs(
-        sequence_length, head_dim, cuda_device, generator
-    )
+    rope_freqs = _make_rope_freqs(sequence_length, head_dim, cuda_device, generator)
     reference_cache = reference.initialize_cache(
         batch_size,
         sequence_length,
@@ -169,7 +169,122 @@ def test_flash_attention_matches_reference(
 
 
 @pytest.mark.ci_gpu
-def test_flash_attention_updates_kv_cache(cuda_device: torch.device) -> None:
+@pytest.mark.parametrize(
+    "batch_size,n_heads,query_length,key_length,head_dim,dtype,atol,rtol",
+    (
+        pytest.param(1, 2, 7, 11, 32, torch.float16, 5e-3, 5e-3, id="fp16-small"),
+        pytest.param(2, 3, 13, 97, 64, torch.float16, 5e-3, 5e-3, id="fp16-key-tiles"),
+        pytest.param(
+            1, 2, 137, 97, 128, torch.float16, 5e-3, 5e-3, id="fp16-query-tiles"
+        ),
+        pytest.param(
+            1, 2, 19, 73, 48, torch.float16, 5e-3, 5e-3, id="fp16-padded-head"
+        ),
+        pytest.param(1, 2, 19, 97, 64, torch.bfloat16, 2e-2, 2e-2, id="bf16"),
+        pytest.param(1, 2, 19, 97, 64, torch.float32, 2e-3, 2e-3, id="fp32"),
+        pytest.param(1, 1, 33, 73, 256, torch.float16, 5e-3, 5e-3, id="fp16-d256"),
+        pytest.param(1, 1, 33, 73, 256, torch.bfloat16, 2e-2, 2e-2, id="bf16-d256"),
+        pytest.param(1, 1, 33, 73, 65, torch.float32, 2e-3, 2e-3, id="fp32-d65"),
+        pytest.param(1, 1, 7, 73, 129, torch.float32, 2e-3, 2e-3, id="fp32-d129"),
+        pytest.param(1, 2, 7, 0, 32, torch.float16, 0.0, 0.0, id="empty-key"),
+    ),
+)
+def test_triton_attention_matches_reference(
+    cuda_device: torch.device,
+    batch_size: int,
+    n_heads: int,
+    query_length: int,
+    key_length: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    atol: float,
+    rtol: float,
+) -> None:
+    """Match fused Triton attention across query, key, and feature tiles."""
+    generator = torch.Generator(device=cuda_device).manual_seed(3456)
+    query = torch.randn(
+        batch_size,
+        query_length,
+        n_heads,
+        head_dim,
+        device=cuda_device,
+        dtype=dtype,
+        generator=generator,
+    ).transpose(1, 2)
+    key = torch.randn(
+        batch_size,
+        key_length,
+        n_heads,
+        head_dim,
+        device=cuda_device,
+        dtype=dtype,
+        generator=generator,
+    ).transpose(1, 2)
+    value = torch.randn(
+        batch_size,
+        key_length,
+        n_heads,
+        head_dim,
+        device=cuda_device,
+        dtype=dtype,
+        generator=generator,
+    ).transpose(1, 2)
+    reference = ReferenceSelfAttention(n_heads * head_dim, n_heads, head_dim).to(
+        device=cuda_device, dtype=dtype
+    )
+    accelerated = AcceleratedSelfAttention(n_heads * head_dim, n_heads, head_dim).to(
+        device=cuda_device, dtype=dtype
+    )
+
+    with torch.inference_mode():
+        expected = reference._apply_attention(query, key, value)
+        actual = accelerated._apply_attention(query, key, value)
+
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+@pytest.mark.ci_gpu
+def test_triton_float32_attention_uses_ieee_dot(
+    cuda_device: torch.device,
+) -> None:
+    """Retain FP32 score differences that TF32 would round away."""
+    head_dim = 16
+    query = torch.zeros((1, 1, 1, head_dim), device=cuda_device, dtype=torch.float32)
+    key = torch.zeros((1, 1, 2, head_dim), device=cuda_device, dtype=torch.float32)
+    value = torch.zeros_like(key)
+    query[..., 0] = 4096.0
+    key[:, :, 0, 0] = 1.0001
+    key[:, :, 1, 0] = 1.0008
+    value[:, :, 0, 0] = 1.0
+    value[:, :, 1, 0] = -1.0
+    reference = ReferenceSelfAttention(head_dim, 1, head_dim).to(cuda_device)
+    accelerated = AcceleratedSelfAttention(head_dim, 1, head_dim).to(cuda_device)
+
+    previous_precision = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        with torch.inference_mode():
+            expected = reference._apply_attention(query, key, value)
+            actual = accelerated._apply_attention(query, key, value)
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
+
+    assert expected[0, 0, 0, 0].abs() > 0.3
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.ci_gpu
+@pytest.mark.parametrize(
+    "attention_type",
+    (
+        pytest.param(FlashAttnSelfAttention, id="pytorch-flash"),
+        pytest.param(AcceleratedSelfAttention, id="triton-flash"),
+    ),
+)
+def test_attention_updates_kv_cache(
+    cuda_device: torch.device,
+    attention_type: type[ReferenceSelfAttention],
+) -> None:
     """Preserve sink tokens and roll cached K/V at the window boundary."""
     batch_size = 2
     chunk_size = 4
@@ -180,13 +295,13 @@ def test_flash_attention_updates_kv_cache(cuda_device: torch.device) -> None:
     query_dim = n_heads * head_dim
     dtype = torch.float16
     generator = torch.Generator(device=cuda_device).manual_seed(5678)
-    reference, flash = _make_matching_attention_modules(
-        query_dim, n_heads, head_dim, cuda_device, dtype
+    reference, candidate = _make_matching_attention_modules(
+        query_dim, n_heads, head_dim, cuda_device, dtype, attention_type
     )
     reference_cache = reference.initialize_cache(
         batch_size, chunk_size, window_size, sink_size, cuda_device, dtype
     )
-    flash_cache = flash.initialize_cache(
+    candidate_cache = candidate.initialize_cache(
         batch_size, chunk_size, window_size, sink_size, cuda_device, dtype
     )
     projected_keys: list[Tensor] = []
@@ -204,20 +319,16 @@ def test_flash_attention_updates_kv_cache(cuda_device: torch.device) -> None:
                 dtype=dtype,
                 generator=generator,
             )
-            rope_freqs = _make_rope_freqs(
-                chunk_size, head_dim, cuda_device, generator
-            )
+            rope_freqs = _make_rope_freqs(chunk_size, head_dim, cuda_device, generator)
             head_shape = (batch_size, chunk_size, n_heads, head_dim)
-            projected_key = reference.k_norm(
-                reference.k_proj(x).reshape(head_shape)
-            )
+            projected_key = reference.k_norm(reference.k_proj(x).reshape(head_shape))
             projected_keys.append(reference._apply_rope(projected_key, rope_freqs))
             projected_values.append(reference.v_proj(x).reshape(head_shape))
 
             reference_cache.before_update(chunk_index)
-            flash_cache.before_update(chunk_index)
+            candidate_cache.before_update(chunk_index)
             expected_output = reference(x, reference_cache, rope_freqs)
-            actual_output = flash(x, flash_cache, rope_freqs)
+            actual_output = candidate(x, candidate_cache, rope_freqs)
 
             local_start = max(sink_chunks, chunk_index - window_chunks + 1)
             visible_chunks = list(range(min(chunk_index + 1, sink_chunks)))
@@ -232,7 +343,7 @@ def test_flash_attention_updates_kv_cache(cuda_device: torch.device) -> None:
             torch.testing.assert_close(
                 actual_output, expected_output, atol=5e-3, rtol=5e-3
             )
-            for cache in (reference_cache, flash_cache):
+            for cache in (reference_cache, candidate_cache):
                 torch.testing.assert_close(
                     cache.cached_k(), expected_keys, atol=0, rtol=0
                 )
@@ -241,12 +352,10 @@ def test_flash_attention_updates_kv_cache(cuda_device: torch.device) -> None:
                 )
 
             reference_cache.after_update(chunk_index)
-            flash_cache.after_update(chunk_index)
-            expected_size = min(
-                (chunk_index + 1) * chunk_size, sink_size + window_size
-            )
+            candidate_cache.after_update(chunk_index)
+            expected_size = min((chunk_index + 1) * chunk_size, sink_size + window_size)
             assert reference_cache.size == expected_size
-            assert flash_cache.size == expected_size
+            assert candidate_cache.size == expected_size
 
 
 _BENCHMARK_CASES = (
@@ -257,11 +366,19 @@ _BENCHMARK_CASES = (
 _BENCHMARK_IMPLEMENTATIONS = (
     pytest.param(ReferenceSelfAttention, id="reference"),
     pytest.param(FlashAttnSelfAttention, id="flash"),
+    pytest.param(AcceleratedSelfAttention, id="accelerated"),
+)
+
+_BENCHMARK_DTYPES = (
+    pytest.param(torch.float32, id="fp32"),
+    pytest.param(torch.float16, id="fp16"),
+    pytest.param(torch.bfloat16, id="bf16"),
 )
 
 
 @pytest.mark.manual
 @pytest.mark.parametrize("attention_type", _BENCHMARK_IMPLEMENTATIONS)
+@pytest.mark.parametrize("dtype", _BENCHMARK_DTYPES)
 @pytest.mark.parametrize(
     "batch_size,sequence_length,n_heads,head_dim,cache_chunks", _BENCHMARK_CASES
 )
@@ -269,6 +386,7 @@ def test_self_attention_benchmark(
     benchmark: Any,
     cuda_device: torch.device,
     attention_type: type[ReferenceSelfAttention],
+    dtype: torch.dtype,
     batch_size: int,
     sequence_length: int,
     n_heads: int,
@@ -276,9 +394,12 @@ def test_self_attention_benchmark(
     cache_chunks: int,
 ) -> None:
     """Benchmark self-attention against a prefilled rolling KV cache."""
+    if dtype == torch.float32 and attention_type is FlashAttnSelfAttention:
+        pytest.skip("PyTorch FlashAttention does not support float32 inputs.")
+
     query_dim = n_heads * head_dim
     window_size = cache_chunks * sequence_length
-    dtype = torch.float16
+    dtype_name = str(dtype).removeprefix("torch.")
     generator = torch.Generator(device=cuda_device).manual_seed(9012)
     torch.manual_seed(0)
     attention = attention_type(query_dim, n_heads, head_dim).to(
@@ -293,9 +414,7 @@ def test_self_attention_benchmark(
         dtype=dtype,
         generator=generator,
     )
-    rope_freqs = _make_rope_freqs(
-        sequence_length, head_dim, cuda_device, generator
-    )
+    rope_freqs = _make_rope_freqs(sequence_length, head_dim, cuda_device, generator)
     kv_cache = attention.initialize_cache(
         batch_size,
         sequence_length,
@@ -325,6 +444,7 @@ def test_self_attention_benchmark(
 
     benchmark.group = (
         f"b{batch_size}-l{sequence_length}-k{window_size}-h{n_heads}-hd{head_dim}"
+        f"-{dtype_name}"
     )
     benchmark.extra_info.update(
         {
@@ -333,6 +453,7 @@ def test_self_attention_benchmark(
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
             "dtype": str(dtype),
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
             "batch_size": batch_size,
             "sequence_length": sequence_length,
             "cached_sequence_length": window_size,
