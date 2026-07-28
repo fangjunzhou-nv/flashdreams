@@ -19,6 +19,7 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
+import nvtx
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
@@ -609,6 +610,7 @@ class Block(nn.Module):
             cross_attn=self.cross_attn.initialize_cache(context),
         )
 
+    @nvtx.annotate("cosmos_dit.block.forward")
     def forward(
         self,
         x: Tensor,
@@ -631,123 +633,131 @@ class Block(nn.Module):
         Returns:
             Updated hidden states with the same shape as ``x``.
         """
-        if x.ndim == 5:
-            B, V, T, HW, D = x.shape
-            L = T * HW
-            x = x.reshape(B, V, L, D)
-        else:
-            assert x.ndim == 4, "x must be a 4D tensor"
-            B, V, L, D = x.shape
-            # If x passes in as a 4D tensor, we don't know T and HW.
-            T = HW = None
+        with nvtx.annotate("cosmos_dit.block.prepare_shapes"):
+            if x.ndim == 5:
+                B, V, T, HW, D = x.shape
+                L = T * HW
+                x = x.reshape(B, V, L, D)
+            else:
+                assert x.ndim == 4, "x must be a 4D tensor"
+                B, V, L, D = x.shape
+                # If x passes in as a 4D tensor, we don't know T and HW.
+                T = HW = None
 
-        # Reshape embeddings to be broadcastable with x.
-        emb = emb.reshape(B, 1, 1, D)
+            # Reshape embeddings to be broadcastable with x.
+            emb = emb.reshape(B, 1, 1, D)
 
         # Compute AdaLN modulation
-        if self.use_adaln_lora:
-            assert adaln_lora is not None, (
-                "adaln_lora is required when use_adaln_lora is True"
-            )
-            adaln_lora = adaln_lora.reshape(B, 1, 1, 3 * D)
-            shift_self, scale_self, gate_self = (
-                self.adaln_modulation_self_attn(emb) + adaln_lora
-            ).chunk(3, dim=-1)
-            shift_cross, scale_cross, gate_cross = (
-                self.adaln_modulation_cross_attn(emb) + adaln_lora
-            ).chunk(3, dim=-1)
-            shift_mlp, scale_mlp, gate_mlp = (
-                self.adaln_modulation_mlp(emb) + adaln_lora
-            ).chunk(3, dim=-1)
-        else:
-            shift_self, scale_self, gate_self = self.adaln_modulation_self_attn(
-                emb
-            ).chunk(3, dim=-1)
-            shift_cross, scale_cross, gate_cross = self.adaln_modulation_cross_attn(
-                emb
-            ).chunk(3, dim=-1)
-            shift_mlp, scale_mlp, gate_mlp = self.adaln_modulation_mlp(emb).chunk(
-                3, dim=-1
-            )
+        with nvtx.annotate("cosmos_dit.block.adaln_modulation"):
+            if self.use_adaln_lora:
+                assert adaln_lora is not None, (
+                    "adaln_lora is required when use_adaln_lora is True"
+                )
+                adaln_lora = adaln_lora.reshape(B, 1, 1, 3 * D)
+                shift_self, scale_self, gate_self = (
+                    self.adaln_modulation_self_attn(emb) + adaln_lora
+                ).chunk(3, dim=-1)
+                shift_cross, scale_cross, gate_cross = (
+                    self.adaln_modulation_cross_attn(emb) + adaln_lora
+                ).chunk(3, dim=-1)
+                shift_mlp, scale_mlp, gate_mlp = (
+                    self.adaln_modulation_mlp(emb) + adaln_lora
+                ).chunk(3, dim=-1)
+            else:
+                shift_self, scale_self, gate_self = self.adaln_modulation_self_attn(
+                    emb
+                ).chunk(3, dim=-1)
+                shift_cross, scale_cross, gate_cross = self.adaln_modulation_cross_attn(
+                    emb
+                ).chunk(3, dim=-1)
+                shift_mlp, scale_mlp, gate_mlp = self.adaln_modulation_mlp(emb).chunk(
+                    3, dim=-1
+                )
 
         if self.enable_cross_view_attn:
-            assert view_embedding_proj is not None
-            (
-                view_shift_self,
-                view_scale_self,
-                view_gate_self,
-                view_shift_cross,
-                view_scale_cross,
-                view_gate_cross,
-                view_shift_mlp,
-                view_scale_mlp,
-                view_gate_mlp,
-            ) = view_embedding_proj.chunk(9, dim=-1)
+            with nvtx.annotate("cosmos_dit.block.view_modulation"):
+                assert view_embedding_proj is not None
+                (
+                    view_shift_self,
+                    view_scale_self,
+                    view_gate_self,
+                    view_shift_cross,
+                    view_scale_cross,
+                    view_gate_cross,
+                    view_shift_mlp,
+                    view_scale_mlp,
+                    view_gate_mlp,
+                ) = view_embedding_proj.chunk(9, dim=-1)
 
-            def expand_view_mod(v_mod: Tensor) -> Tensor:
-                return v_mod.reshape(B, V, 1, D)
+                def expand_view_mod(v_mod: Tensor) -> Tensor:
+                    return v_mod.reshape(B, V, 1, D)
 
-            shift_self = shift_self + expand_view_mod(view_shift_self)
-            scale_self = scale_self + expand_view_mod(view_scale_self)
-            gate_self = gate_self + expand_view_mod(view_gate_self)
+                shift_self = shift_self + expand_view_mod(view_shift_self)
+                scale_self = scale_self + expand_view_mod(view_scale_self)
+                gate_self = gate_self + expand_view_mod(view_gate_self)
 
-            shift_cross = shift_cross + expand_view_mod(view_shift_cross)
-            scale_cross = scale_cross + expand_view_mod(view_scale_cross)
-            gate_cross = gate_cross + expand_view_mod(view_gate_cross)
+                shift_cross = shift_cross + expand_view_mod(view_shift_cross)
+                scale_cross = scale_cross + expand_view_mod(view_scale_cross)
+                gate_cross = gate_cross + expand_view_mod(view_gate_cross)
 
-            shift_mlp = shift_mlp + expand_view_mod(view_shift_mlp)
-            scale_mlp = scale_mlp + expand_view_mod(view_scale_mlp)
-            gate_mlp = gate_mlp + expand_view_mod(view_gate_mlp)
+                shift_mlp = shift_mlp + expand_view_mod(view_shift_mlp)
+                scale_mlp = scale_mlp + expand_view_mod(view_scale_mlp)
+                gate_mlp = gate_mlp + expand_view_mod(view_gate_mlp)
 
         # Self-attention
-        normed_x = self.layer_norm_self_attn(x) * (1 + scale_self) + shift_self
-        attn_out = self.self_attn(
-            normed_x,
-            rope_freqs=rope_freqs,
-            kv_cache=cache.self_attn,
-        ).reshape_as(normed_x)
-        x = x + gate_self * attn_out
+        with nvtx.annotate("cosmos_dit.block.self_attention"):
+            normed_x = self.layer_norm_self_attn(x) * (1 + scale_self) + shift_self
+            attn_out = self.self_attn(
+                normed_x,
+                rope_freqs=rope_freqs,
+                kv_cache=cache.self_attn,
+            ).reshape_as(normed_x)
+            x = x + gate_self * attn_out
 
         # Cross-view attention: dense
         if self.enable_cross_view_attn:
-            assert T is not None and HW is not None, (
-                "T and HW must be available (x should be a 5D tensor) when cross-view attention is enabled"
-            )
-            normed_x_cv = self.layer_norm_cross_view_attn(x)
-            x_cv = rearrange(normed_x_cv, "b v (t hw) d -> b t v hw d", t=T, hw=HW)
-            if self.cross_view_attn.is_context_parallel_enabled():
-                # CP-enabled: views are split across GPUs in rank order
-                # (e.g. 4 views on 2 GPUs -> [0,1] and [2,3]).
-                if V == 1:
-                    # CP size == num views: ring attention gathers all K/V,
-                    # so local context stays unexpanded.
-                    x_context = x_cv
+            with nvtx.annotate("cosmos_dit.block.cross_view_attention"):
+                assert T is not None and HW is not None, (
+                    "T and HW must be available (x should be a 5D tensor) when cross-view attention is enabled"
+                )
+                normed_x_cv = self.layer_norm_cross_view_attn(x)
+                x_cv = rearrange(normed_x_cv, "b v (t hw) d -> b t v hw d", t=T, hw=HW)
+                if self.cross_view_attn.is_context_parallel_enabled():
+                    # CP-enabled: views are split across GPUs in rank order
+                    # (e.g. 4 views on 2 GPUs -> [0,1] and [2,3]).
+                    if V == 1:
+                        # CP size == num views: ring attention gathers all K/V,
+                        # so local context stays unexpanded.
+                        x_context = x_cv
+                    else:
+                        # CP size < num views: gather each GPU's local views first.
+                        x_context = repeat(x_cv, "b t v hw d -> b t v2 (v hw) d", v2=V)
                 else:
-                    # CP size < num views: gather each GPU's local views first.
+                    # Without CP, repeat context so each view attends over all views.
                     x_context = repeat(x_cv, "b t v hw d -> b t v2 (v hw) d", v2=V)
-            else:
-                # Without CP, repeat context so each view attends over all views.
-                x_context = repeat(x_cv, "b t v hw d -> b t v2 (v hw) d", v2=V)
-            cross_view_attn_kv_cache = self.cross_view_attn.compute_kv(x_context)
-            cv_out = self.cross_view_attn(x_cv, kv_cache=cross_view_attn_kv_cache)
-            cv_out = rearrange(cv_out, "b t v hw d -> b v (t hw) d")
-            x = x + cv_out
+                cross_view_attn_kv_cache = self.cross_view_attn.compute_kv(x_context)
+                cv_out = self.cross_view_attn(x_cv, kv_cache=cross_view_attn_kv_cache)
+                cv_out = rearrange(cv_out, "b t v hw d -> b v (t hw) d")
+                x = x + cv_out
 
         # Cross-attention
-        normed_x = self.layer_norm_cross_attn(x) * (1 + scale_cross) + shift_cross
-        cross_out = self.cross_attn(
-            normed_x,
-            kv_cache=cache.cross_attn,
-        ).reshape_as(normed_x)
-        x = x + gate_cross * cross_out
+        with nvtx.annotate("cosmos_dit.block.cross_attention"):
+            normed_x = self.layer_norm_cross_attn(x) * (1 + scale_cross) + shift_cross
+            cross_out = self.cross_attn(
+                normed_x,
+                kv_cache=cache.cross_attn,
+            ).reshape_as(normed_x)
+            x = x + gate_cross * cross_out
 
         # MLP
-        normed_x = self.layer_norm_mlp(x) * (1 + scale_mlp) + shift_mlp
-        mlp_out = self.mlp(normed_x)
-        x = x + gate_mlp * mlp_out
+        with nvtx.annotate("cosmos_dit.block.mlp"):
+            normed_x = self.layer_norm_mlp(x) * (1 + scale_mlp) + shift_mlp
+            mlp_out = self.mlp(normed_x)
+            x = x + gate_mlp * mlp_out
 
         # reshape back to 5D if needed
         if T is not None and HW is not None:
-            x = x.reshape(B, V, T, HW, D)  # [B, V, T, HW, D]
+            with nvtx.annotate("cosmos_dit.block.restore_shape"):
+                x = x.reshape(B, V, T, HW, D)  # [B, V, T, HW, D]
 
         return x
