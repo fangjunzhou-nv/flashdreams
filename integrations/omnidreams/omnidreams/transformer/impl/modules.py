@@ -28,6 +28,11 @@ from torch.distributed import ProcessGroup
 
 from flashdreams.core.attention import BlockKVCache, ContextParallelAttention
 from flashdreams.core.attention.rope import apply_rope_freqs
+from flashdreams.core.experimental.accelerated_kernels.self_attention import (
+    ReferenceSelfAttention,
+    FlashAttnSelfAttention,
+    AcceleratedSelfAttention
+)
 
 
 class GPT2FeedForward(nn.Module):
@@ -497,12 +502,10 @@ class Block(nn.Module):
         self.layer_norm_self_attn = nn.LayerNorm(
             x_dim, elementwise_affine=False, eps=1e-6
         )
-        self.self_attn = SelfAttention(
+        self.self_attn = AcceleratedSelfAttention(
             query_dim=x_dim,
-            context_dim=None,
             n_heads=num_heads,
             head_dim=x_dim // num_heads,
-            cp_method=cp_method,
         )
 
         # Cross-attention
