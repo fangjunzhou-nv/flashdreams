@@ -1237,6 +1237,7 @@ dependencies = [
 dev = [
     { name = "mediapy" },
     { name = "pytest" },
+    { name = "pytest-benchmark" },
     { name = "pytest-manual-marker" },
     { name = "tomli" },
     { name = "transformer-engine", extra = ["core-cu13", "pytorch"], marker = "(sys_platform != 'win32' and extra == 'extra-11-flashdreams-dev') or (sys_platform != 'win32' and extra != 'group-11-flashdreams-cuda12') or (extra == 'extra-11-flashdreams-dev' and extra == 'group-11-flashdreams-cuda12') or (extra == 'group-11-flashdreams-cuda12' and extra == 'group-11-flashdreams-cuda13')" },
@@ -1294,6 +1295,7 @@ requires-dist = [
     { name = "opencv-python-headless", marker = "extra == 'examples'", specifier = ">=4.5" },
     { name = "opencv-python-headless", marker = "extra == 'runners'", specifier = ">=4.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-benchmark", marker = "extra == 'dev'", specifier = ">=5.1" },
     { name = "pytest-manual-marker", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "safetensors", specifier = ">=0.4" },
     { name = "scipy", marker = "extra == 'examples'", specifier = ">=1.11" },
