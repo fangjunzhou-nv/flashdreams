@@ -305,7 +305,7 @@ def _flash_attention_kernel(
     accumulator = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
     # Base-2 exponentials are cheaper in Triton; fold log2(e) into the QK scale.
-    qk_scale = scale * 1.4426950408889634
+    qk_scale = scale.to(tl.float32) * 1.4426950408889634
     for key_start in range(0, key_length, BLOCK_N):
         key_offsets = key_start + tl.arange(0, BLOCK_N)
         key_mask = key_offsets < key_length

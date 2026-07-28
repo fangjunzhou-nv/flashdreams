@@ -274,6 +274,44 @@ def test_triton_float32_attention_uses_ieee_dot(
 
 
 @pytest.mark.ci_gpu
+def test_triton_attention_compiles_with_inductor(
+    cuda_device: torch.device,
+) -> None:
+    """Compile the user Triton kernel through Inductor."""
+    head_dim = 16
+    dtype = torch.float16
+    generator = torch.Generator(device=cuda_device).manual_seed(7890)
+    query = torch.randn(
+        (1, 1, 1, head_dim), device=cuda_device, dtype=dtype, generator=generator
+    )
+    key = torch.randn(
+        (1, 1, 2, head_dim), device=cuda_device, dtype=dtype, generator=generator
+    )
+    value = torch.randn(
+        (1, 1, 2, head_dim), device=cuda_device, dtype=dtype, generator=generator
+    )
+    reference = ReferenceSelfAttention(head_dim, 1, head_dim).to(
+        device=cuda_device, dtype=dtype
+    )
+    accelerated = AcceleratedSelfAttention(head_dim, 1, head_dim).to(
+        device=cuda_device, dtype=dtype
+    )
+    compiled_attention = torch.compile(
+        accelerated._apply_attention,
+        backend="inductor",
+        fullgraph=True,
+        dynamic=False,
+    )
+
+    with torch.inference_mode():
+        expected = reference._apply_attention(query, key, value)
+        actual = compiled_attention(query, key, value)
+    torch.cuda.synchronize(cuda_device)
+
+    torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.ci_gpu
 @pytest.mark.parametrize(
     "attention_type",
     (
