@@ -274,11 +274,18 @@ def test_triton_float32_attention_uses_ieee_dot(
 
 
 @pytest.mark.ci_gpu
+@pytest.mark.parametrize(
+    "head_dim",
+    (
+        pytest.param(16, id="pointer"),
+        pytest.param(128, id="tma"),
+    ),
+)
 def test_triton_attention_compiles_with_inductor(
     cuda_device: torch.device,
+    head_dim: int,
 ) -> None:
     """Compile the user Triton kernel through Inductor."""
-    head_dim = 16
     dtype = torch.float16
     generator = torch.Generator(device=cuda_device).manual_seed(7890)
     query = torch.randn(

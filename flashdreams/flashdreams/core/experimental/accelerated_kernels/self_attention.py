@@ -29,6 +29,18 @@ from torch.distributed import ProcessGroup
 from flashdreams.core.attention.kvcache import BlockKVCache
 
 
+def _allocate_triton_workspace(
+    size: int,
+    alignment: int,
+    stream: int | None,
+) -> Tensor:
+    """Allocate tensor-descriptor workspace on the active CUDA device."""
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+triton.set_allocator(_allocate_triton_workspace)
+
+
 class ReferenceSelfAttention(nn.Module):
     """Streaming self-attention implemented with basic PyTorch operations."""
 
@@ -361,6 +373,126 @@ def _flash_attention_kernel(
     tl.store(output_ptrs, output, mask=query_mask[:, None] & dim_mask[None, :])
 
 
+@triton.jit
+def _flash_attention_tma_kernel(
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    output_ptr,
+    query_stride_b,
+    query_stride_h,
+    query_stride_l,
+    query_stride_d,
+    key_stride_b,
+    key_stride_h,
+    key_stride_s,
+    key_stride_d,
+    value_stride_b,
+    value_stride_h,
+    value_stride_s,
+    value_stride_d,
+    output_stride_b,
+    output_stride_h,
+    output_stride_l,
+    output_stride_d,
+    batch_size,
+    num_heads,
+    query_length,
+    key_length,
+    scale,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+):
+    """Apply non-causal FlashAttention with tensor-memory-accelerator loads."""
+    query_block = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    batch = batch_head // num_heads
+    head = batch_head % num_heads
+
+    query_desc = tl.make_tensor_descriptor(
+        query_ptr,
+        shape=[batch_size, num_heads, query_length, HEAD_DIM],
+        strides=[
+            query_stride_b,
+            query_stride_h,
+            query_stride_l,
+            query_stride_d,
+        ],
+        block_shape=[1, 1, BLOCK_M, HEAD_DIM],
+    )
+    key_desc = tl.make_tensor_descriptor(
+        key_ptr,
+        shape=[batch_size, num_heads, key_length, HEAD_DIM],
+        strides=[key_stride_b, key_stride_h, key_stride_s, key_stride_d],
+        block_shape=[1, 1, BLOCK_N, HEAD_DIM],
+    )
+    value_desc = tl.make_tensor_descriptor(
+        value_ptr,
+        shape=[batch_size, num_heads, key_length, HEAD_DIM],
+        strides=[
+            value_stride_b,
+            value_stride_h,
+            value_stride_s,
+            value_stride_d,
+        ],
+        block_shape=[1, 1, BLOCK_N, HEAD_DIM],
+    )
+    output_desc = tl.make_tensor_descriptor(
+        output_ptr,
+        shape=[batch_size, num_heads, query_length, HEAD_DIM],
+        strides=[
+            output_stride_b,
+            output_stride_h,
+            output_stride_l,
+            output_stride_d,
+        ],
+        block_shape=[1, 1, BLOCK_M, HEAD_DIM],
+    )
+
+    query_start = query_block * BLOCK_M
+    query = query_desc.load([batch, head, query_start, 0]).reshape((BLOCK_M, HEAD_DIM))
+    row_max = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    denominator = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+    key_offsets = tl.arange(0, BLOCK_N)
+    qk_scale = scale.to(tl.float32) * 1.4426950408889634
+
+    for key_start in tl.range(
+        0,
+        key_length,
+        BLOCK_N,
+        warp_specialize=WARP_SPECIALIZE,
+    ):
+        key = key_desc.load([batch, head, key_start, 0]).reshape((BLOCK_N, HEAD_DIM))
+        scores = tl.dot(query, tl.trans(key), input_precision="ieee")
+        scores *= qk_scale
+        key_mask = key_start + key_offsets < key_length
+        scores = tl.where(key_mask[None, :], scores, -float("inf"))
+
+        block_max = tl.max(scores, axis=1)
+        new_row_max = tl.maximum(row_max, block_max)
+        correction = tl.exp2(row_max - new_row_max)
+        probabilities = tl.exp2(scores - new_row_max[:, None])
+        denominator = denominator * correction + tl.sum(probabilities, axis=1)
+        value = value_desc.load([batch, head, key_start, 0]).reshape(
+            (BLOCK_N, HEAD_DIM)
+        )
+        accumulator = accumulator * correction[:, None] + tl.dot(
+            probabilities.to(value.dtype),
+            value,
+            input_precision="ieee",
+        )
+        row_max = new_row_max
+
+    output = accumulator / denominator[:, None]
+    output_desc.store(
+        [batch, head, query_start, 0],
+        output.reshape((1, 1, BLOCK_M, HEAD_DIM)),
+    )
+
+
 class AcceleratedSelfAttention(ReferenceSelfAttention):
     """Streaming self-attention with fused Triton FlashAttention."""
 
@@ -409,6 +541,44 @@ class AcceleratedSelfAttention(ReferenceSelfAttention):
         if key_length == 0:
             return output.zero_()
 
+        tma_supported = (
+            query.dtype in (torch.float16, torch.bfloat16)
+            and head_dim == 128
+            and torch.cuda.get_device_capability(query.device)[0] >= 9
+        )
+        if tma_supported:
+            block_m = min(
+                128,
+                max(int(triton.next_power_of_2(query_length)), 16),
+            )
+            block_n = 32
+            grid = (
+                triton.cdiv(query_length, block_m),
+                batch_size * num_heads,
+            )
+            _flash_attention_tma_kernel[grid](
+                query,
+                key,
+                value,
+                output,
+                *query.stride(),
+                *key.stride(),
+                *value.stride(),
+                *output.stride(),
+                batch_size,
+                num_heads,
+                query_length,
+                key_length,
+                1.0 / math.sqrt(head_dim),
+                HEAD_DIM=head_dim,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                WARP_SPECIALIZE=False,
+                num_warps=4,
+                num_stages=2,
+            )
+            return output
+
         block_d = max(int(triton.next_power_of_2(head_dim)), 16)
         if query.dtype == torch.float32:
             max_block_m = 16 if block_d > 128 else 64
@@ -416,7 +586,7 @@ class AcceleratedSelfAttention(ReferenceSelfAttention):
             num_stages = 1 if block_d > 128 else 2
         else:
             max_block_m = 64 if block_d > 128 else 128
-            block_n = 32 if block_d > 64 else 64
+            block_n = 32 if block_d > 128 else 64
             num_stages = 2 if block_d > 128 else 3
         block_m = min(
             max_block_m,
