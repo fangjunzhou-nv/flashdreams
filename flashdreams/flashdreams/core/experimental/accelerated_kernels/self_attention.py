@@ -16,6 +16,7 @@
 """Reference, PyTorch FlashAttention, and Triton streaming self-attention."""
 
 import math
+from collections.abc import Callable
 
 import nvtx
 import torch
@@ -493,8 +494,719 @@ def _flash_attention_tma_kernel(
     )
 
 
+@triton.jit
+def _qkv_postprocess_cache_kernel(
+    qkv_ptr,
+    query_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    key_cache_fp8_ptr,
+    value_cache_fp8_ptr,
+    query_weight_ptr,
+    key_weight_ptr,
+    rope_freqs_ptr,
+    qkv_stride_b,
+    qkv_stride_l,
+    qkv_stride_p,
+    qkv_stride_h,
+    qkv_stride_d,
+    query_stride_b,
+    query_stride_l,
+    query_stride_h,
+    query_stride_d,
+    key_cache_stride_b,
+    key_cache_stride_l,
+    key_cache_stride_h,
+    key_cache_stride_d,
+    value_cache_stride_b,
+    value_cache_stride_l,
+    value_cache_stride_h,
+    value_cache_stride_d,
+    rope_stride_l,
+    rope_stride_d,
+    sequence_length,
+    num_heads,
+    cache_read_start,
+    cache_write_start,
+    cache_write_length,
+    EPS: tl.constexpr,
+    HEAD_DIM_HALF: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Normalize and rotate fused QKV while writing K/V into the cache."""
+    batch = tl.program_id(0)
+    sequence_block = tl.program_id(1)
+    head_block = tl.program_id(2)
+
+    sequence_offsets = sequence_block * BLOCK_S + tl.arange(0, BLOCK_S)
+    head_offsets = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    dim_offsets = tl.arange(0, BLOCK_D)
+    sequence_mask = sequence_offsets < sequence_length
+    head_mask = head_offsets < num_heads
+    dim_mask = dim_offsets < HEAD_DIM_HALF
+    activation_mask = (
+        sequence_mask[:, None, None]
+        & head_mask[None, :, None]
+        & dim_mask[None, None, :]
+    )
+
+    qkv_base = (
+        qkv_ptr
+        + batch * qkv_stride_b
+        + sequence_offsets[:, None, None] * qkv_stride_l
+        + head_offsets[None, :, None] * qkv_stride_h
+    )
+    first_offsets = dim_offsets[None, None, :] * qkv_stride_d
+    second_offsets = (HEAD_DIM_HALF + dim_offsets[None, None, :]) * qkv_stride_d
+
+    query_first = tl.load(qkv_base + first_offsets, mask=activation_mask, other=0.0)
+    query_second = tl.load(
+        qkv_base + second_offsets,
+        mask=activation_mask,
+        other=0.0,
+    )
+    key_base = qkv_base + qkv_stride_p
+    key_first = tl.load(key_base + first_offsets, mask=activation_mask, other=0.0)
+    key_second = tl.load(
+        key_base + second_offsets,
+        mask=activation_mask,
+        other=0.0,
+    )
+
+    query_square_sum = tl.sum(
+        query_first.to(tl.float32) * query_first.to(tl.float32)
+        + query_second.to(tl.float32) * query_second.to(tl.float32),
+        axis=2,
+    )
+    key_square_sum = tl.sum(
+        key_first.to(tl.float32) * key_first.to(tl.float32)
+        + key_second.to(tl.float32) * key_second.to(tl.float32),
+        axis=2,
+    )
+    query_scale = tl.rsqrt(query_square_sum / (2 * HEAD_DIM_HALF) + EPS)
+    key_scale = tl.rsqrt(key_square_sum / (2 * HEAD_DIM_HALF) + EPS)
+
+    query_weight_first = tl.load(
+        query_weight_ptr + dim_offsets,
+        mask=dim_mask,
+        other=0.0,
+    )
+    query_weight_second = tl.load(
+        query_weight_ptr + HEAD_DIM_HALF + dim_offsets,
+        mask=dim_mask,
+        other=0.0,
+    )
+    key_weight_first = tl.load(
+        key_weight_ptr + dim_offsets,
+        mask=dim_mask,
+        other=0.0,
+    )
+    key_weight_second = tl.load(
+        key_weight_ptr + HEAD_DIM_HALF + dim_offsets,
+        mask=dim_mask,
+        other=0.0,
+    )
+
+    query_first = (
+        query_first * query_scale[:, :, None] * query_weight_first[None, None, :]
+    ).to(query_first.dtype)
+    query_second = (
+        query_second * query_scale[:, :, None] * query_weight_second[None, None, :]
+    ).to(query_second.dtype)
+    key_first = (
+        key_first * key_scale[:, :, None] * key_weight_first[None, None, :]
+    ).to(key_first.dtype)
+    key_second = (
+        key_second * key_scale[:, :, None] * key_weight_second[None, None, :]
+    ).to(key_second.dtype)
+
+    frequency_offsets = (
+        sequence_offsets[:, None] * rope_stride_l + dim_offsets[None, :] * rope_stride_d
+    )
+    frequency_mask = sequence_mask[:, None] & dim_mask[None, :]
+    frequencies = tl.load(
+        rope_freqs_ptr + frequency_offsets,
+        mask=frequency_mask,
+        other=0.0,
+    ).to(tl.float32)
+    cos_freqs = tl.cos(frequencies).to(query_first.dtype)[:, None, :]
+    sin_freqs = tl.sin(frequencies).to(query_first.dtype)[:, None, :]
+
+    query_rotated_first = query_first * cos_freqs - query_second * sin_freqs
+    query_rotated_second = query_second * cos_freqs + query_first * sin_freqs
+    key_rotated_first = key_first * cos_freqs - key_second * sin_freqs
+    key_rotated_second = key_second * cos_freqs + key_first * sin_freqs
+
+    query_base = (
+        query_ptr
+        + batch * query_stride_b
+        + sequence_offsets[:, None, None] * query_stride_l
+        + head_offsets[None, :, None] * query_stride_h
+    )
+    tl.store(
+        query_base + dim_offsets[None, None, :] * query_stride_d,
+        query_rotated_first,
+        mask=activation_mask,
+    )
+    tl.store(
+        query_base + (HEAD_DIM_HALF + dim_offsets[None, None, :]) * query_stride_d,
+        query_rotated_second,
+        mask=activation_mask,
+    )
+
+    cache_offsets = sequence_offsets - cache_read_start
+    cache_mask = (
+        activation_mask
+        & (cache_offsets[:, None, None] >= 0)
+        & (cache_offsets[:, None, None] < cache_write_length)
+    )
+    cache_sequence_offsets = cache_write_start + cache_offsets
+    key_cache_base = (
+        key_cache_ptr
+        + batch * key_cache_stride_b
+        + cache_sequence_offsets[:, None, None] * key_cache_stride_l
+        + head_offsets[None, :, None] * key_cache_stride_h
+    )
+    value_cache_base = (
+        value_cache_ptr
+        + batch * value_cache_stride_b
+        + cache_sequence_offsets[:, None, None] * value_cache_stride_l
+        + head_offsets[None, :, None] * value_cache_stride_h
+    )
+    key_cache_fp8_base = (
+        key_cache_fp8_ptr
+        + batch * key_cache_stride_b
+        + cache_sequence_offsets[:, None, None] * key_cache_stride_l
+        + head_offsets[None, :, None] * key_cache_stride_h
+    )
+    value_cache_fp8_base = (
+        value_cache_fp8_ptr
+        + batch * value_cache_stride_b
+        + cache_sequence_offsets[:, None, None] * value_cache_stride_l
+        + head_offsets[None, :, None] * value_cache_stride_h
+    )
+    tl.store(
+        key_cache_base + dim_offsets[None, None, :] * key_cache_stride_d,
+        key_rotated_first,
+        mask=cache_mask,
+    )
+    tl.store(
+        key_cache_base
+        + (HEAD_DIM_HALF + dim_offsets[None, None, :]) * key_cache_stride_d,
+        key_rotated_second,
+        mask=cache_mask,
+    )
+    tl.store(
+        key_cache_fp8_base + dim_offsets[None, None, :] * key_cache_stride_d,
+        key_rotated_first,
+        mask=cache_mask,
+    )
+    tl.store(
+        key_cache_fp8_base
+        + (HEAD_DIM_HALF + dim_offsets[None, None, :]) * key_cache_stride_d,
+        key_rotated_second,
+        mask=cache_mask,
+    )
+
+    value_base = qkv_base + 2 * qkv_stride_p
+    value_first = tl.load(
+        value_base + first_offsets,
+        mask=activation_mask,
+        other=0.0,
+    )
+    value_second = tl.load(
+        value_base + second_offsets,
+        mask=activation_mask,
+        other=0.0,
+    )
+    tl.store(
+        value_cache_base + dim_offsets[None, None, :] * value_cache_stride_d,
+        value_first,
+        mask=cache_mask,
+    )
+    tl.store(
+        value_cache_base
+        + (HEAD_DIM_HALF + dim_offsets[None, None, :]) * value_cache_stride_d,
+        value_second,
+        mask=cache_mask,
+    )
+    tl.store(
+        value_cache_fp8_base + dim_offsets[None, None, :] * value_cache_stride_d,
+        value_first,
+        mask=cache_mask,
+    )
+    tl.store(
+        value_cache_fp8_base
+        + (HEAD_DIM_HALF + dim_offsets[None, None, :]) * value_cache_stride_d,
+        value_second,
+        mask=cache_mask,
+    )
+
+
+class _AcceleratedBlockKVCache(BlockKVCache):
+    """Block KV cache with an internal FP8 mirror for accelerated attention."""
+
+    _k_fp8: Tensor | None
+    """Cached keys quantized to FP8 E4M3 for the fused attention kernel."""
+
+    _v_fp8: Tensor | None
+    """Cached values quantized to FP8 E4M3 for the fused attention kernel."""
+
+    def __post_init__(self) -> None:
+        """Allocate the public cache and an eligible production FP8 mirror."""
+        super().__post_init__()
+        use_fp8 = (
+            self.dtype == torch.bfloat16
+            and self.k_shape[-1] == 128
+            and torch.device(self.device).type == "cuda"
+            and torch.cuda.get_device_capability(self.device)[0] >= 9
+        )
+        if use_fp8:
+            self._k_fp8 = torch.empty(
+                self.k_shape,
+                device=self.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            self._v_fp8 = torch.empty(
+                self.v_shape,
+                device=self.device,
+                dtype=torch.float8_e4m3fn,
+            )
+        else:
+            self._k_fp8 = None
+            self._v_fp8 = None
+
+    def _roll_local_window_left(self) -> None:
+        """Roll both public BF16 storage and the internal FP8 mirror."""
+        super()._roll_local_window_left()
+        if self._k_fp8 is None or self._v_fp8 is None:
+            return
+
+        tokens_to_keep = self.window_size - self.chunk_size
+        if tokens_to_keep <= 0:
+            return
+
+        total_size = self._k_fp8.shape[self.seq_dim]
+        src_start = self.sink_size + self.chunk_size
+        dst_start = self.sink_size
+        dst_end = self.sink_size + tokens_to_keep
+        dst_slice = self._seq_slice(dst_start, dst_end)
+        src_slice = self._seq_slice(src_start, total_size)
+        self._k_fp8[dst_slice] = self._k_fp8[src_slice].clone()
+        self._v_fp8[dst_slice] = self._v_fp8[src_slice].clone()
+
+    def cached_k_fp8(self) -> Tensor:
+        """Return the visible prefix of the internal FP8 key cache."""
+        assert self._k_fp8 is not None
+        return self._k_fp8[self._seq_slice(0, self._visible_end())]
+
+    def cached_v_fp8(self) -> Tensor:
+        """Return the visible prefix of the internal FP8 value cache."""
+        assert self._v_fp8 is not None
+        return self._v_fp8[self._seq_slice(0, self._visible_end())]
+
+
 class AcceleratedSelfAttention(ReferenceSelfAttention):
-    """Streaming self-attention with fused Triton FlashAttention."""
+    """Streaming self-attention with fused Triton preprocessing and attention."""
+
+    _fused_qkv_weight: Tensor | None
+    """Concatenated QKV projection weight quantized per output channel."""
+
+    _fused_qkv_scale: Tensor | None
+    """Per-output-channel dequantization scale for the fused QKV weight."""
+
+    _output_weight_fp8: Tensor | None
+    """Output projection weight quantized per output channel."""
+
+    _output_weight_scale: Tensor | None
+    """Per-output-channel dequantization scale for the output weight."""
+
+    def __init__(
+        self,
+        query_dim: int,
+        n_heads: int = 8,
+        head_dim: int = 64,
+    ) -> None:
+        """Initialize projections, fused weights, and per-head normalization.
+
+        Args:
+            query_dim: Feature dimension of input tokens and projected output.
+            n_heads: Number of attention heads.
+            head_dim: Feature dimension of each attention head.
+        """
+        super().__init__(query_dim, n_heads, head_dim)
+        self.register_buffer("_fused_qkv_weight", None, persistent=False)
+        self.register_buffer("_fused_qkv_scale", None, persistent=False)
+        self.register_buffer("_output_weight_fp8", None, persistent=False)
+        self.register_buffer("_output_weight_scale", None, persistent=False)
+        self._refresh_fused_qkv_weight()
+        self.register_load_state_dict_post_hook(self._refresh_fused_qkv_weight)
+
+    @staticmethod
+    @torch.no_grad()
+    def _quantize_linear_weight(weight: Tensor) -> tuple[Tensor, Tensor]:
+        """Quantize a linear weight to FP8 with one scale per output row."""
+        weight_float = weight.detach().to(torch.float32)
+        scale = (weight_float.abs().amax(dim=1) / 448.0).clamp_min(1e-12)
+        weight_fp8 = (
+            (weight_float / scale[:, None])
+            .clamp(-448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
+        return weight_fp8, scale.reshape(1, -1).contiguous()
+
+    @torch.no_grad()
+    def _refresh_fused_qkv_weight(self, *args: object) -> None:
+        """Rebuild FP8 projection weights from the authoritative parameters."""
+        fused_qkv_weight = torch.cat(
+            (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
+            dim=0,
+        )
+        self._fused_qkv_weight, self._fused_qkv_scale = self._quantize_linear_weight(
+            fused_qkv_weight
+        )
+        self._output_weight_fp8, self._output_weight_scale = (
+            self._quantize_linear_weight(self.output_proj.weight)
+        )
+
+    def _apply(
+        self,
+        fn: Callable[[Tensor], Tensor],
+        recurse: bool = True,
+    ) -> "AcceleratedSelfAttention":
+        """Apply a module conversion and rebuild derived FP8 weights."""
+        module = super()._apply(fn, recurse=recurse)
+        self._refresh_fused_qkv_weight()
+        return module
+
+    @staticmethod
+    def _fp8_linear(
+        x: Tensor,
+        weight: Tensor,
+        weight_scale: Tensor,
+    ) -> Tensor:
+        """Apply a unit-activation-scale, per-output-weight-scale FP8 GEMM."""
+        input_shape = x.shape
+        x_2d = x.reshape(-1, input_shape[-1])
+        x_fp8 = (
+            x_2d
+            if x_2d.dtype == torch.float8_e4m3fn
+            else x_2d.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        )
+        input_scale = torch.ones(
+            (x_2d.shape[0], 1),
+            device=x.device,
+            dtype=torch.float32,
+        )
+        output = torch._scaled_mm(
+            x_fp8,
+            weight.T,
+            input_scale,
+            weight_scale,
+            out_dtype=torch.bfloat16,
+            use_fast_accum=False,
+        )
+        return output.reshape(input_shape[:-1] + (weight.shape[0],))
+
+    def initialize_cache(
+        self,
+        batch_size: int,
+        chunk_size: int,
+        window_size: int,
+        sink_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> BlockKVCache:
+        """Initialize a cache with an internal FP8 mirror when supported."""
+        total_size = sink_size + window_size
+        return _AcceleratedBlockKVCache(
+            k_shape=(batch_size, total_size, self.n_heads, self.head_dim),
+            v_shape=(batch_size, total_size, self.n_heads, self.head_dim),
+            seq_dim=-3,
+            chunk_size=chunk_size,
+            window_size=window_size,
+            sink_size=sink_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _supports_fused_forward(
+        self,
+        x: Tensor,
+        kv_cache: BlockKVCache,
+        rope_freqs: Tensor,
+    ) -> bool:
+        """Return whether inputs satisfy the production FP8 fast-path contract."""
+        return (
+            not torch.is_grad_enabled()
+            and x.is_cuda
+            and isinstance(kv_cache, _AcceleratedBlockKVCache)
+            and x.dtype == torch.bfloat16
+            and self.head_dim == 128
+            and x.shape[-1] == self.n_heads * self.head_dim
+            and x.shape[-2] == kv_cache.chunk_size
+            and kv_cache.seq_dim == 1
+            and kv_cache._k.is_contiguous()
+            and kv_cache._v.is_contiguous()
+            and kv_cache._k.dtype == x.dtype
+            and kv_cache._v.dtype == x.dtype
+            and kv_cache._k.device == x.device
+            and kv_cache._v.device == x.device
+            and kv_cache._k_fp8 is not None
+            and kv_cache._v_fp8 is not None
+            and kv_cache._k_fp8.is_contiguous()
+            and kv_cache._v_fp8.is_contiguous()
+            and rope_freqs.ndim == 4
+            and rope_freqs.shape[0] == x.shape[-2]
+            and rope_freqs.shape[-1] == self.head_dim
+            and rope_freqs.is_cuda
+            and rope_freqs.device == x.device
+            and self._fused_qkv_weight is not None
+            and self._fused_qkv_weight.dtype == torch.float8_e4m3fn
+            and self._fused_qkv_weight.device == x.device
+            and self._fused_qkv_scale is not None
+            and self._fused_qkv_scale.dtype == torch.float32
+            and self._fused_qkv_scale.device == x.device
+            and self._output_weight_fp8 is not None
+            and self._output_weight_fp8.dtype == torch.float8_e4m3fn
+            and self._output_weight_fp8.device == x.device
+            and self._output_weight_scale is not None
+            and self._output_weight_scale.dtype == torch.float32
+            and self._output_weight_scale.device == x.device
+        )
+
+    @staticmethod
+    def _cache_write_slice(kv_cache: BlockKVCache) -> tuple[int, int, int]:
+        """Return the source offset, cache offset, and write length."""
+        write_start, write_end = kv_cache._current_write_bounds()
+        read_start = 0
+        if (
+            kv_cache.sink_size > 0
+            and not kv_cache._current_chunk_overlaps_sink()
+            and write_start < kv_cache.sink_size
+        ):
+            write_start = kv_cache.sink_size
+            write_length = write_end - write_start
+            read_start = kv_cache.chunk_size - write_length
+        return read_start, write_start, write_end - write_start
+
+    def _fused_qkv_and_cache(
+        self,
+        x: Tensor,
+        kv_cache: _AcceleratedBlockKVCache,
+        rope_freqs: Tensor,
+    ) -> Tensor:
+        """Project QKV and fuse normalization, RoPE, and cache writes.
+
+        Args:
+            x: Current token chunk of shape ``[..., L, D]``.
+            kv_cache: Cache prepared for the current chunk.
+            rope_freqs: Full-width RoPE angles of shape ``[L, 1, 1, head_dim]``.
+
+        Returns:
+            FP8 query heads in contiguous ``[B, L, H, D]`` layout.
+        """
+        batch_size = math.prod(x.shape[:-2])
+        sequence_length = x.shape[-2]
+        assert self._fused_qkv_weight is not None
+        assert self._fused_qkv_scale is not None
+        qkv = self._fp8_linear(
+            x, self._fused_qkv_weight, self._fused_qkv_scale
+        ).reshape(
+            batch_size,
+            sequence_length,
+            3,
+            self.n_heads,
+            self.head_dim,
+        )
+        query = torch.empty(
+            (batch_size, sequence_length, self.n_heads, self.head_dim),
+            device=x.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        assert kv_cache._k_fp8 is not None and kv_cache._v_fp8 is not None
+
+        cache_read_start, cache_write_start, cache_write_length = (
+            self._cache_write_slice(kv_cache)
+        )
+        block_s = 4
+        block_h = min(int(triton.next_power_of_2(self.n_heads)), 32)
+        block_d = max(int(triton.next_power_of_2(self.head_dim // 2)), 16)
+        grid = (
+            batch_size,
+            triton.cdiv(sequence_length, block_s),
+            triton.cdiv(self.n_heads, block_h),
+        )
+        _qkv_postprocess_cache_kernel[grid](
+            qkv,
+            query,
+            kv_cache._k,
+            kv_cache._v,
+            kv_cache._k_fp8,
+            kv_cache._v_fp8,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            rope_freqs,
+            *qkv.stride(),
+            *query.stride(),
+            *kv_cache._k.stride(),
+            *kv_cache._v.stride(),
+            rope_freqs.stride(0),
+            rope_freqs.stride(3),
+            sequence_length,
+            self.n_heads,
+            cache_read_start,
+            cache_write_start,
+            cache_write_length,
+            EPS=self.q_norm.eps,
+            HEAD_DIM_HALF=self.head_dim // 2,
+            BLOCK_S=block_s,
+            BLOCK_H=block_h,
+            BLOCK_D=block_d,
+            num_warps=4,
+            num_stages=1,
+        )
+        return query
+
+    @nvtx.annotate("self_attention.forward")
+    def forward(
+        self,
+        x: Tensor,
+        kv_cache: BlockKVCache,
+        rope_freqs: Tensor,
+    ) -> Tensor:
+        """Run the fused inference path when the production layout is supported.
+
+        Args:
+            x: Current token chunk of shape ``[..., L, D]``.
+            kv_cache: Cache prepared for this chunk with
+                :meth:`BlockKVCache.before_update`.
+            rope_freqs: Full-width RoPE angles of shape ``[L, 1, 1, head_dim]``.
+
+        Returns:
+            Projected attention output with the same shape as ``x``.
+        """
+        if not self._supports_fused_forward(x, kv_cache, rope_freqs):
+            return super().forward(x, kv_cache, rope_freqs)
+        assert isinstance(kv_cache, _AcceleratedBlockKVCache)
+
+        batch_shape = x.shape[:-2]
+        sequence_length = x.shape[-2]
+        inner_dim = self.n_heads * self.head_dim
+        with nvtx.annotate("self_attention.qkv_projection_and_postprocess"):
+            query = self._fused_qkv_and_cache(x, kv_cache, rope_freqs)
+
+        with nvtx.annotate("self_attention.attention"):
+            output = self._apply_attention_blhd(
+                query,
+                kv_cache.cached_k_fp8(),
+                kv_cache.cached_v_fp8(),
+            )
+
+        with nvtx.annotate("self_attention.output_projection"):
+            output = output.reshape(batch_shape + (sequence_length, inner_dim))
+            assert self._output_weight_fp8 is not None
+            assert self._output_weight_scale is not None
+            return self._fp8_linear(
+                output, self._output_weight_fp8, self._output_weight_scale
+            )
+
+    def _apply_attention_blhd(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+    ) -> Tensor:
+        """Apply TMA FlashAttention directly to contiguous BLHD tensors.
+
+        Args:
+            query: FP8 current query heads of shape ``[B, L, H, D]``.
+            key: FP8 cached key heads of shape ``[B, S, H, D]``.
+            value: FP8 cached value heads of shape ``[B, S, H, D]``.
+
+        Returns:
+            Contiguous FP8 attention output of shape ``[B, L, H, D]``.
+        """
+        batch_size, query_length, num_heads, head_dim = query.shape
+        key_batch, key_length, key_heads, key_dim = key.shape
+        assert (key_batch, key_heads, key_dim) == (
+            batch_size,
+            num_heads,
+            head_dim,
+        )
+        assert value.shape == key.shape
+
+        assert query.dtype == torch.float8_e4m3fn
+        assert key.dtype == torch.float8_e4m3fn
+        assert value.dtype == torch.float8_e4m3fn
+
+        output = torch.empty(
+            query.shape,
+            device=query.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        if batch_size == 0 or num_heads == 0 or query_length == 0:
+            return output
+        if key_length == 0:
+            return output.zero_()
+
+        block_m = min(
+            128,
+            max(int(triton.next_power_of_2(query_length)), 16),
+        )
+        grid = (
+            triton.cdiv(query_length, block_m),
+            batch_size * num_heads,
+        )
+        query_bhld_strides = (
+            query.stride(0),
+            query.stride(2),
+            query.stride(1),
+            query.stride(3),
+        )
+        key_bhld_strides = (
+            key.stride(0),
+            key.stride(2),
+            key.stride(1),
+            key.stride(3),
+        )
+        value_bhld_strides = (
+            value.stride(0),
+            value.stride(2),
+            value.stride(1),
+            value.stride(3),
+        )
+        output_bhld_strides = (
+            output.stride(0),
+            output.stride(2),
+            output.stride(1),
+            output.stride(3),
+        )
+        _flash_attention_tma_kernel[grid](
+            query,
+            key,
+            value,
+            output,
+            *query_bhld_strides,
+            *key_bhld_strides,
+            *value_bhld_strides,
+            *output_bhld_strides,
+            batch_size,
+            num_heads,
+            query_length,
+            key_length,
+            1.0 / math.sqrt(head_dim),
+            HEAD_DIM=head_dim,
+            BLOCK_M=block_m,
+            BLOCK_N=64,
+            WARP_SPECIALIZE=False,
+            num_warps=4,
+            num_stages=3,
+        )
+        return output
 
     def _apply_attention(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
         """Apply scaled dot-product attention with a fused Triton kernel.
@@ -535,7 +1247,7 @@ class AcceleratedSelfAttention(ReferenceSelfAttention):
         if head_dim > 256:
             raise ValueError("Triton FlashAttention supports head_dim at most 256.")
 
-        output = torch.empty_like(query, memory_format=torch.contiguous_format)
+        output = torch.empty_like(query, memory_format=torch.preserve_format)
         if batch_size == 0 or num_heads == 0 or query_length == 0 or head_dim == 0:
             return output
         if key_length == 0:

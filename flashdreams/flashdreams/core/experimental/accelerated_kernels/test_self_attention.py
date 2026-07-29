@@ -36,6 +36,7 @@ from flashdreams.core.experimental.accelerated_kernels.self_attention import (
     AcceleratedSelfAttention,
     FlashAttnSelfAttention,
     ReferenceSelfAttention,
+    _AcceleratedBlockKVCache,
 )
 
 
@@ -93,6 +94,23 @@ def _make_matching_attention_modules(
     reference.eval()
     candidate.eval()
     return reference, candidate
+
+
+def _assert_quantized_close(
+    actual: Tensor,
+    expected: Tensor,
+    *,
+    max_abs_error: float,
+    max_rmse: float,
+) -> None:
+    """Check explicit maximum and aggregate error bounds for FP8 results."""
+    error = (actual.to(torch.float32) - expected.to(torch.float32)).abs()
+    observed_max = error.max().item()
+    observed_rmse = error.square().mean().sqrt().item()
+    assert observed_max <= max_abs_error, (
+        f"maximum absolute error {observed_max} exceeds {max_abs_error}"
+    )
+    assert observed_rmse <= max_rmse, f"RMSE {observed_rmse} exceeds {max_rmse}"
 
 
 _CORRECTNESS_CASES = (
@@ -166,6 +184,91 @@ def test_flash_attention_matches_reference(
     )
     reference_cache.after_update(0)
     flash_cache.after_update(0)
+
+
+@pytest.mark.ci_gpu
+def test_fused_bfloat16_forward_matches_reference(
+    cuda_device: torch.device,
+) -> None:
+    """Match the production fused QKV path against the reference module."""
+    batch_size = 1
+    sequence_length = 17
+    n_heads = 16
+    head_dim = 128
+    query_dim = n_heads * head_dim
+    dtype = torch.bfloat16
+    generator = torch.Generator(device=cuda_device).manual_seed(2345)
+    reference, accelerated = _make_matching_attention_modules(
+        query_dim,
+        n_heads,
+        head_dim,
+        cuda_device,
+        dtype,
+        AcceleratedSelfAttention,
+    )
+    assert isinstance(accelerated, AcceleratedSelfAttention)
+    x = torch.randn(
+        batch_size,
+        sequence_length,
+        query_dim,
+        device=cuda_device,
+        dtype=dtype,
+        generator=generator,
+    )
+    rope_freqs = _make_rope_freqs(
+        sequence_length,
+        head_dim,
+        cuda_device,
+        generator,
+    )
+    reference_cache = reference.initialize_cache(
+        batch_size,
+        sequence_length,
+        sequence_length,
+        0,
+        cuda_device,
+        dtype,
+    )
+    accelerated_cache = accelerated.initialize_cache(
+        batch_size,
+        sequence_length,
+        sequence_length,
+        0,
+        cuda_device,
+        dtype,
+    )
+    reference_cache.before_update(0)
+    accelerated_cache.before_update(0)
+
+    with torch.inference_mode():
+        assert accelerated._supports_fused_forward(
+            x,
+            accelerated_cache,
+            rope_freqs,
+        )
+        expected = reference(x, reference_cache, rope_freqs)
+        actual = accelerated(x, accelerated_cache, rope_freqs)
+
+    _assert_quantized_close(
+        actual,
+        expected,
+        max_abs_error=7e-2,
+        max_rmse=2e-2,
+    )
+    _assert_quantized_close(
+        accelerated_cache.cached_k(),
+        reference_cache.cached_k(),
+        max_abs_error=2.5e-1,
+        max_rmse=5e-2,
+    )
+    _assert_quantized_close(
+        accelerated_cache.cached_v(),
+        reference_cache.cached_v(),
+        max_abs_error=1.5e-1,
+        max_rmse=3e-2,
+    )
+    reference_cache.after_update(0)
+    accelerated_cache.after_update(0)
 
 
 @pytest.mark.ci_gpu
@@ -320,25 +423,52 @@ def test_triton_attention_compiles_with_inductor(
 
 @pytest.mark.ci_gpu
 @pytest.mark.parametrize(
-    "attention_type",
+    "attention_type,dtype,n_heads,head_dim,output_tolerance,cache_tolerance",
     (
-        pytest.param(FlashAttnSelfAttention, id="pytorch-flash"),
-        pytest.param(AcceleratedSelfAttention, id="triton-flash"),
+        pytest.param(
+            FlashAttnSelfAttention,
+            torch.float16,
+            2,
+            32,
+            5e-3,
+            0.0,
+            id="pytorch-flash",
+        ),
+        pytest.param(
+            AcceleratedSelfAttention,
+            torch.float16,
+            2,
+            32,
+            5e-3,
+            0.0,
+            id="triton-flash",
+        ),
+        pytest.param(
+            AcceleratedSelfAttention,
+            torch.bfloat16,
+            16,
+            128,
+            4e-2,
+            2e-2,
+            id="triton-fused-bf16",
+        ),
     ),
 )
 def test_attention_updates_kv_cache(
     cuda_device: torch.device,
     attention_type: type[ReferenceSelfAttention],
+    dtype: torch.dtype,
+    n_heads: int,
+    head_dim: int,
+    output_tolerance: float,
+    cache_tolerance: float,
 ) -> None:
     """Preserve sink tokens and roll cached K/V at the window boundary."""
     batch_size = 2
     chunk_size = 4
     window_size = 8
     sink_size = 4
-    n_heads = 2
-    head_dim = 32
     query_dim = n_heads * head_dim
-    dtype = torch.float16
     generator = torch.Generator(device=cuda_device).manual_seed(5678)
     reference, candidate = _make_matching_attention_modules(
         query_dim, n_heads, head_dim, cuda_device, dtype, attention_type
@@ -373,6 +503,9 @@ def test_attention_updates_kv_cache(
             reference_cache.before_update(chunk_index)
             candidate_cache.before_update(chunk_index)
             expected_output = reference(x, reference_cache, rope_freqs)
+            if dtype == torch.bfloat16:
+                assert isinstance(candidate, AcceleratedSelfAttention)
+                assert candidate._supports_fused_forward(x, candidate_cache, rope_freqs)
             actual_output = candidate(x, candidate_cache, rope_freqs)
 
             local_start = max(sink_chunks, chunk_index - window_chunks + 1)
@@ -385,15 +518,74 @@ def test_attention_updates_kv_cache(
                 [projected_values[index] for index in visible_chunks], dim=1
             )
 
-            torch.testing.assert_close(
-                actual_output, expected_output, atol=5e-3, rtol=5e-3
+            uses_fp8 = (
+                isinstance(candidate_cache, _AcceleratedBlockKVCache)
+                and candidate_cache._k_fp8 is not None
             )
-            for cache in (reference_cache, candidate_cache):
+            if uses_fp8:
+                _assert_quantized_close(
+                    actual_output,
+                    expected_output,
+                    max_abs_error=7e-2,
+                    max_rmse=2e-2,
+                )
+            else:
                 torch.testing.assert_close(
-                    cache.cached_k(), expected_keys, atol=0, rtol=0
+                    actual_output,
+                    expected_output,
+                    atol=output_tolerance,
+                    rtol=output_tolerance,
+                )
+
+            torch.testing.assert_close(
+                reference_cache.cached_k(), expected_keys, atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                reference_cache.cached_v(), expected_values, atol=0, rtol=0
+            )
+            if uses_fp8:
+                _assert_quantized_close(
+                    candidate_cache.cached_k(),
+                    expected_keys,
+                    max_abs_error=2.5e-1,
+                    max_rmse=5e-2,
+                )
+                _assert_quantized_close(
+                    candidate_cache.cached_v(),
+                    expected_values,
+                    max_abs_error=1.5e-1,
+                    max_rmse=3e-2,
+                )
+            else:
+                torch.testing.assert_close(
+                    candidate_cache.cached_k(),
+                    expected_keys,
+                    atol=cache_tolerance,
+                    rtol=cache_tolerance,
                 )
                 torch.testing.assert_close(
-                    cache.cached_v(), expected_values, atol=0, rtol=0
+                    candidate_cache.cached_v(),
+                    expected_values,
+                    atol=cache_tolerance,
+                    rtol=cache_tolerance,
+                )
+
+            if uses_fp8:
+                cached_k_fp8 = candidate_cache.cached_k_fp8()
+                cached_v_fp8 = candidate_cache.cached_v_fp8()
+                assert cached_k_fp8.dtype == torch.float8_e4m3fn
+                assert cached_v_fp8.dtype == torch.float8_e4m3fn
+                torch.testing.assert_close(
+                    cached_k_fp8,
+                    candidate_cache.cached_k().to(torch.float8_e4m3fn),
+                    atol=0,
+                    rtol=0,
+                )
+                torch.testing.assert_close(
+                    cached_v_fp8,
+                    candidate_cache.cached_v().to(torch.float8_e4m3fn),
+                    atol=0,
+                    rtol=0,
                 )
 
             reference_cache.after_update(chunk_index)
@@ -404,6 +596,8 @@ def test_attention_updates_kv_cache(
 
 
 _BENCHMARK_CASES = (
+    pytest.param(1, 40 * 73 * 2, 16, 128, 1, id="b1-l5840-k5840-h16-hd128"),
+    pytest.param(1, 40 * 73 * 2, 16, 128, 3, id="b1-l5840-k17520-h16-hd128"),
     pytest.param(1, 80 * 44 * 2, 16, 128, 1, id="b1-l7040-k7040-h16-hd128"),
     pytest.param(1, 80 * 44 * 2, 16, 128, 3, id="b1-l7040-k21120-h16-hd128"),
 )
