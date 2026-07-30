@@ -17,7 +17,6 @@
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
 
 import nvtx
 import torch
@@ -65,6 +64,146 @@ def _cache_write_slice(kv_cache: BlockKVCache) -> tuple[int, int, int]:
     return read_start, write_start, write_end - write_start
 
 
+@torch.no_grad()
+def _quantize_linear_weight(weight: Tensor) -> tuple[Tensor, Tensor]:
+    """Quantize a linear weight to raw E4M3 bytes and FP32 row scales."""
+    weight_float = weight.detach().to(torch.float32)
+    scale = (weight_float.abs().amax(dim=1) / _FP8_MAX).clamp_min(1e-12)
+    weight_fp8 = (
+        (weight_float / scale[:, None])
+        .clamp(-_FP8_MAX, _FP8_MAX)
+        .to(torch.float8_e4m3fn)
+        .contiguous()
+    )
+    return weight_fp8.view(torch.uint8), scale.contiguous()
+
+
+def _as_float8(weight: Tensor) -> Tensor:
+    """View raw E4M3 bytes as an FP8 tensor without allocating a mirror."""
+    if weight.dtype == torch.float8_e4m3fn:
+        return weight
+    if weight.dtype != torch.uint8:
+        raise TypeError(f"FP8 weight storage must be uint8; got {weight.dtype}.")
+    return weight.view(torch.float8_e4m3fn)
+
+
+def _dequantize_linear_weight(weight: Tensor, weight_scale: Tensor) -> Tensor:
+    """Dequantize raw E4M3 weight storage to FP32."""
+    if weight_scale.ndim == 2 and weight_scale.shape[0] == 1:
+        weight_scale = weight_scale.squeeze(0)
+    if weight_scale.ndim != 1 or weight_scale.shape[0] != weight.shape[0]:
+        raise ValueError("FP8 weight_scale must contain one value per output row.")
+    return (
+        _as_float8(weight).to(torch.float32) * weight_scale.to(torch.float32)[:, None]
+    )
+
+
+def _fp8_linear(
+    x: Tensor,
+    weight: Tensor,
+    weight_scale: Tensor,
+    bias: Tensor | None,
+    out_dtype: torch.dtype,
+) -> Tensor:
+    """Apply dynamically scaled activations to a row-scaled FP8 GEMM."""
+    input_shape = x.shape
+    x_2d = x.reshape(-1, input_shape[-1])
+    if x_2d.dtype == torch.float8_e4m3fn:
+        x_fp8 = x_2d
+        input_scale = torch.ones(
+            (x_2d.shape[0], 1), device=x.device, dtype=torch.float32
+        )
+    else:
+        x_float = x_2d.to(torch.float32)
+        input_scale = (x_float.abs().amax(dim=1, keepdim=True) / _FP8_MAX).clamp_min(
+            1e-12
+        )
+        x_fp8 = (
+            (x_float / input_scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+        )
+    weight_fp8 = _as_float8(weight)
+    scaled_mm_dtype = torch.bfloat16
+    scaled_bias = bias.to(scaled_mm_dtype) if bias is not None else None
+    output = torch._scaled_mm(
+        x_fp8,
+        weight_fp8.T,
+        input_scale,
+        weight_scale.reshape(1, -1),
+        bias=scaled_bias,
+        out_dtype=scaled_mm_dtype,
+        use_fast_accum=False,
+    )
+    if out_dtype != scaled_mm_dtype:
+        output = output.to(out_dtype)
+    return output.reshape(input_shape[:-1] + (weight.shape[0],))
+
+
+class _PackedFP8Linear(nn.Module):
+    """Inference-only linear layer backed by one raw FP8 weight tensor."""
+
+    in_features: int
+    """Input feature width."""
+
+    out_features: int
+    """Output feature width."""
+
+    weight: Tensor
+    """Raw E4M3 bytes in ``[out_features, in_features]`` layout."""
+
+    weight_scale: Tensor
+    """FP32 dequantization scale for each output row."""
+
+    bias: Tensor | None
+    """Optional inference-only projection bias."""
+
+    def __init__(self, weight: Tensor, bias: Tensor | None) -> None:
+        """Quantize and retain only packed weight storage and row scales."""
+        super().__init__()
+        if weight.ndim != 2:
+            raise ValueError("Packed linear weight must be two-dimensional.")
+        self.out_features, self.in_features = weight.shape
+        packed_weight, weight_scale = _quantize_linear_weight(weight)
+        self.register_buffer("weight", packed_weight, persistent=True)
+        self.register_buffer("weight_scale", weight_scale, persistent=True)
+        if bias is None:
+            self.register_parameter("bias", None)
+        else:
+            self.bias = nn.Parameter(bias.detach().clone(), requires_grad=False)
+
+    def _apply(
+        self,
+        fn: Callable[[Tensor], Tensor],
+        recurse: bool = True,
+    ) -> "_PackedFP8Linear":
+        """Move row scales without allowing module dtype casts to change FP32."""
+        weight_scale = self._buffers.pop("weight_scale")
+        assert weight_scale is not None
+        try:
+            module = super()._apply(fn, recurse=recurse)
+            scale_bytes = fn(weight_scale.contiguous().view(torch.uint8))
+            self.register_buffer(
+                "weight_scale", scale_bytes.view(torch.float32), persistent=True
+            )
+        except Exception:
+            self.register_buffer("weight_scale", weight_scale, persistent=True)
+            raise
+        return module
+
+    def forward(self, x: Tensor, out_dtype: torch.dtype) -> Tensor:
+        """Apply the packed FP8 projection."""
+        return _fp8_linear(
+            x, self.weight, self.weight_scale, self.bias, out_dtype=out_dtype
+        )
+
+    def extra_repr(self) -> str:
+        """Return feature and bias metadata for module summaries."""
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}"
+        )
+
+
+# TODO: Replace hard-coded heuristic with Triton auto tuning.
 def _select_attention_config(
     query_length: int,
     head_dim: int,
@@ -150,7 +289,8 @@ def _flash_attention_kernel(
 
     The launch grid is ``[B * H, ceil(L / BLOCK_M)]``. Each program streams
     across cached K/V blocks while retaining only its online-softmax state and
-    ``[BLOCK_M, BLOCK_D]`` output accumulator.
+    ``[BLOCK_M, BLOCK_D]`` output accumulator. ``BLOCK_D`` pads the physical
+    head width to a dot-product-friendly power of two; masked lanes remain zero.
     """
     # Select one batch/head pair and one query-row tile.
     batch_head = tl.program_id(0)
@@ -175,6 +315,9 @@ def _flash_attention_kernel(
         mask=query_mask[:, None] & dim_mask[None, :],
         other=0.0,
     )
+
+    # Initialize the online-softmax state for each query row. The accumulator
+    # stays in FP32 while K/V blocks are incorporated one at a time.
     row_max = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
     denominator = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
@@ -182,6 +325,7 @@ def _flash_attention_kernel(
     # Base-2 exponentials are cheaper in Triton; fold log2(e) into the QK scale.
     qk_scale = scale.to(tl.float32) * 1.4426950408889634
     for key_start in range(0, key_length, BLOCK_N):
+        # Stream one K/V tile from the cache and mask the final partial tile.
         key_offsets = key_start + tl.arange(0, BLOCK_N)
         key_mask = key_offsets < key_length
         key_ptrs = (
@@ -225,6 +369,7 @@ def _flash_attention_kernel(
         )
         row_max = new_row_max
 
+    # Normalize the accumulated weighted values and discard padded rows/features.
     output = accumulator / denominator[:, None]
     output_ptrs = (
         output_ptr
@@ -268,12 +413,20 @@ def _flash_attention_tma_kernel(
     BLOCK_N: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
 ):
-    """Apply non-causal FlashAttention with tensor-memory-accelerator loads."""
+    """Apply non-causal FlashAttention with tensor-memory-accelerator loads.
+
+    The launch grid is ``[ceil(L / BLOCK_M), B * H]``. Tensor descriptors move
+    rectangular Q/K/V tiles while the kernel uses the same online-softmax
+    recurrence as the pointer-based implementation.
+    """
+    # Select one query tile and one flattened batch/head pair.
     query_block = tl.program_id(0)
     batch_head = tl.program_id(1)
     batch = batch_head // num_heads
     head = batch_head % num_heads
 
+    # Describe the logical BHLD views once so TMA can issue tiled asynchronous
+    # transfers without explicit pointer matrices in the loop below.
     query_desc = tl.make_tensor_descriptor(
         query_ptr,
         shape=[batch_size, num_heads, query_length, HEAD_DIM],
@@ -314,6 +467,7 @@ def _flash_attention_tma_kernel(
         block_shape=[1, 1, BLOCK_M, HEAD_DIM],
     )
 
+    # Load Q once and initialize one online-softmax state per query row.
     query_start = query_block * BLOCK_M
     query = query_desc.load([batch, head, query_start, 0]).reshape((BLOCK_M, HEAD_DIM))
     row_max = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
@@ -328,17 +482,23 @@ def _flash_attention_tma_kernel(
         BLOCK_N,
         warp_specialize=WARP_SPECIALIZE,
     ):
+        # Stream a K tile, form its score contribution, and mask descriptor
+        # padding in the final key tile before the softmax reduction.
         key = key_desc.load([batch, head, key_start, 0]).reshape((BLOCK_N, HEAD_DIM))
         scores = tl.dot(query, tl.trans(key), input_precision="ieee")
         scores *= qk_scale
         key_mask = key_start + key_offsets < key_length
         scores = tl.where(key_mask[None, :], scores, -float("inf"))
 
+        # Merge this tile into the running softmax without materializing the
+        # complete query-by-key score matrix.
         block_max = tl.max(scores, axis=1)
         new_row_max = tl.maximum(row_max, block_max)
         correction = tl.exp2(row_max - new_row_max)
         probabilities = tl.exp2(scores - new_row_max[:, None])
         denominator = denominator * correction + tl.sum(probabilities, axis=1)
+        # Delay the V transfer until its probabilities are available, then add
+        # its weighted contribution to the FP32 output accumulator.
         value = value_desc.load([batch, head, key_start, 0]).reshape(
             (BLOCK_N, HEAD_DIM)
         )
@@ -349,6 +509,7 @@ def _flash_attention_tma_kernel(
         )
         row_max = new_row_max
 
+    # Normalize and let the descriptor store handle a partial final query tile.
     output = accumulator / denominator[:, None]
     output_desc.store(
         [batch, head, query_start, 0],
@@ -364,8 +525,6 @@ def _qkv_postprocess_cache_kernel(
     query_output_ptr,
     key_cache_ptr,
     value_cache_ptr,
-    key_cache_fp8_ptr,
-    value_cache_fp8_ptr,
     query_weight_ptr,
     key_weight_ptr,
     rope_freqs_ptr,
@@ -405,16 +564,22 @@ def _qkv_postprocess_cache_kernel(
     APPLY_NORM: tl.constexpr,
     APPLY_ROPE: tl.constexpr,
     INTERLEAVED: tl.constexpr,
-    WRITE_FP8: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Normalize and rotate Q/K while writing K/V into the prepared cache."""
+    """Normalize and rotate Q/K while writing K/V into the prepared cache.
+
+    Each program handles one batch and a tile of sequence positions, heads, and
+    paired feature dimensions. Compile-time flags remove normalization, RoPE,
+    and cache conversion when those operations are disabled.
+    """
+    # Select a three-dimensional sequence/head/half-feature tile for one batch.
     batch = tl.program_id(0)
     sequence_block = tl.program_id(1)
     head_block = tl.program_id(2)
 
+    # Rounded block sizes require independent masks along every tiled axis.
     sequence_offsets = sequence_block * BLOCK_S + tl.arange(0, BLOCK_S)
     head_offsets = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
     dim_offsets = tl.arange(0, BLOCK_D)
@@ -427,6 +592,8 @@ def _qkv_postprocess_cache_kernel(
         & dim_mask[None, None, :]
     )
 
+    # Express both RoPE layouts as pairs: adjacent even/odd features for the
+    # interleaved layout, or corresponding features from the two head halves.
     if INTERLEAVED:
         first_feature_offsets = 2 * dim_offsets
         second_feature_offsets = 2 * dim_offsets + 1
@@ -434,6 +601,7 @@ def _qkv_postprocess_cache_kernel(
         first_feature_offsets = dim_offsets
         second_feature_offsets = HEAD_DIM_HALF + dim_offsets
 
+    # Build BLH bases and load both members of each Q/K feature pair.
     query_base = (
         query_input_ptr
         + batch * query_input_stride_b
@@ -474,6 +642,8 @@ def _qkv_postprocess_cache_kernel(
     )
 
     if APPLY_NORM:
+        # Compute one FP32 RMS statistic per sequence/head over both members of
+        # every feature pair, then apply the learned per-feature weights.
         query_square_sum = tl.sum(
             query_first.to(tl.float32) * query_first.to(tl.float32)
             + query_second.to(tl.float32) * query_second.to(tl.float32),
@@ -520,6 +690,8 @@ def _qkv_postprocess_cache_kernel(
         ).to(key_second.dtype)
 
     if APPLY_ROPE:
+        # Frequencies are shared across heads. Selecting the first member's
+        # offset addresses each pair's angle in either supported RoPE layout.
         frequency_offsets = (
             sequence_offsets[:, None] * rope_stride_l
             + first_feature_offsets[None, :] * rope_stride_d
@@ -532,6 +704,7 @@ def _qkv_postprocess_cache_kernel(
         ).to(tl.float32)
         cos_freqs = tl.cos(frequencies).to(query_first.dtype)[:, None, :]
         sin_freqs = tl.sin(frequencies).to(query_first.dtype)[:, None, :]
+        # Apply the same two-dimensional rotation to Q and K for every pair.
         query_rotated_first = query_first * cos_freqs - query_second * sin_freqs
         query_rotated_second = query_second * cos_freqs + query_first * sin_freqs
         key_rotated_first = key_first * cos_freqs - key_second * sin_freqs
@@ -542,6 +715,7 @@ def _qkv_postprocess_cache_kernel(
         key_rotated_first = key_first
         key_rotated_second = key_second
 
+    # Materialize processed Q for attention; Q is never retained in the cache.
     query_output_base = (
         query_output_ptr
         + batch * query_output_stride_b
@@ -561,6 +735,8 @@ def _qkv_postprocess_cache_kernel(
         mask=activation_mask,
     )
 
+    # Map the writable source slice onto its physical cache destination. Sink
+    # preservation can make this a suffix of the current input chunk.
     cache_offsets = sequence_offsets - cache_read_start
     cache_mask = (
         activation_mask
@@ -568,6 +744,7 @@ def _qkv_postprocess_cache_kernel(
         & (cache_offsets[:, None, None] < cache_write_length)
     )
     cache_sequence_offsets = cache_write_start + cache_offsets
+    # Build native cache addresses only for lanes selected by the cache mapping.
     key_cache_base = (
         key_cache_ptr
         + batch * key_cache_stride_b
@@ -580,6 +757,7 @@ def _qkv_postprocess_cache_kernel(
         + cache_sequence_offsets[:, None, None] * value_cache_stride_l
         + head_offsets[None, :, None] * value_cache_stride_h
     )
+    # V bypasses RMSNorm and RoPE, so load it only when preparing cache stores.
     value_first = tl.load(
         value_base + first_feature_offsets[None, None, :] * value_input_stride_d,
         mask=activation_mask,
@@ -590,6 +768,7 @@ def _qkv_postprocess_cache_kernel(
         mask=activation_mask,
         other=0.0,
     )
+    # Store K/V once; the cache tensor dtype performs any FP8 conversion.
     tl.store(
         key_cache_base + first_feature_offsets[None, None, :] * key_cache_stride_d,
         key_rotated_first,
@@ -611,121 +790,6 @@ def _qkv_postprocess_cache_kernel(
         mask=cache_mask,
     )
 
-    if WRITE_FP8:
-        key_cache_fp8_base = (
-            key_cache_fp8_ptr
-            + batch * key_cache_stride_b
-            + cache_sequence_offsets[:, None, None] * key_cache_stride_l
-            + head_offsets[None, :, None] * key_cache_stride_h
-        )
-        value_cache_fp8_base = (
-            value_cache_fp8_ptr
-            + batch * value_cache_stride_b
-            + cache_sequence_offsets[:, None, None] * value_cache_stride_l
-            + head_offsets[None, :, None] * value_cache_stride_h
-        )
-        tl.store(
-            key_cache_fp8_base
-            + first_feature_offsets[None, None, :] * key_cache_stride_d,
-            key_rotated_first,
-            mask=cache_mask,
-        )
-        tl.store(
-            key_cache_fp8_base
-            + second_feature_offsets[None, None, :] * key_cache_stride_d,
-            key_rotated_second,
-            mask=cache_mask,
-        )
-        tl.store(
-            value_cache_fp8_base
-            + first_feature_offsets[None, None, :] * value_cache_stride_d,
-            value_first,
-            mask=cache_mask,
-        )
-        tl.store(
-            value_cache_fp8_base
-            + second_feature_offsets[None, None, :] * value_cache_stride_d,
-            value_second,
-            mask=cache_mask,
-        )
-
-
-@dataclass
-class _AcceleratedBlockKVCache(BlockKVCache):
-    """Block KV cache with an optional internal FP8 mirror."""
-
-    use_fp8: bool = False
-    """Whether to allocate the FP8 mirror when the device and shape allow it."""
-
-    _k_fp8: Tensor | None = field(init=False, default=None)
-    """Cached keys quantized to FP8 E4M3 for accelerated attention."""
-
-    _v_fp8: Tensor | None = field(init=False, default=None)
-    """Cached values quantized to FP8 E4M3 for accelerated attention."""
-
-    def __post_init__(self) -> None:
-        """Allocate native storage and an eligible FP8 mirror."""
-        super().__post_init__()
-        device = torch.device(self.device)
-        supports_device = (
-            device.type == "cuda"
-            and torch.cuda.is_available()
-            and torch.cuda.get_device_capability(device)[0] >= 9
-        )
-        supports_dtype = self.dtype in (torch.float16, torch.bfloat16)
-        supports_shape = (
-            len(self.k_shape) >= 2
-            and self.k_shape[-1] == self.v_shape[-1]
-            and _supports_fp8_cache_shape(self.k_shape[-2], self.k_shape[-1])
-        )
-        if self.use_fp8 and supports_device and supports_dtype and supports_shape:
-            self._k_fp8 = torch.empty(
-                self.k_shape, device=self.device, dtype=torch.float8_e4m3fn
-            )
-            self._v_fp8 = torch.empty(
-                self.v_shape, device=self.device, dtype=torch.float8_e4m3fn
-            )
-
-    def _roll_local_window_left(self) -> None:
-        """Roll both native storage and the optional FP8 mirror."""
-        super()._roll_local_window_left()
-        if self._k_fp8 is None or self._v_fp8 is None:
-            return
-        tokens_to_keep = self.window_size - self.chunk_size
-        if tokens_to_keep <= 0:
-            return
-        total_size = self._k_fp8.shape[self.seq_dim]
-        src_start = self.sink_size + self.chunk_size
-        dst_start = self.sink_size
-        dst_end = self.sink_size + tokens_to_keep
-        dst_slice = self._seq_slice(dst_start, dst_end)
-        src_slice = self._seq_slice(src_start, total_size)
-        self._k_fp8[dst_slice] = self._k_fp8[src_slice].clone()
-        self._v_fp8[dst_slice] = self._v_fp8[src_slice].clone()
-
-    def update(self, k: Tensor, v: Tensor) -> None:
-        """Write native K/V and update the optional FP8 mirror."""
-        super().update(k, v)
-        if self._k_fp8 is None or self._v_fp8 is None:
-            return
-        read_start, write_start, write_length = _cache_write_slice(self)
-        read_slice = self._seq_slice(read_start, read_start + write_length)
-        write_slice = self._seq_slice(write_start, write_start + write_length)
-        self._k_fp8[write_slice] = k[read_slice].to(torch.float8_e4m3fn)
-        self._v_fp8[write_slice] = v[read_slice].to(torch.float8_e4m3fn)
-
-    def cached_k_fp8(self) -> Tensor:
-        """Return the visible prefix of the FP8 key cache."""
-        if self._k_fp8 is None:
-            raise RuntimeError("FP8 key storage is unavailable.")
-        return self._k_fp8[self._seq_slice(0, self._visible_end())]
-
-    def cached_v_fp8(self) -> Tensor:
-        """Return the visible prefix of the FP8 value cache."""
-        if self._v_fp8 is None:
-            raise RuntimeError("FP8 value storage is unavailable.")
-        return self._v_fp8[self._seq_slice(0, self._visible_end())]
-
 
 class AcceleratedSelfAttention(nn.Module):
     """Streaming self-attention with independently configurable fast paths."""
@@ -738,6 +802,14 @@ class AcceleratedSelfAttention(nn.Module):
 
     query_dim: int
     """Input and output feature width, independent of the attention inner width."""
+
+    qkv_proj: _PackedFP8Linear
+    q_proj: nn.Linear
+    k_proj: nn.Linear
+    v_proj: nn.Linear
+    output_proj: nn.Linear | _PackedFP8Linear
+    _fused_qkv_weight: Tensor | None
+    _fused_qkv_bias: Tensor | None
 
     def __init__(
         self,
@@ -789,25 +861,48 @@ class AcceleratedSelfAttention(nn.Module):
         self.fuse_rope_kv_cache = fuse_rope_kv_cache
         self.use_fp8 = use_fp8
 
-        self.q_proj = nn.Linear(query_dim, inner_dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(query_dim, inner_dim, bias=qkv_bias)
-        self.v_proj = nn.Linear(query_dim, inner_dim, bias=qkv_bias)
-        self.output_proj = nn.Linear(inner_dim, query_dim, bias=output_bias)
+        if use_fp8:
+            if query_dim % 16 != 0:
+                raise ValueError(
+                    "FP8 projection requires query_dim to be a multiple of 16."
+                )
+            if not _supports_fp8_cache_shape(n_heads, head_dim):
+                raise ValueError(
+                    "FP8 attention requires head_dim <= 256 and inner_dim to be "
+                    "a multiple of 16."
+                )
+
+        q_proj = nn.Linear(query_dim, inner_dim, bias=qkv_bias)
+        k_proj = nn.Linear(query_dim, inner_dim, bias=qkv_bias)
+        v_proj = nn.Linear(query_dim, inner_dim, bias=qkv_bias)
+        output_proj = nn.Linear(inner_dim, query_dim, bias=output_bias)
+        if use_fp8:
+            fused_weight = torch.cat(
+                (q_proj.weight, k_proj.weight, v_proj.weight), dim=0
+            )
+            fused_bias = None
+            if q_proj.bias is not None:
+                assert k_proj.bias is not None and v_proj.bias is not None
+                fused_bias = torch.cat((q_proj.bias, k_proj.bias, v_proj.bias), dim=0)
+            self.qkv_proj = _PackedFP8Linear(fused_weight, fused_bias)
+            self.output_proj = _PackedFP8Linear(output_proj.weight, output_proj.bias)
+        else:
+            self.q_proj = q_proj
+            self.k_proj = k_proj
+            self.v_proj = v_proj
+            self.output_proj = output_proj
+            self.register_buffer("_fused_qkv_weight", None, persistent=False)
+            self.register_buffer("_fused_qkv_bias", None, persistent=False)
+
         self.q_norm: nn.Module = (
             nn.RMSNorm(head_dim, eps=qk_norm_eps) if qk_norm else nn.Identity()
         )
         self.k_norm: nn.Module = (
             nn.RMSNorm(head_dim, eps=qk_norm_eps) if qk_norm else nn.Identity()
         )
-
-        self.register_buffer("_fused_qkv_weight", None, persistent=False)
-        self.register_buffer("_fused_qkv_bias", None, persistent=False)
-        self.register_buffer("_fused_qkv_weight_fp8", None, persistent=False)
-        self.register_buffer("_fused_qkv_scale", None, persistent=False)
-        self.register_buffer("_output_weight_fp8", None, persistent=False)
-        self.register_buffer("_output_weight_scale", None, persistent=False)
-        self._refresh_derived_weights()
-        self.register_load_state_dict_post_hook(self._refresh_derived_weights)
+        if not use_fp8:
+            self._refresh_derived_weights()
+            self.register_load_state_dict_post_hook(self._refresh_derived_weights)
 
     @property
     def optimization_settings(self) -> dict[str, bool]:
@@ -827,22 +922,139 @@ class AcceleratedSelfAttention(nn.Module):
             )
 
     @staticmethod
-    @torch.no_grad()
-    def _quantize_linear_weight(weight: Tensor) -> tuple[Tensor, Tensor]:
-        """Quantize a linear weight with one FP8 scale per output row."""
-        weight_float = weight.detach().to(torch.float32)
-        scale = (weight_float.abs().amax(dim=1) / _FP8_MAX).clamp_min(1e-12)
-        weight_fp8 = (
-            (weight_float / scale[:, None])
-            .clamp(-_FP8_MAX, _FP8_MAX)
-            .to(torch.float8_e4m3fn)
-            .contiguous()
+    def _normalize_packed_weight(weight: Tensor) -> Tensor:
+        """Normalize packed checkpoint storage to contiguous raw E4M3 bytes."""
+        if weight.dtype == torch.float8_e4m3fn:
+            return weight.contiguous().view(torch.uint8)
+        if weight.dtype != torch.uint8:
+            raise TypeError(f"Packed FP8 weights must be uint8; got {weight.dtype}.")
+        return weight.contiguous()
+
+    @staticmethod
+    def _normalize_weight_scale(weight_scale: Tensor, rows: int) -> Tensor:
+        """Normalize a packed checkpoint scale to one FP32 value per row."""
+        scale = weight_scale.squeeze(0) if weight_scale.ndim == 2 else weight_scale
+        if scale.ndim != 1 or scale.numel() != rows:
+            raise ValueError(f"Packed FP8 scale must contain {rows} values.")
+        return scale.to(torch.float32).contiguous()
+
+    def _prepare_packed_state_dict(
+        self, state_dict: dict[str, Tensor], prefix: str
+    ) -> None:
+        """Upgrade legacy split native projections to the packed FP8 schema."""
+        qkv_key = prefix + "qkv_proj.weight"
+        qkv_scale_key = prefix + "qkv_proj.weight_scale"
+        legacy_weight_keys = [
+            prefix + f"{name}_proj.weight" for name in ("q", "k", "v")
+        ]
+        legacy_present = [key in state_dict for key in legacy_weight_keys]
+        if qkv_key in state_dict and any(legacy_present):
+            raise RuntimeError("Checkpoint mixes packed and split Q/K/V weights.")
+        if qkv_key not in state_dict and all(legacy_present):
+            fused_weight = torch.cat(
+                [state_dict.pop(key) for key in legacy_weight_keys], dim=0
+            )
+            packed_weight, weight_scale = _quantize_linear_weight(fused_weight)
+            state_dict[qkv_key] = packed_weight
+            state_dict[qkv_scale_key] = weight_scale
+            legacy_bias_keys = [
+                prefix + f"{name}_proj.bias" for name in ("q", "k", "v")
+            ]
+            if all(key in state_dict for key in legacy_bias_keys):
+                state_dict[prefix + "qkv_proj.bias"] = torch.cat(
+                    [state_dict.pop(key) for key in legacy_bias_keys], dim=0
+                )
+        elif qkv_key in state_dict:
+            qkv_weight = state_dict[qkv_key]
+            if qkv_weight.dtype not in (torch.uint8, torch.float8_e4m3fn):
+                qkv_weight, qkv_scale = _quantize_linear_weight(qkv_weight)
+                state_dict[qkv_key] = qkv_weight
+                state_dict[qkv_scale_key] = qkv_scale
+            elif qkv_scale_key not in state_dict:
+                raise RuntimeError("Packed QKV checkpoint is missing weight_scale.")
+
+        output_key = prefix + "output_proj.weight"
+        output_scale_key = prefix + "output_proj.weight_scale"
+        if output_key in state_dict:
+            output_weight = state_dict[output_key]
+            if output_weight.dtype not in (torch.uint8, torch.float8_e4m3fn):
+                output_weight, output_scale = _quantize_linear_weight(output_weight)
+                state_dict[output_key] = output_weight
+                state_dict[output_scale_key] = output_scale
+            elif output_scale_key not in state_dict:
+                raise RuntimeError("Packed output checkpoint is missing weight_scale.")
+
+        for weight_key, scale_key in (
+            (qkv_key, qkv_scale_key),
+            (output_key, output_scale_key),
+        ):
+            if weight_key not in state_dict or scale_key not in state_dict:
+                continue
+            state_dict[weight_key] = self._normalize_packed_weight(
+                state_dict[weight_key]
+            )
+            state_dict[scale_key] = self._normalize_weight_scale(
+                state_dict[scale_key], state_dict[weight_key].shape[0]
+            )
+
+    def _prepare_native_state_dict(
+        self, state_dict: dict[str, Tensor], prefix: str
+    ) -> None:
+        """Downgrade the packed FP8 schema for a native attention instance."""
+        qkv_key = prefix + "qkv_proj.weight"
+        qkv_scale_key = prefix + "qkv_proj.weight_scale"
+        if qkv_key in state_dict:
+            if qkv_scale_key not in state_dict:
+                raise RuntimeError("Packed QKV checkpoint is missing weight_scale.")
+            fused_weight = _dequantize_linear_weight(
+                state_dict.pop(qkv_key), state_dict.pop(qkv_scale_key)
+            )
+            q_weight, k_weight, v_weight = fused_weight.chunk(3, dim=0)
+            for name, weight in zip(("q", "k", "v"), (q_weight, k_weight, v_weight)):
+                state_dict[prefix + f"{name}_proj.weight"] = weight
+            qkv_bias_key = prefix + "qkv_proj.bias"
+            if qkv_bias_key in state_dict:
+                q_bias, k_bias, v_bias = state_dict.pop(qkv_bias_key).chunk(3, dim=0)
+                for name, bias in zip(("q", "k", "v"), (q_bias, k_bias, v_bias)):
+                    state_dict[prefix + f"{name}_proj.bias"] = bias
+
+        output_key = prefix + "output_proj.weight"
+        output_scale_key = prefix + "output_proj.weight_scale"
+        if output_key in state_dict and output_scale_key in state_dict:
+            state_dict[output_key] = _dequantize_linear_weight(
+                state_dict[output_key], state_dict.pop(output_scale_key)
+            )
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, object],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        """Load packed checkpoints and transparently upgrade legacy weights."""
+        if self.use_fp8:
+            self._prepare_packed_state_dict(state_dict, prefix)
+        else:
+            self._prepare_native_state_dict(state_dict, prefix)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
         )
-        return weight_fp8, scale.reshape(1, -1).contiguous()
 
     @torch.no_grad()
     def _refresh_derived_weights(self, *args: object) -> None:
-        """Rebuild fused and quantized weights from authoritative parameters."""
+        """Rebuild the native fused projection from authoritative parameters."""
+        if self.use_fp8:
+            return
         fused_weight = torch.cat(
             (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight), dim=0
         ).detach()
@@ -854,69 +1066,55 @@ class AcceleratedSelfAttention(nn.Module):
             self._fused_qkv_bias = torch.cat(
                 (self.q_proj.bias, self.k_proj.bias, self.v_proj.bias), dim=0
             ).detach()
-        if self.use_fp8:
-            self._fused_qkv_weight_fp8, self._fused_qkv_scale = (
-                self._quantize_linear_weight(fused_weight)
-            )
-            self._output_weight_fp8, self._output_weight_scale = (
-                self._quantize_linear_weight(self.output_proj.weight)
-            )
-        else:
-            self._fused_qkv_weight_fp8 = None
-            self._fused_qkv_scale = None
-            self._output_weight_fp8 = None
-            self._output_weight_scale = None
 
     def _apply(
         self,
         fn: Callable[[Tensor], Tensor],
         recurse: bool = True,
     ) -> "AcceleratedSelfAttention":
-        """Apply a module conversion and rebuild derived projection weights."""
+        """Apply a module conversion while preserving packed FP8 metadata."""
         module = super()._apply(fn, recurse=recurse)
-        self._refresh_derived_weights()
+        if not self.use_fp8:
+            self._refresh_derived_weights()
         return module
 
     @staticmethod
-    def _fp8_linear(
-        x: Tensor,
-        weight: Tensor,
-        weight_scale: Tensor,
-        bias: Tensor | None,
-        out_dtype: torch.dtype,
-    ) -> Tensor:
-        """Apply a dynamically scaled activation and row-scaled FP8 GEMM."""
-        input_shape = x.shape
-        x_2d = x.reshape(-1, input_shape[-1])
-        if x_2d.dtype == torch.float8_e4m3fn:
-            x_fp8 = x_2d
-            input_scale = torch.ones(
-                (x_2d.shape[0], 1), device=x.device, dtype=torch.float32
+    def _validate_fp8_device(device: torch.device) -> None:
+        """Require a CUDA device with native FP8 tensor-core support."""
+        if device.type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError("FP8-only attention requires a CUDA device.")
+        if torch.cuda.get_device_capability(device)[0] < 9:
+            raise RuntimeError("FP8-only attention requires compute capability 9.0+.")
+
+    def _validate_fp8_forward(self, x: Tensor, kv_cache: BlockKVCache) -> None:
+        """Reject inputs that cannot execute the strict FP8-only path."""
+        if not self.use_fp8:
+            return
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "FP8-only attention is inference-only; disable gradients."
             )
-        else:
-            x_float = x_2d.to(torch.float32)
-            input_scale = (
-                x_float.abs().amax(dim=1, keepdim=True) / _FP8_MAX
-            ).clamp_min(1e-12)
-            x_fp8 = (
-                (x_float / input_scale)
-                .clamp(-_FP8_MAX, _FP8_MAX)
-                .to(torch.float8_e4m3fn)
+        self._validate_fp8_device(x.device)
+        if x.dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError("FP8-only attention requires FP16 or BF16 activations.")
+        if (
+            kv_cache._k.dtype != torch.float8_e4m3fn
+            or kv_cache._v.dtype != torch.float8_e4m3fn
+        ):
+            raise TypeError("FP8-only attention requires an FP8 E4M3 KV cache.")
+        if kv_cache._k.device != x.device or kv_cache._v.device != x.device:
+            raise ValueError("FP8 KV cache and activations must be on the same device.")
+        if not isinstance(self.qkv_proj, _PackedFP8Linear) or not isinstance(
+            self.output_proj, _PackedFP8Linear
+        ):
+            raise RuntimeError("FP8-only attention is missing packed projections.")
+        if (
+            self.qkv_proj.weight.device != x.device
+            or self.output_proj.weight.device != x.device
+        ):
+            raise ValueError(
+                "Packed FP8 weights and activations must be on the same device."
             )
-        scaled_mm_dtype = torch.bfloat16
-        scaled_bias = bias.to(scaled_mm_dtype) if bias is not None else None
-        output = torch._scaled_mm(
-            x_fp8,
-            weight.T,
-            input_scale,
-            weight_scale,
-            bias=scaled_bias,
-            out_dtype=scaled_mm_dtype,
-            use_fast_accum=False,
-        )
-        if out_dtype != scaled_mm_dtype:
-            output = output.to(out_dtype)
-        return output.reshape(input_shape[:-1] + (weight.shape[0],))
 
     def initialize_cache(
         self,
@@ -927,9 +1125,16 @@ class AcceleratedSelfAttention(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> BlockKVCache:
-        """Initialize the fixed-size streaming KV cache."""
+        """Initialize the fixed-size canonical KV cache."""
+        cache_dtype = dtype
+        if self.use_fp8:
+            device = torch.device(device)
+            self._validate_fp8_device(device)
+            if dtype not in (torch.float16, torch.bfloat16):
+                raise TypeError("FP8-only attention requires FP16 or BF16 activations.")
+            cache_dtype = torch.float8_e4m3fn
         total_size = sink_size + window_size
-        return _AcceleratedBlockKVCache(
+        return BlockKVCache(
             k_shape=(batch_size, total_size, self.n_heads, self.head_dim),
             v_shape=(batch_size, total_size, self.n_heads, self.head_dim),
             seq_dim=-3,
@@ -937,29 +1142,7 @@ class AcceleratedSelfAttention(nn.Module):
             window_size=window_size,
             sink_size=sink_size,
             device=device,
-            dtype=dtype,
-            use_fp8=self.use_fp8,
-        )
-
-    def _supports_fp8_forward(self, x: Tensor, kv_cache: BlockKVCache) -> bool:
-        """Return whether FP8 can accelerate the complete forward path."""
-        return (
-            self.use_fp8
-            and not torch.is_grad_enabled()
-            and x.is_cuda
-            and x.dtype in (torch.float16, torch.bfloat16)
-            and torch.cuda.get_device_capability(x.device)[0] >= 9
-            and self.query_dim % 16 == 0
-            and _supports_fp8_cache_shape(self.n_heads, self.head_dim)
-            and isinstance(kv_cache, _AcceleratedBlockKVCache)
-            and kv_cache._k_fp8 is not None
-            and kv_cache._v_fp8 is not None
-            and self._fused_qkv_weight_fp8 is not None
-            and self._fused_qkv_weight_fp8.device == x.device
-            and self._fused_qkv_scale is not None
-            and self._output_weight_fp8 is not None
-            and self._output_weight_fp8.device == x.device
-            and self._output_weight_scale is not None
+            dtype=cache_dtype,
         )
 
     def _supports_fused_postprocess(
@@ -985,7 +1168,7 @@ class AcceleratedSelfAttention(nn.Module):
             and self.head_dim % 2 == 0
             and self.head_dim <= 512
             and norm_supported
-            and isinstance(kv_cache, _AcceleratedBlockKVCache)
+            and isinstance(kv_cache, BlockKVCache)
             and kv_cache.seq_dim == 1
             and kv_cache._k.is_contiguous()
             and kv_cache._v.is_contiguous()
@@ -994,40 +1177,31 @@ class AcceleratedSelfAttention(nn.Module):
             and (rope_freqs is None or rope_freqs.device == x.device)
         )
 
-    def _project_qkv(
-        self, x: Tensor, *, use_fp8: bool
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Project Q/K/V with fused or separate native/FP8 GEMMs."""
+    def _project_qkv(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Project Q/K/V from either packed FP8 or native authoritative weights."""
         inner_dim = self.n_heads * self.head_dim
         use_fused_projection = self.fuse_qkv and not torch.is_grad_enabled()
-        if use_fused_projection:
-            if use_fp8:
-                assert self._fused_qkv_weight_fp8 is not None
-                assert self._fused_qkv_scale is not None
-                qkv = self._fp8_linear(
-                    x,
-                    self._fused_qkv_weight_fp8,
-                    self._fused_qkv_scale,
-                    self._fused_qkv_bias,
-                    x.dtype,
-                )
+        if self.use_fp8:
+            if use_fused_projection:
+                qkv = self.qkv_proj(x, out_dtype=x.dtype)
+                qkv = qkv.reshape(-1, x.shape[-2], 3, self.n_heads, self.head_dim)
+                query, key, value = qkv.unbind(dim=2)
+                return query, key, value
+            q_weight, k_weight, v_weight = self.qkv_proj.weight.split(inner_dim, dim=0)
+            q_scale, k_scale, v_scale = self.qkv_proj.weight_scale.split(inner_dim)
+            if self.qkv_proj.bias is None:
+                q_bias = k_bias = v_bias = None
             else:
-                assert self._fused_qkv_weight is not None
-                qkv = F.linear(x, self._fused_qkv_weight, self._fused_qkv_bias)
+                q_bias, k_bias, v_bias = self.qkv_proj.bias.split(inner_dim)
+            query = _fp8_linear(x, q_weight, q_scale, q_bias, x.dtype)
+            key = _fp8_linear(x, k_weight, k_scale, k_bias, x.dtype)
+            value = _fp8_linear(x, v_weight, v_scale, v_bias, x.dtype)
+        elif use_fused_projection:
+            assert self._fused_qkv_weight is not None
+            qkv = F.linear(x, self._fused_qkv_weight, self._fused_qkv_bias)
             qkv = qkv.reshape(-1, x.shape[-2], 3, self.n_heads, self.head_dim)
             query, key, value = qkv.unbind(dim=2)
             return query, key, value
-
-        if use_fp8:
-            assert self._fused_qkv_weight_fp8 is not None
-            assert self._fused_qkv_scale is not None
-            q_weight, k_weight, v_weight = self._fused_qkv_weight_fp8.split(
-                inner_dim, dim=0
-            )
-            q_scale, k_scale, v_scale = self._fused_qkv_scale.split(inner_dim, dim=1)
-            query = self._fp8_linear(x, q_weight, q_scale, self.q_proj.bias, x.dtype)
-            key = self._fp8_linear(x, k_weight, k_scale, self.k_proj.bias, x.dtype)
-            value = self._fp8_linear(x, v_weight, v_scale, self.v_proj.bias, x.dtype)
         else:
             query = self.q_proj(x)
             key = self.k_proj(x)
@@ -1068,21 +1242,18 @@ class AcceleratedSelfAttention(nn.Module):
         value: Tensor,
         kv_cache: BlockKVCache,
         rope_freqs: Tensor | None,
-        *,
-        use_fp8: bool,
     ) -> Tensor:
         """Postprocess Q/K and write the current K/V chunk into the cache."""
         if not self._supports_fused_postprocess(query, kv_cache, rope_freqs):
             query = self._apply_rope(self.q_norm(query), rope_freqs)
             key = self._apply_rope(self.k_norm(key), rope_freqs)
             kv_cache.update(key, value)
-            return query.to(torch.float8_e4m3fn) if use_fp8 else query
+            return query.to(torch.float8_e4m3fn) if self.use_fp8 else query
 
-        assert isinstance(kv_cache, _AcceleratedBlockKVCache)
         query_output = torch.empty(
             query.shape,
             device=query.device,
-            dtype=torch.float8_e4m3fn if use_fp8 else query.dtype,
+            dtype=torch.float8_e4m3fn if self.use_fp8 else query.dtype,
         )
         cache_read_start, cache_write_start, cache_write_length = _cache_write_slice(
             kv_cache
@@ -1096,16 +1267,9 @@ class AcceleratedSelfAttention(nn.Module):
             triton.cdiv(self.n_heads, block_h),
         )
         apply_norm = isinstance(self.q_norm, nn.RMSNorm)
-        query_weight = (
-            self.q_norm.weight if apply_norm else self.q_proj.weight.reshape(-1)
-        )
-        key_weight = (
-            self.k_norm.weight if apply_norm else self.k_proj.weight.reshape(-1)
-        )
+        query_weight = self.q_norm.weight if apply_norm else query.reshape(-1)
+        key_weight = self.k_norm.weight if apply_norm else key.reshape(-1)
         rope_pointer = rope_freqs if rope_freqs is not None else query
-        key_cache_fp8 = kv_cache._k_fp8 if use_fp8 else kv_cache._k
-        value_cache_fp8 = kv_cache._v_fp8 if use_fp8 else kv_cache._v
-        assert key_cache_fp8 is not None and value_cache_fp8 is not None
         norm_eps = self.q_norm.eps if isinstance(self.q_norm, nn.RMSNorm) else 0.0
         _qkv_postprocess_cache_kernel[grid](
             query,
@@ -1114,8 +1278,6 @@ class AcceleratedSelfAttention(nn.Module):
             query_output,
             kv_cache._k,
             kv_cache._v,
-            key_cache_fp8,
-            value_cache_fp8,
             query_weight,
             key_weight,
             rope_pointer,
@@ -1137,7 +1299,6 @@ class AcceleratedSelfAttention(nn.Module):
             APPLY_NORM=apply_norm,
             APPLY_ROPE=rope_freqs is not None,
             INTERLEAVED=self.rope_interleaved,
-            WRITE_FP8=use_fp8,
             BLOCK_S=block_s,
             BLOCK_H=block_h,
             BLOCK_D=block_d,
@@ -1215,7 +1376,7 @@ class AcceleratedSelfAttention(nn.Module):
         )
         if not self._supports_triton_attention(query):
             if query.dtype == torch.float8_e4m3fn:
-                native_dtype = self.output_proj.weight.dtype
+                native_dtype = torch.bfloat16
                 query = query.to(native_dtype)
                 key = key.to(native_dtype)
                 value = value.to(native_dtype)
@@ -1356,7 +1517,8 @@ class AcceleratedSelfAttention(nn.Module):
         rope_freqs: Tensor | None,
     ) -> dict[str, str | bool]:
         """Resolve requested settings to auditable effective backend labels."""
-        use_fp8 = self._supports_fp8_forward(x, kv_cache)
+        self._validate_fp8_forward(x, kv_cache)
+        use_fp8 = self.use_fp8
         use_fused_projection = self.fuse_qkv and not torch.is_grad_enabled()
         use_fused_postprocess = self._supports_fused_postprocess(
             x, kv_cache, rope_freqs
@@ -1385,6 +1547,8 @@ class AcceleratedSelfAttention(nn.Module):
             ),
             "attention_backend": attention_backend,
             "output_backend": "fp8" if use_fp8 else "native",
+            "projection_storage": "fp8-only" if use_fp8 else "native",
+            "kv_cache_storage": "fp8-only" if use_fp8 else "native",
         }
 
     @nvtx.annotate("self_attention.forward")
@@ -1409,10 +1573,10 @@ class AcceleratedSelfAttention(nn.Module):
         batch_shape = x.shape[:-2]
         sequence_length = x.shape[-2]
         inner_dim = self.n_heads * self.head_dim
-        use_fp8 = self._supports_fp8_forward(x, kv_cache)
+        self._validate_fp8_forward(x, kv_cache)
 
         with nvtx.annotate("self_attention.qkv_projection"):
-            query, key, value = self._project_qkv(x, use_fp8=use_fp8)
+            query, key, value = self._project_qkv(x)
         with nvtx.annotate("self_attention.rope_and_cache_update"):
             query = self._postprocess_and_update_cache(
                 query,
@@ -1420,27 +1584,13 @@ class AcceleratedSelfAttention(nn.Module):
                 value,
                 kv_cache,
                 rope_freqs,
-                use_fp8=use_fp8,
             )
         with nvtx.annotate("self_attention.attention"):
-            if use_fp8:
-                assert isinstance(kv_cache, _AcceleratedBlockKVCache)
-                cached_key = kv_cache.cached_k_fp8()
-                cached_value = kv_cache.cached_v_fp8()
-            else:
-                cached_key = kv_cache.cached_k()
-                cached_value = kv_cache.cached_v()
+            cached_key = kv_cache.cached_k()
+            cached_value = kv_cache.cached_v()
             output = self._apply_attention_blhd(query, cached_key, cached_value)
         with nvtx.annotate("self_attention.output_projection"):
             output = output.reshape(batch_shape + (sequence_length, inner_dim))
-            if use_fp8:
-                assert self._output_weight_fp8 is not None
-                assert self._output_weight_scale is not None
-                return self._fp8_linear(
-                    output,
-                    self._output_weight_fp8,
-                    self._output_weight_scale,
-                    self.output_proj.bias,
-                    x.dtype,
-                )
+            if self.use_fp8:
+                return self.output_proj(output, out_dtype=x.dtype)
             return self.output_proj(output)

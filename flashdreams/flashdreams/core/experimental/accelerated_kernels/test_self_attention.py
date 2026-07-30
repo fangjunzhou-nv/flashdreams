@@ -105,6 +105,38 @@ def _initialize_reference_cache(
     )
 
 
+def _make_native_reference(
+    attention: AcceleratedSelfAttention,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> AcceleratedSelfAttention:
+    """Build a native SDPA oracle from native or packed checkpoint state."""
+    if attention.use_fp8:
+        qkv_bias = attention.qkv_proj.bias is not None
+        output_bias = attention.output_proj.bias is not None
+    else:
+        qkv_bias = attention.q_proj.bias is not None
+        output_bias = attention.output_proj.bias is not None
+    qk_norm = isinstance(attention.q_norm, torch.nn.RMSNorm)
+    qk_norm_eps = float(attention.q_norm.eps or 1e-6) if qk_norm else 1e-6
+    reference = AcceleratedSelfAttention(
+        attention.query_dim,
+        attention.n_heads,
+        attention.head_dim,
+        qkv_bias=qkv_bias,
+        output_bias=output_bias,
+        qk_norm=qk_norm,
+        qk_norm_eps=qk_norm_eps,
+        rope_interleaved=attention.rope_interleaved,
+        use_tma=False,
+        fuse_qkv=False,
+        fuse_rope_kv_cache=False,
+        use_fp8=False,
+    ).to(device=device, dtype=dtype)
+    reference.load_state_dict(attention.state_dict(), strict=True)
+    return reference.eval()
+
+
 def _sdpa_reference_step(
     attention: AcceleratedSelfAttention,
     x: Tensor,
@@ -228,6 +260,7 @@ class _CorrectnessCase:
     qk_norm: bool = True
     use_rope: bool = True
     rope_interleaved: bool = False
+    use_fp8: bool = False
 
 
 _CORRECTNESS_CASES = (
@@ -240,11 +273,11 @@ _CORRECTNESS_CASES = (
         id="b1-l9-q37-h3-d7-fp16-odd-no-rope",
     ),
     pytest.param(
-        _CorrectnessCase((1,), 11, 48, 2, 8, torch.bfloat16, 2),
+        _CorrectnessCase((1,), 11, 48, 2, 8, torch.bfloat16, 2, use_fp8=True),
         id="b1-l11-q48-h2-d8-bf16-fp8-pointer",
     ),
     pytest.param(
-        _CorrectnessCase((2,), 7, 112, 3, 32, torch.float16, 2),
+        _CorrectnessCase((2,), 7, 112, 3, 32, torch.float16, 2, use_fp8=True),
         id="b2-l7-q112-h3-d32-fp16",
     ),
     pytest.param(
@@ -261,15 +294,16 @@ _CORRECTNESS_CASES = (
             output_bias=True,
             qk_norm=False,
             rope_interleaved=True,
+            use_fp8=True,
         ),
         id="leading-batch-l17-q320-h4-d64-bf16-interleaved",
     ),
     pytest.param(
-        _CorrectnessCase((1,), 31, 224, 2, 96, torch.float16, 3),
+        _CorrectnessCase((1,), 31, 224, 2, 96, torch.float16, 3, use_fp8=True),
         id="b1-l31-q224-h2-d96-fp16-pointer",
     ),
     pytest.param(
-        _CorrectnessCase((1,), 17, 400, 2, 192, torch.bfloat16, 2),
+        _CorrectnessCase((1,), 17, 400, 2, 192, torch.bfloat16, 2, use_fp8=True),
         id="b1-l17-q400-h2-d192-bf16-pointer",
     ),
     pytest.param(
@@ -300,8 +334,12 @@ def test_accelerated_self_attention_matches_sdpa_across_architectures(
         output_bias=case.output_bias,
         qk_norm=case.qk_norm,
         rope_interleaved=case.rope_interleaved,
+        use_fp8=case.use_fp8,
     ).to(device=cuda_device, dtype=case.dtype)
     attention.eval()
+    if case.use_fp8 and torch.cuda.get_device_capability(cuda_device)[0] < 9:
+        pytest.skip("Strict FP8 attention requires compute capability 9.0+.")
+    reference_attention = _make_native_reference(attention, cuda_device, case.dtype)
 
     batch_size = math.prod(case.batch_shape)
     window_size = case.cache_chunks * case.sequence_length
@@ -315,7 +353,7 @@ def test_accelerated_self_attention_matches_sdpa_across_architectures(
         case.dtype,
     )
     reference_cache = _initialize_reference_cache(
-        attention,
+        reference_attention,
         batch_size,
         case.sequence_length,
         window_size,
@@ -348,7 +386,7 @@ def test_accelerated_self_attention_matches_sdpa_across_architectures(
             reference_cache.before_update(chunk_index)
             metadata = attention._backend_metadata(x, candidate_cache, rope_freqs)
             expected = _sdpa_reference_step(
-                attention,
+                reference_attention,
                 x,
                 reference_cache,
                 rope_freqs,
@@ -404,6 +442,9 @@ def test_every_optimization_combination_matches_sdpa(
         use_fp8=use_fp8,
     ).to(device=cuda_device, dtype=dtype)
     attention.eval()
+    if use_fp8 and torch.cuda.get_device_capability(cuda_device)[0] < 9:
+        pytest.skip("Strict FP8 attention requires compute capability 9.0+.")
+    reference_attention = _make_native_reference(attention, cuda_device, dtype)
     x = torch.randn(
         (1, 17, 320),
         device=cuda_device,
@@ -419,14 +460,16 @@ def test_every_optimization_combination_matches_sdpa(
     )
     candidate_cache = attention.initialize_cache(1, 17, 34, 0, cuda_device, dtype)
     reference_cache = _initialize_reference_cache(
-        attention, 1, 17, 34, 0, cuda_device, dtype
+        reference_attention, 1, 17, 34, 0, cuda_device, dtype
     )
     candidate_cache.before_update(0)
     reference_cache.before_update(0)
 
     with torch.inference_mode():
         metadata = attention._backend_metadata(x, candidate_cache, rope_freqs)
-        expected = _sdpa_reference_step(attention, x, reference_cache, rope_freqs)
+        expected = _sdpa_reference_step(
+            reference_attention, x, reference_cache, rope_freqs
+        )
         actual = attention(x, candidate_cache, rope_freqs)
         _assert_module_matches_sdpa(
             actual,
@@ -539,6 +582,121 @@ def test_all_optimizations_disabled_matches_sdpa_on_cpu() -> None:
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.ci_cpu
+def test_fp8_mode_keeps_only_packed_projection_state() -> None:
+    """Persist packed FP8 weights without native or derived weight mirrors."""
+    torch.manual_seed(8)
+    native = AcceleratedSelfAttention(
+        32,
+        2,
+        16,
+        qkv_bias=True,
+        output_bias=True,
+        use_fp8=False,
+    )
+    packed = AcceleratedSelfAttention(
+        32,
+        2,
+        16,
+        qkv_bias=True,
+        output_bias=True,
+        use_fp8=True,
+    )
+    packed.load_state_dict(native.state_dict(), strict=True)
+
+    state = packed.state_dict()
+    assert set(state) == {
+        "qkv_proj.weight",
+        "qkv_proj.weight_scale",
+        "qkv_proj.bias",
+        "output_proj.weight",
+        "output_proj.weight_scale",
+        "output_proj.bias",
+        "q_norm.weight",
+        "k_norm.weight",
+    }
+    assert state["qkv_proj.weight"].dtype == torch.uint8
+    assert state["output_proj.weight"].dtype == torch.uint8
+    assert state["qkv_proj.weight_scale"].dtype == torch.float32
+    assert state["output_proj.weight_scale"].dtype == torch.float32
+    assert not hasattr(packed, "q_proj")
+    assert not hasattr(packed, "_fused_qkv_weight")
+
+    packed_copy = AcceleratedSelfAttention(
+        32,
+        2,
+        16,
+        qkv_bias=True,
+        output_bias=True,
+        use_fp8=True,
+    )
+    packed_copy.load_state_dict(state, strict=True)
+    native_copy = AcceleratedSelfAttention(
+        32,
+        2,
+        16,
+        qkv_bias=True,
+        output_bias=True,
+        use_fp8=False,
+    )
+    native_copy.load_state_dict(state, strict=True)
+    packed_copy.to(dtype=torch.bfloat16)
+    assert packed_copy.qkv_proj.weight.dtype == torch.uint8
+    assert packed_copy.qkv_proj.weight_scale.dtype == torch.float32
+
+
+@pytest.mark.ci_cpu
+def test_fp8_cache_lifecycle_uses_one_canonical_allocation() -> None:
+    """Preserve FP8 fill, same-chunk overwrite, roll, and reset semantics."""
+    cache = BlockKVCache(
+        k_shape=(1, 4, 1, 2),
+        v_shape=(1, 4, 1, 2),
+        seq_dim=1,
+        chunk_size=2,
+        window_size=4,
+        device=torch.device("cpu"),
+        dtype=torch.float8_e4m3fn,
+    )
+    k_ptr = cache._k.data_ptr()
+    v_ptr = cache._v.data_ptr()
+
+    def chunk(value: float) -> Tensor:
+        return torch.full((1, 2, 1, 2), value, dtype=torch.float32)
+
+    cache.before_update(0)
+    cache.update(chunk(1.0), chunk(11.0))
+    cache.after_update(0)
+    cache.before_update(1)
+    cache.update(chunk(2.0), chunk(12.0))
+    cache.after_update(1)
+    cache.before_update(1)
+    cache.update(chunk(3.0), chunk(13.0))
+    torch.testing.assert_close(cache.cached_k().float()[:, 2:], chunk(3.0))
+    cache.after_update(1)
+    cache.before_update(2)
+    cache.update(chunk(4.0), chunk(14.0))
+    torch.testing.assert_close(cache.cached_k().float()[:, :2], chunk(3.0))
+    torch.testing.assert_close(cache.cached_k().float()[:, 2:], chunk(4.0))
+    cache.after_update(2)
+
+    cache.reset()
+    assert cache.size == 0
+    assert cache._k.data_ptr() == k_ptr
+    assert cache._v.data_ptr() == v_ptr
+    assert cache._k.dtype == torch.float8_e4m3fn
+    assert cache._v.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.ci_cpu
+def test_strict_fp8_mode_rejects_unsupported_execution() -> None:
+    """Reject invalid geometry and CPU cache initialization without fallback."""
+    with pytest.raises(ValueError, match="multiple of 16"):
+        AcceleratedSelfAttention(31, 1, 16, use_fp8=True)
+    attention = AcceleratedSelfAttention(32, 2, 16, use_fp8=True)
+    with pytest.raises(RuntimeError, match="CUDA device"):
+        attention.initialize_cache(1, 2, 4, 0, torch.device("cpu"), torch.bfloat16)
+
+
 @dataclass(frozen=True)
 class _BenchmarkCase:
     """One full-forward benchmark shape and prefilled cache length."""
@@ -629,10 +787,8 @@ def _run_self_attention_benchmark(
     study: str,
 ) -> None:
     """Benchmark one prefilled steady-state full-forward configuration."""
-    if dtype == torch.float32 and variant.name == "without-fp8":
-        pytest.skip("FP8 is intentionally ineligible for FP32 inputs.")
-    if dtype == torch.float32 and study == "factorial" and variant.use_fp8:
-        pytest.skip("FP8 factorial rows apply only to FP16/BF16 inputs.")
+    if dtype == torch.float32 and variant.use_fp8:
+        pytest.skip("Strict FP8 variants apply only to FP16/BF16 inputs.")
 
     torch.manual_seed(0)
     generator = torch.Generator(device=cuda_device).manual_seed(9012)
@@ -708,6 +864,15 @@ def _run_self_attention_benchmark(
             "tokens_per_forward": case.batch_size * case.sequence_length,
             "warmup_rounds": _benchmark_warmup_rounds(),
             "rounds": _benchmark_rounds(),
+            "projection_weight_bytes": sum(
+                tensor.numel() * tensor.element_size()
+                for name, tensor in attention.state_dict().items()
+                if name.endswith(("proj.weight", "proj.weight_scale"))
+            ),
+            "kv_cache_bytes": (
+                kv_cache._k.numel() * kv_cache._k.element_size()
+                + kv_cache._v.numel() * kv_cache._v.element_size()
+            ),
             **metadata,
         }
     )
