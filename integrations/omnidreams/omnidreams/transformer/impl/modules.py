@@ -29,9 +29,7 @@ from torch.distributed import ProcessGroup
 from flashdreams.core.attention import BlockKVCache, ContextParallelAttention
 from flashdreams.core.attention.rope import apply_rope_freqs
 from flashdreams.core.experimental.accelerated_kernels.self_attention import (
-    ReferenceSelfAttention,
-    FlashAttnSelfAttention,
-    AcceleratedSelfAttention
+    AcceleratedSelfAttention,
 )
 
 
