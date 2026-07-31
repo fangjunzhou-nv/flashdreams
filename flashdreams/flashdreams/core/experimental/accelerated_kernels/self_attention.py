@@ -203,57 +203,88 @@ class _PackedFP8Linear(nn.Module):
         )
 
 
-# TODO: Replace hard-coded heuristic with Triton auto tuning.
-def _select_attention_config(
-    query_length: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    *,
-    use_tma: bool,
-) -> tuple[int, int, int, int, int]:
-    """Select deterministic attention launch metadata.
+_ATTENTION_AUTOTUNE_KEY = [
+    "device_arch",
+    "batch_size",
+    "num_heads",
+    "query_length",
+    "key_length",
+    "HEAD_DIM",
+    "query_stride_l",
+    "query_stride_d",
+    "key_stride_s",
+    "key_stride_d",
+    "value_stride_s",
+    "value_stride_d",
+    "output_stride_l",
+    "output_stride_d",
+]
 
-    Returns:
-        ``(block_m, block_n, block_d, num_warps, num_stages)``.
-    """
-    if not 0 < head_dim <= 256:
-        raise ValueError("Triton attention requires 0 < head_dim <= 256.")
 
-    minimum_block_d = 32 if dtype == torch.float8_e4m3fn else 16
-    block_d = max(int(triton.next_power_of_2(head_dim)), minimum_block_d)
-    block_m = min(128, max(int(triton.next_power_of_2(query_length)), 16))
-    if use_tma:
-        if dtype == torch.float32:
-            max_block_m = 64 if block_d <= 64 else 32
-            block_m = min(block_m, max_block_m)
-            block_n = 16 if block_d > 128 else 32
-            num_stages = 1
-        elif block_d > 128:
-            block_m = min(block_m, 64)
-            block_n = 32
-            num_stages = 2
-        else:
-            block_n = 64
-            num_stages = 3
-        num_warps = 4 if block_m * block_d <= 4096 else 8
-        return block_m, block_n, block_d, num_warps, num_stages
+def _make_attention_autotune_configs() -> list[triton.Config]:
+    """Return portable attention tiles while retaining the former defaults."""
+    return [
+        triton.Config(
+            {"BLOCK_M": block_m, "BLOCK_N": block_n},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for block_m in (16, 32, 64, 128)
+        for block_n in (32, 64)
+        for num_warps in (4, 8)
+        for num_stages in (2, 3)
+    ]
 
-    if dtype == torch.float32:
-        max_block_m = 16 if block_d > 128 else 64
-        block_n = 16 if block_d > 128 else 32
-        num_stages = 1 if block_d > 128 else 2
-    else:
-        max_block_m = 64 if block_d > 128 else 128
-        block_n = 32 if block_d > 128 else 64
-        num_stages = 2 if block_d > 128 else 3
-    block_m = min(
-        max_block_m,
+
+_POINTER_ATTENTION_CONFIGS = _make_attention_autotune_configs()
+_TMA_ATTENTION_CONFIGS = _make_attention_autotune_configs()
+
+
+def _prune_attention_configs(
+    configs: list[triton.Config],
+    named_args: dict[str, object],
+    **meta: object,
+) -> list[triton.Config]:
+    """Discard query tiles that waste work or exceed wide-head resources."""
+    query_length = named_args["query_length"]
+    head_dim = meta["HEAD_DIM"]
+    assert isinstance(query_length, int) and isinstance(head_dim, int)
+    max_block_m = min(
+        128,
         max(int(triton.next_power_of_2(query_length)), 16),
     )
-    num_warps = 4 if block_m * block_d <= 4096 else 8
-    return block_m, block_n, block_d, num_warps, num_stages
+    if head_dim > 128:
+        max_block_m = min(max_block_m, 64)
+    return [config for config in configs if config.kwargs["BLOCK_M"] <= max_block_m]
 
 
+def _prune_tma_attention_configs(
+    configs: list[triton.Config],
+    named_args: dict[str, object],
+    **meta: object,
+) -> list[triton.Config]:
+    """Apply shape pruning and remove unsupported Hopper warp layouts."""
+    pruned = _prune_attention_configs(configs, named_args, **meta)
+    device_arch = named_args["device_arch"]
+    assert isinstance(device_arch, int)
+    if device_arch // 10 != 9:
+        return pruned
+    return [
+        config
+        for config in pruned
+        if not (
+            config.kwargs["BLOCK_M"] * config.kwargs["BLOCK_N"] < 128 * 128
+            and config.num_warps == 8
+        )
+    ]
+
+
+@triton.autotune(
+    configs=_POINTER_ATTENTION_CONFIGS,
+    key=_ATTENTION_AUTOTUNE_KEY,
+    prune_configs_by={"early_config_prune": _prune_attention_configs},
+    cache_results=True,
+)
 @triton.jit
 def _flash_attention_kernel(
     query_ptr,
@@ -276,6 +307,8 @@ def _flash_attention_kernel(
     output_stride_h,
     output_stride_l,
     output_stride_d,
+    device_arch,
+    batch_size,
     num_heads,
     query_length,
     key_length,
@@ -381,6 +414,12 @@ def _flash_attention_kernel(
     tl.store(output_ptrs, output, mask=query_mask[:, None] & dim_mask[None, :])
 
 
+@triton.autotune(
+    configs=_TMA_ATTENTION_CONFIGS,
+    key=_ATTENTION_AUTOTUNE_KEY,
+    prune_configs_by={"early_config_prune": _prune_tma_attention_configs},
+    cache_results=True,
+)
 @triton.jit
 def _flash_attention_tma_kernel(
     query_ptr,
@@ -403,6 +442,7 @@ def _flash_attention_tma_kernel(
     output_stride_h,
     output_stride_l,
     output_stride_d,
+    device_arch,
     batch_size,
     num_heads,
     query_length,
@@ -1389,9 +1429,8 @@ class AcceleratedSelfAttention(nn.Module):
             return output.zero_()
 
         use_tma = self._supports_tma_attention(query)
-        block_m, block_n, block_d, num_warps, num_stages = _select_attention_config(
-            query_length, head_dim, query.dtype, use_tma=use_tma
-        )
+        device_capability = torch.cuda.get_device_capability(query.device)
+        device_arch = device_capability[0] * 10 + device_capability[1]
         query_bhld_strides = (
             query.stride(0),
             query.stride(2),
@@ -1412,7 +1451,10 @@ class AcceleratedSelfAttention(nn.Module):
             output.stride(3),
         )
         if use_tma:
-            grid = (triton.cdiv(query_length, block_m), batch_size * num_heads)
+            grid = lambda meta: (
+                triton.cdiv(query_length, meta["BLOCK_M"]),
+                batch_size * num_heads,
+            )
             _flash_attention_tma_kernel[grid](
                 query,
                 key,
@@ -1422,20 +1464,25 @@ class AcceleratedSelfAttention(nn.Module):
                 *key_bhld_strides,
                 *value_bhld_strides,
                 *output_bhld_strides,
+                device_arch,
                 batch_size,
                 num_heads,
                 query_length,
                 key_length,
                 1.0 / math.sqrt(head_dim),
                 HEAD_DIM=head_dim,
-                BLOCK_M=block_m,
-                BLOCK_N=block_n,
                 WARP_SPECIALIZE=False,
-                num_warps=num_warps,
-                num_stages=num_stages,
             )
         else:
-            grid = (batch_size * num_heads, triton.cdiv(query_length, block_m))
+            minimum_block_d = 32 if query.dtype == torch.float8_e4m3fn else 16
+            block_d = max(
+                int(triton.next_power_of_2(head_dim)),
+                minimum_block_d,
+            )
+            grid = lambda meta: (
+                batch_size * num_heads,
+                triton.cdiv(query_length, meta["BLOCK_M"]),
+            )
             _flash_attention_kernel[grid](
                 query,
                 key,
@@ -1445,16 +1492,14 @@ class AcceleratedSelfAttention(nn.Module):
                 *key_bhld_strides,
                 *value_bhld_strides,
                 *output_bhld_strides,
+                device_arch,
+                batch_size,
                 num_heads,
                 query_length,
                 key_length,
                 1.0 / math.sqrt(head_dim),
                 HEAD_DIM=head_dim,
-                BLOCK_M=block_m,
-                BLOCK_N=block_n,
                 BLOCK_D=block_d,
-                num_warps=num_warps,
-                num_stages=num_stages,
             )
         return output
 

@@ -43,7 +43,11 @@ from torch import Tensor
 
 from flashdreams.core.attention.kvcache import BlockKVCache
 from flashdreams.core.experimental.accelerated_kernels.self_attention import (
+    _POINTER_ATTENTION_CONFIGS,
+    _TMA_ATTENTION_CONFIGS,
     AcceleratedSelfAttention,
+    _prune_attention_configs,
+    _prune_tma_attention_configs,
 )
 
 
@@ -487,6 +491,26 @@ _ATTENTION_CASES = (
     pytest.param(1, 2, 17, 97, 64, torch.bfloat16, True, id="d64-bf16-tma"),
     pytest.param(1, 2, 19, 73, 96, torch.float32, True, id="d96-fp32-sdpa-fallback"),
     pytest.param(1, 1, 33, 97, 128, torch.float16, True, id="d128-fp16-tma"),
+    pytest.param(
+        1,
+        2,
+        129,
+        257,
+        128,
+        torch.float16,
+        True,
+        id="d128-fp16-tma-large-tile",
+    ),
+    pytest.param(
+        1,
+        2,
+        129,
+        257,
+        128,
+        torch.float16,
+        False,
+        id="d128-fp16-pointer-large-tile",
+    ),
     pytest.param(1, 1, 17, 73, 192, torch.bfloat16, False, id="d192-bf16-pointer"),
     pytest.param(1, 1, 7, 33, 256, torch.float16, True, id="d256-fp16-tma"),
     pytest.param(1, 1, 5, 19, 320, torch.float32, True, id="d320-sdpa-fallback"),
@@ -544,6 +568,66 @@ def test_accelerated_attention_kernel_matches_sdpa(
         actual = attention._apply_attention(query, key, value)
     atol, rtol = _native_tolerance(dtype)
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+@pytest.mark.ci_cpu
+@pytest.mark.parametrize(
+    "configs",
+    (_POINTER_ATTENTION_CONFIGS, _TMA_ATTENTION_CONFIGS),
+    ids=("pointer", "tma"),
+)
+@pytest.mark.parametrize(
+    "query_length,head_dim,expected_max_block_m",
+    (
+        (1, 64, 16),
+        (17, 64, 32),
+        (129, 128, 128),
+        (257, 192, 64),
+    ),
+)
+def test_attention_autotune_prunes_tiles_and_retains_previous_default(
+    configs: list[triton.Config],
+    query_length: int,
+    head_dim: int,
+    expected_max_block_m: int,
+) -> None:
+    """Keep valid tiles and the former launch choice in each shape class."""
+    pruned = _prune_attention_configs(
+        configs,
+        {"query_length": query_length},
+        HEAD_DIM=head_dim,
+    )
+    assert pruned
+    assert max(config.kwargs["BLOCK_M"] for config in pruned) == (expected_max_block_m)
+
+    block_d = max(int(triton.next_power_of_2(head_dim)), 16)
+    block_n = 32 if block_d > 128 else 64
+    num_stages = 2 if block_d > 128 else 3
+    num_warps = 4 if expected_max_block_m * block_d <= 4096 else 8
+    assert any(
+        config.kwargs == {"BLOCK_M": expected_max_block_m, "BLOCK_N": block_n}
+        and config.num_warps == num_warps
+        and config.num_stages == num_stages
+        for config in pruned
+    )
+
+
+@pytest.mark.ci_cpu
+def test_tma_attention_autotune_prunes_unsupported_hopper_warp_layouts() -> None:
+    """Avoid Hopper 8-warp tiles excluded by Triton's attention tuner."""
+    pruned = _prune_tma_attention_configs(
+        _TMA_ATTENTION_CONFIGS,
+        {"query_length": 129, "device_arch": 90},
+        HEAD_DIM=128,
+    )
+    assert pruned
+    assert all(
+        not (
+            config.kwargs["BLOCK_M"] * config.kwargs["BLOCK_N"] < 128 * 128
+            and config.num_warps == 8
+        )
+        for config in pruned
+    )
 
 
 @pytest.mark.ci_cpu
