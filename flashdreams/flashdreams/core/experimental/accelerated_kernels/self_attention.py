@@ -429,19 +429,19 @@ def _flash_attention_tma_kernel(
     query_stride_b,
     query_stride_h,
     query_stride_l,
-    query_stride_d,
+    query_stride_d: tl.constexpr,
     key_stride_b,
     key_stride_h,
     key_stride_s,
-    key_stride_d,
+    key_stride_d: tl.constexpr,
     value_stride_b,
     value_stride_h,
     value_stride_s,
-    value_stride_d,
+    value_stride_d: tl.constexpr,
     output_stride_b,
     output_stride_h,
     output_stride_l,
-    output_stride_d,
+    output_stride_d: tl.constexpr,
     device_arch,
     batch_size,
     num_heads,
@@ -457,7 +457,9 @@ def _flash_attention_tma_kernel(
 
     The launch grid is ``[ceil(L / BLOCK_M), B * H]``. Tensor descriptors move
     rectangular Q/K/V tiles while the kernel uses the same online-softmax
-    recurrence as the pointer-based implementation.
+    recurrence as the pointer-based implementation. Descriptor-contiguous
+    strides are constexpr so Triton and torch.compile's TTIR analysis can prove
+    their required unit-stride invariant.
     """
     # Select one query tile and one flattened batch/head pair.
     query_block = tl.program_id(0)
@@ -1383,7 +1385,21 @@ class AcceleratedSelfAttention(nn.Module):
             and 0 < query.shape[-1] <= 256
         )
 
-    def _supports_tma_attention(self, query: Tensor) -> bool:
+    @staticmethod
+    def _supports_tma_tensor_layout(tensor: Tensor) -> bool:
+        """Return whether one tensor satisfies TMA descriptor stride rules."""
+        element_size = tensor.element_size()
+        return tensor.stride(-1) == 1 and all(
+            stride > 0 and stride * element_size % 16 == 0
+            for stride in tensor.stride()[:-1]
+        )
+
+    def _supports_tma_attention(
+        self,
+        query: Tensor,
+        key: Tensor | None = None,
+        value: Tensor | None = None,
+    ) -> bool:
         """Return whether tensor descriptors support the current attention layout."""
         head_dim = query.shape[-1]
         return (
@@ -1392,7 +1408,10 @@ class AcceleratedSelfAttention(nn.Module):
             and torch.cuda.get_device_capability(query.device)[0] >= 9
             and head_dim >= 16
             and head_dim & (head_dim - 1) == 0
-            and query.stride(-1) == 1
+            and all(
+                tensor is None or self._supports_tma_tensor_layout(tensor)
+                for tensor in (query, key, value)
+            )
         )
 
     @staticmethod
@@ -1428,7 +1447,7 @@ class AcceleratedSelfAttention(nn.Module):
         if key_length == 0:
             return output.zero_()
 
-        use_tma = self._supports_tma_attention(query)
+        use_tma = self._supports_tma_attention(query, key, value)
         device_capability = torch.cuda.get_device_capability(query.device)
         device_arch = device_capability[0] * 10 + device_capability[1]
         query_bhld_strides = (

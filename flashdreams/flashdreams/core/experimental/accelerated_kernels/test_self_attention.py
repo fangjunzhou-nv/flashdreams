@@ -30,6 +30,7 @@ Run CUDA correctness and the manual benchmark from the workspace root with::
 """
 
 import itertools
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -568,6 +569,132 @@ def test_accelerated_attention_kernel_matches_sdpa(
         actual = attention._apply_attention(query, key, value)
     atol, rtol = _native_tolerance(dtype)
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+@pytest.mark.ci_gpu
+def test_tma_attention_torch_compile_analyzes_tensor_accesses(
+    cuda_device: torch.device,
+) -> None:
+    """Compile TMA attention without conservatively marking every input mutated."""
+    if torch.cuda.get_device_capability(cuda_device)[0] < 9:
+        pytest.skip("TMA attention requires compute capability 9.0+.")
+
+    generator = torch.Generator(device=cuda_device).manual_seed(4567)
+    query = torch.randn(
+        (1, 2, 17, 128),
+        device=cuda_device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    key = torch.randn(
+        (1, 2, 33, 128),
+        device=cuda_device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    value = torch.randn(
+        (1, 2, 33, 128),
+        device=cuda_device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    attention = AcceleratedSelfAttention(
+        256,
+        2,
+        128,
+        use_tma=True,
+        fuse_rope_kv_cache=False,
+        use_fp8=False,
+    ).eval()
+
+    with torch.inference_mode():
+        assert attention._supports_tma_attention(query, key, value)
+        expected = attention._apply_attention(query, key, value)
+
+    captured: list[logging.LogRecord] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    logger = logging.getLogger("torch._dynamo")
+    handler = _CaptureHandler(level=logging.WARNING)
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    torch.compiler.reset()
+    try:
+        with torch.inference_mode():
+            compiled_attention = torch.compile(
+                attention._apply_attention,
+                mode="default",
+                fullgraph=True,
+            )
+            actual = compiled_attention(query, key, value)
+            torch.cuda.synchronize(cuda_device)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    assert not any(
+        "assuming every input is mutated" in record.getMessage() for record in captured
+    )
+    torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.ci_gpu
+def test_tma_attention_falls_back_for_noncontiguous_kv_features(
+    cuda_device: torch.device,
+) -> None:
+    """Use the pointer kernel when a K/V descriptor is not unit-stride."""
+    if torch.cuda.get_device_capability(cuda_device)[0] < 9:
+        pytest.skip("TMA attention requires compute capability 9.0+.")
+
+    generator = torch.Generator(device=cuda_device).manual_seed(5678)
+    query = torch.randn(
+        (1, 2, 17, 128),
+        device=cuda_device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    key = torch.randn(
+        (1, 2, 33, 256),
+        device=cuda_device,
+        dtype=torch.float16,
+        generator=generator,
+    )[..., ::2]
+    value = torch.randn(
+        (1, 2, 33, 256),
+        device=cuda_device,
+        dtype=torch.float16,
+        generator=generator,
+    )[..., ::2]
+    attention = AcceleratedSelfAttention(
+        256,
+        2,
+        128,
+        use_tma=True,
+        fuse_rope_kv_cache=False,
+        use_fp8=False,
+    ).eval()
+
+    with torch.inference_mode():
+        assert not attention._supports_tma_attention(query, key, value)
+        expected = F.scaled_dot_product_attention(query, key, value)
+        actual = attention._apply_attention(query, key, value)
+    torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.ci_cpu
+def test_tma_tensor_layout_requires_descriptor_strides() -> None:
+    """Reject final-contiguous views that violate TMA stride constraints."""
+    contiguous = torch.empty((1, 2, 3, 128), dtype=torch.float16)
+    padded = torch.empty((1, 2, 3, 129), dtype=torch.float16)[..., :128]
+    broadcast = contiguous.expand(2, -1, -1, -1)
+
+    assert AcceleratedSelfAttention._supports_tma_tensor_layout(contiguous)
+    assert not AcceleratedSelfAttention._supports_tma_tensor_layout(padded)
+    assert not AcceleratedSelfAttention._supports_tma_tensor_layout(broadcast)
 
 
 @pytest.mark.ci_cpu
