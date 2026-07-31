@@ -28,6 +28,10 @@ from flashdreams.infra.acceleration.encoder_lifecycle import (
 )
 from flashdreams.infra.acceleration.frame_prefetch import LazyCudaFrame
 from flashdreams.infra.acceleration.prewarm import run_timed_prewarm
+from flashdreams.infra.postprocess import (
+    VideoPostprocessChainConfig,
+    VideoPostprocessStream,
+)
 
 PipelineFactory = Callable[[WorldModelManifest, WorldModelProfileConfig], Any]
 _VIEW_NAMES = ["camera_front_wide_120fov"]
@@ -482,6 +486,7 @@ class FlashdreamsWorldModelSession:
         *,
         offload_text_encoder: bool = False,
         pipeline_factory: PipelineFactory | None = None,
+        postprocess: VideoPostprocessChainConfig | None = None,
     ) -> None:
         self.manifest = manifest
         self._profile_config = profile or WorldModelProfileConfig()
@@ -492,6 +497,9 @@ class FlashdreamsWorldModelSession:
         self._precomputed_embeddings: dict[str, torch.Tensor | None] | None = None
         self._pending_finalization_index: int | None = None
         self._next_block_index = 0
+        self._postprocess = postprocess or VideoPostprocessChainConfig()
+        self._postprocess_enabled = self._postprocess.is_enabled()
+        self._postprocess_stream: VideoPostprocessStream | None = None
 
     @property
     def pipeline(self) -> Any:
@@ -628,6 +636,7 @@ class FlashdreamsWorldModelSession:
                 cache=self._cache,
                 hdmap=self._condition_tensor(condition_frames),
             )
+            video = self._postprocess_video(video, autoregressive_index=0)
             model_frames = self._video_tensor_to_frames(video)
             _synchronize_cuda_frame_event(model_frames)
         self._pending_finalization_index = 0
@@ -656,6 +665,9 @@ class FlashdreamsWorldModelSession:
                 cache=self._cache,
                 hdmap=self._condition_tensor(condition_frames),
             )
+            video = self._postprocess_video(
+                video, autoregressive_index=self._next_block_index
+            )
             model_frames = self._video_tensor_to_frames(video)
             _synchronize_cuda_frame_event(model_frames)
         block_index = self._next_block_index
@@ -669,6 +681,7 @@ class FlashdreamsWorldModelSession:
         return model_frames
 
     def reset(self, *, clear_precomputed_embeddings: bool = False) -> None:
+        self._close_postprocess_stream()
         self._cache = None
         self._pending_finalization_index = None
         self._next_block_index = 0
@@ -680,11 +693,61 @@ class FlashdreamsWorldModelSession:
             )
 
     def close(self) -> None:
+        self._close_postprocess_stream()
         if self._cache is not None and self._pending_finalization_index is not None:
             self.pipeline.finalize(self._pending_finalization_index, self._cache)
             self._pending_finalization_index = None
         self._cache = None
         self._pipeline = None
+
+    def set_postprocess_enabled(self, enabled: bool) -> None:
+        """Toggle the configured post-process chain between generated chunks."""
+        enabled = bool(enabled)
+        if enabled and not self._postprocess.is_enabled():
+            raise RuntimeError(
+                "Cannot enable post-processing without --postprocess-preset."
+            )
+        if enabled == self._postprocess_enabled:
+            return
+        self._close_postprocess_stream()
+        self._postprocess_enabled = enabled
+        logger.info(
+            "[flashdreams-session] post-processing {} preset={!r}",
+            "enabled" if enabled else "disabled",
+            self._postprocess.preset,
+        )
+
+    def _postprocess_video(
+        self, video: torch.Tensor, *, autoregressive_index: int
+    ) -> torch.Tensor:
+        if not self._postprocess_enabled:
+            return video
+        if self._postprocess_stream is None:
+            self._postprocess_stream = VideoPostprocessStream(
+                postprocess=self._postprocess,
+                output_layout="bvtchw",
+                fps=self.manifest.fps,
+                per_view=False,
+                world_size=1,
+                collect_output=False,
+                move_to_cpu=False,
+            )
+        processed = self._postprocess_stream.process(
+            video, autoregressive_index=autoregressive_index
+        )
+        if processed.shape[2] != video.shape[2]:
+            raise RuntimeError(
+                "Interactive post-processing must emit one display frame for "
+                "each generated frame; got "
+                f"{processed.shape[2]} output frames for {video.shape[2]} inputs."
+            )
+        return processed
+
+    def _close_postprocess_stream(self) -> None:
+        if self._postprocess_stream is None:
+            return
+        self._postprocess_stream.finish()
+        self._postprocess_stream = None
 
     def _initialize_cache(self, initial_rgb: object, prompt: str) -> Any:
         if self.manifest.synthetic_model:

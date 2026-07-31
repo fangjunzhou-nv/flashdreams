@@ -33,6 +33,7 @@ from omnidreams.interactive_drive.world_model.manifest import WorldModelManifest
 from PIL import Image
 
 from flashdreams.infra.acceleration.prewarm import run_timed_prewarm
+from flashdreams.infra.postprocess import VideoPostprocessChainConfig
 
 _FIRST_STEADY_STATE_WARMUP_MESSAGE = "Optimizing world model..."
 
@@ -46,6 +47,7 @@ class WorldModelRenderBackend(RenderBackend):
         profile: WorldModelProfileConfig | None = None,
         bev: BevConfig | None = None,
         offload_text_encoder: bool = False,
+        postprocess: VideoPostprocessChainConfig | None = None,
     ) -> None:
         super().__init__(chunk=chunk, raster=raster)
         self._manifest = manifest
@@ -54,6 +56,7 @@ class WorldModelRenderBackend(RenderBackend):
             manifest,
             profile=profile,
             offload_text_encoder=offload_text_encoder,
+            postprocess=postprocess,
         )
         self._scene: SceneBundle | None = None
         self._next_chunk_count = 0
@@ -245,6 +248,9 @@ class WorldModelRenderBackend(RenderBackend):
     def reset_scene_conditioning(self) -> None:
         self._session.reset(clear_precomputed_embeddings=True)
         self._next_chunk_count = 0
+
+    def set_postprocess_enabled(self, enabled: bool) -> None:
+        self._session.set_postprocess_enabled(enabled)
 
     def close(self) -> None:
         self._session.close()

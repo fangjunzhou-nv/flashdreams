@@ -23,6 +23,7 @@ import pytest
 from flashvsr.postprocess import FlashVSRPostProcessorConfig
 
 from flashdreams.infra.postprocess import (
+    RTXVideoSuperResolutionPostProcessorConfig,
     VideoPostprocessChainConfig,
     VideoPostProcessorConfig,
 )
@@ -45,6 +46,9 @@ def test_discover_postprocess_presets_includes_flashvsr_entries() -> None:
     assert "flashvsr-v1.1-sparse-2.0" in presets
     assert "flashvsr-v1.1-sparse-1.5" in presets
     assert "flashvsr-v1.1-full-attn" in presets
+    assert "rtx-super-resolution" in presets
+    assert "rtx-super-resolution-ultra" in presets
+    assert "rtx-deblur-ultra" in presets
 
 
 def test_resolve_postprocess_preset_rejects_unknown_name() -> None:
@@ -65,6 +69,36 @@ def test_chain_config_appends_preset_after_explicit_processors() -> None:
     preset = resolved[1]
     assert isinstance(preset, FlashVSRPostProcessorConfig)
     assert preset.sparse_ratio == 2.0
+
+
+def test_chain_config_resolves_rtx_super_resolution_preset() -> None:
+    chain = VideoPostprocessChainConfig(preset="rtx-super-resolution")
+
+    preset = chain.resolved_processors()[0]
+
+    assert isinstance(preset, RTXVideoSuperResolutionPostProcessorConfig)
+    assert preset.scale == 2.0
+
+
+@pytest.mark.parametrize(
+    ("preset_name", "expected_quality", "expected_scale"),
+    [
+        ("rtx-super-resolution-ultra", "ULTRA", 2.0),
+        ("rtx-deblur-ultra", "DEBLUR_ULTRA", 1.0),
+    ],
+)
+def test_chain_config_resolves_additional_rtx_presets(
+    preset_name: str,
+    expected_quality: str,
+    expected_scale: float,
+) -> None:
+    chain = VideoPostprocessChainConfig(preset=preset_name)
+
+    preset = chain.resolved_processors()[0]
+
+    assert isinstance(preset, RTXVideoSuperResolutionPostProcessorConfig)
+    assert preset.quality == expected_quality
+    assert preset.scale == expected_scale
 
 
 def test_chain_config_is_enabled_for_preset_only() -> None:

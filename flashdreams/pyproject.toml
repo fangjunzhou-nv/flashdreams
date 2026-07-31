@@ -70,6 +70,12 @@ dependencies = [
 # Mirrors nerfstudio's ``ns-train`` console script shape (one hyphenated
 # binary, tyro union over runners as direct subcommands).
 flashdreams-run = "flashdreams.scripts.cli:entrypoint"
+flashdreams-benchmark = "tools.benchmarks.cli:main"
+
+[project.entry-points."flashdreams.postprocess_presets"]
+"rtx-super-resolution" = "flashdreams.infra.postprocess:POSTPROCESS_PRESET_RTX_SUPER_RESOLUTION"
+"rtx-super-resolution-ultra" = "flashdreams.infra.postprocess:POSTPROCESS_PRESET_RTX_SUPER_RESOLUTION_ULTRA"
+"rtx-deblur-ultra" = "flashdreams.infra.postprocess:POSTPROCESS_PRESET_RTX_DEBLUR_ULTRA"
 
 [project.urls]
 Homepage = "https://github.com/NVIDIA/flashdreams"
@@ -110,6 +116,12 @@ runners = [
     "opencv-python-headless>=4.5",
     "scipy>=1.11",
 ]
+# Optional NVIDIA VFX runtime used only by the RTX postprocess presets.
+# Kept out of the default install because it is proprietary and requires
+# supported NVIDIA RTX hardware.
+rtx-postprocess = [
+    "nvidia-vfx==0.1.0.1",
+]
 serving = [
     "aiohttp>=3.9",
     "aiortc>=1.9",
@@ -122,7 +134,7 @@ serving = [
 version = {attr = "flashdreams._version.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["flashdreams*"]
+include = ["flashdreams*", "tools*"]
 exclude = ["tests", "flashdreams._pytest_plugins*"]
 
 [dependency-groups]

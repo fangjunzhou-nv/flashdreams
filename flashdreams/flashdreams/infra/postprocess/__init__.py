@@ -25,6 +25,14 @@ from flashdreams.infra.postprocess.base import (
     VideoTensorLayout,
     to_bvtchw,
 )
+from flashdreams.infra.postprocess.rtx import (
+    POSTPROCESS_PRESET_RTX_DEBLUR_ULTRA,
+    POSTPROCESS_PRESET_RTX_SUPER_RESOLUTION,
+    POSTPROCESS_PRESET_RTX_SUPER_RESOLUTION_ULTRA,
+    RTXVideoSuperResolutionPostProcessor,
+    RTXVideoSuperResolutionPostProcessorConfig,
+    RTXVideoSuperResolutionQuality,
+)
 from flashdreams.infra.postprocess.stream import (
     VideoPostprocessStepStats,
     VideoPostprocessStream,
@@ -43,4 +51,10 @@ __all__ = [
     "VideoSpec",
     "VideoTensorLayout",
     "to_bvtchw",
+    "RTXVideoSuperResolutionPostProcessor",
+    "RTXVideoSuperResolutionPostProcessorConfig",
+    "RTXVideoSuperResolutionQuality",
+    "POSTPROCESS_PRESET_RTX_SUPER_RESOLUTION",
+    "POSTPROCESS_PRESET_RTX_SUPER_RESOLUTION_ULTRA",
+    "POSTPROCESS_PRESET_RTX_DEBLUR_ULTRA",
 ]

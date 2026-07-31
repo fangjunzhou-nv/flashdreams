@@ -122,23 +122,28 @@ Interpret the report as follows:
   tolerances.
 
 ## Run interactive-drive (desktop demo)
-
 The `omnidreams.interactive_drive` subpackage ships a single-process
-driving demo with a Ludus OpenGL raster backend and a PyTorch world-model
-backend ([see its README](omnidreams/interactive_drive/README.md) for the
-full guide). From the flashdreams workspace root:
+driving demo. Refer to [README for full guide](omnidreams/interactive_drive/README.md)
 
+Example execution below:
 ```bash
-uv sync --package flashdreams-omnidreams --extra interactive-drive
-uv run --package flashdreams-omnidreams interactive-drive
-```
+# Token For Asset Repos
+export HF_TOKEN=<YOUR-HF-TOKEN>
+# Enable long paths to avoid breaking third-party source checkouts
+git config --system core.longpaths true
 
-The `interactive-drive` extra adds `slangpy` (the Vulkan-backed local
-windowing runtime); server users running only `omnidreams.webrtc` or
-`omnidreams.grpc` can skip it. The default scene auto-stages from
-`nvidia/omni-dreams-scenes` on first launch when `HF_TOKEN` is set; use
-`omnidreams-prepare` for explicit staging of arbitrary scene UUIDs
-or to pre-warm the ~14 GB Cosmos-Reason1 text encoder.
+# Sync dependencies
+uv sync --package flashdreams-omnidreams --extra interactive-drive
+uv run --package flashdreams-omnidreams python integrations/omnidreams/omnidreams_singleview/tools/sync_thirdparty.py sync
+
+# Prepare to run tuned for performance
+uv run --package flashdreams-omnidreams omnidreams-prepare --perf
+# Run demo
+uv run --package flashdreams-omnidreams interactive-drive \
+	--manifest example_world_model_perf.yaml
+
+# add `--stream-mjpeg :8080` to stream to your browser
+```
 
 ## Native DiT defaults
 
@@ -173,6 +178,11 @@ from the scene's first ground-truth camera frame
 (`clipgt/frames/<camera>/<ts>.jpeg`, falling back to `clipgt/first_image.*`) and
 the weather-matched `clipgt/prompt<N>.txt` (falling back to `clipgt/prompt.txt`).
 Pass `--scene_dir <path>` to use a pre-staged local scene instead.
+
+To enable video post-processing by default, pass a registered preset such as
+`--postprocess-preset rtx-super-resolution`. The request-session page also
+offers a **Post-process** selector; its choice applies to the next connection
+and can override the command-line default, including turning processing off.
 
 ## Run gRPC server
 

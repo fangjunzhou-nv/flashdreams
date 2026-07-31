@@ -12,6 +12,7 @@ handled by the demo's outer loop over this same long-lived window.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import math as _math
 import time
@@ -77,6 +78,8 @@ MPS_TO_MPH = 2.2369362920544
 # :class:`SlangPyHudPresenter`.
 DRIVE_KEY_RELEASE_DEBOUNCE_S = 0.08
 
+_BevPanelKey = tuple[int, int, int, int]
+
 
 def _allocate_canvas(width: int, height: int) -> tuple[np.ndarray, Image.Image]:
     """Allocate the chrome buffer and a PIL Image view sharing its memory.
@@ -92,6 +95,28 @@ def _allocate_canvas(width: int, height: int) -> tuple[np.ndarray, Image.Image]:
     img = Image.frombuffer("RGBA", (width, height), buf, "raw", "RGBA", 0, 1)
     img.readonly = 0
     return buf, img
+
+
+def _build_bev_panel_image(
+    key: _BevPanelKey,
+    bev_source: object,
+    target_size: tuple[int, int],
+    apply_filter: Callable[[Image.Image], Image.Image],
+) -> tuple[_BevPanelKey, Image.Image]:
+    """Materialize, resize, and recolor BEV away from presentation."""
+    bev_rgb = _as_rgb_host_uint8(bev_source)
+    bev = Image.fromarray(bev_rgb, mode="RGB")
+    target_w, target_h = target_size
+    scale = max(target_w / bev.width, target_h / bev.height)
+    scaled_w = max(1, int(bev.width * scale))
+    scaled_h = max(1, int(bev.height * scale))
+    scaled = bev.resize((scaled_w, scaled_h), Image.Resampling.BILINEAR)
+    crop_left = (scaled_w - target_w) // 2
+    crop_top = (scaled_h - target_h) // 2
+    cropped = scaled.crop(
+        (crop_left, crop_top, crop_left + target_w, crop_top + target_h)
+    )
+    return key, apply_filter(cropped)
 
 
 class _LRUCache(OrderedDict):
@@ -314,6 +339,11 @@ class SlangPyHudPresenter:
         # on the main thread, where it's safe to recreate Vulkan
         # resources.
         self._pending_resize: tuple[int, int] | None = None
+        # Last model-frame resolution that drove an automatic native-size
+        # window resize. User resizes at the same source resolution remain
+        # authoritative; a new source resolution (for example VSR on/off)
+        # triggers one fresh native-size request.
+        self._auto_sized_camera_src_size: tuple[int, int] | None = None
         self._window.on_resize = self._on_resize
         self._window.on_keyboard_event = self._on_keyboard_event
         self._window.on_mouse_event = self._on_mouse_event
@@ -333,11 +363,21 @@ class SlangPyHudPresenter:
         self._pedal_cache: _LRUCache = _LRUCache(maxsize=16)
         self._scene_thumb_cache: dict[Any, Image.Image | None] = {}
         self._variant_thumb_cache: dict[tuple[Any, str], Image.Image | None] = {}
-        self._bev_panel_cache_key: tuple[int, int, int] | None = None
+        self._bev_panel_cache_key: _BevPanelKey | None = None
         self._bev_panel_cache: Image.Image | None = None
+        self._bev_panel_epoch = 0
+        self._bev_panel_exec = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="interactive-drive-bev-panel",
+        )
+        self._bev_panel_future: (
+            concurrent.futures.Future[tuple[_BevPanelKey, Image.Image]] | None
+        ) = None
 
         self._latest_camera_pil: Image.Image | None = None
-        self._latest_bev_pil: Image.Image | None = None
+        self._latest_bev_source: object | None = None
+        self._prepared_bev_source_key: object | None = None
+        self._bev_source_generation = 0
         # Numpy view of the latest world-model frame (RGBA8 with alpha
         # padded to 255) used by the GPU camera path. Lazily filled on
         # demand from ``_latest_camera_pil`` so we don't pay for the
@@ -378,6 +418,7 @@ class SlangPyHudPresenter:
         self._variant_dropdown_open = False
         self._scene_header_rect: tuple[int, int, int, int] | None = None
         self._variant_header_rect: tuple[int, int, int, int] | None = None
+        self._postprocess_rect: tuple[int, int, int, int] | None = None
         self._scene_item_rects: list[tuple[tuple[int, int, int, int], Any]] = []
         self._variant_item_rects: list[tuple[tuple[int, int, int, int], str]] = []
         self._hovered_scene_label: str | None = None
@@ -411,6 +452,9 @@ class SlangPyHudPresenter:
         # clicks and the placeholder shows a "Preloading scenes..." hint, so
         # the user can't pick a scene until every scene is cached.
         self._scene_selection_locked_probe: Callable[[], bool] = lambda: False
+        self._postprocess_preset = ""
+        self._postprocess_enabled = False
+        self._postprocess_callback: Callable[[bool], None] = lambda enabled: None
 
         # Scene-change request set by the dropdown click handlers. The
         # outer demo loop checks this after each ``app.run_scene`` returns:
@@ -460,7 +504,15 @@ class SlangPyHudPresenter:
         if self._cuda_hud_interop is None or not _has_cuda_tensor(rgb):
             _prefetch_to_numpy(rgb)
         if frame.bev_host_uint8 is not None:
-            _prefetch_to_numpy(frame.bev_host_uint8)
+            source_group_key = getattr(frame.bev_host_uint8, "source_group_key", None)
+            source_key = (
+                source_group_key()
+                if callable(source_group_key)
+                else id(frame.bev_host_uint8)
+            )
+            if source_key != getattr(self, "_prepared_bev_source_key", None):
+                _prefetch_to_numpy(frame.bev_host_uint8)
+                self._prepared_bev_source_key = source_key
 
     def present_frame(self, frame: PresentedFrame, view_mode: str) -> None:
         # Apply any pending resize before touching the display texture
@@ -472,6 +524,15 @@ class SlangPyHudPresenter:
             self._apply_resize(new_size[0], new_size[1])
 
         rgb = self._select_view_rgb(frame, view_mode)
+        if (
+            view_mode == "model_rgb"
+            and frame.model_rgb_host_uint8 is not None
+            and self._resize_window_for_native_model_frame(rgb)
+        ):
+            # Window/swapchain resources are rebuilt at the start of the next
+            # presentation tick. Drop this transition frame instead of using
+            # old-size CUDA/Vulkan buffers against the newly resized window.
+            return
         try:
             if self._present_cuda_hud_frame(frame, rgb):
                 return
@@ -534,6 +595,10 @@ class SlangPyHudPresenter:
 
     def close(self) -> None:
         self._should_close_flag = True
+        bev_panel_exec = getattr(self, "_bev_panel_exec", None)
+        if bev_panel_exec is not None:
+            bev_panel_exec.shutdown(wait=True, cancel_futures=True)
+            self._bev_panel_exec = None
         if self._cuda_hud_interop is not None:
             with contextlib.suppress(Exception):
                 self._cuda_hud_interop.close()
@@ -588,28 +653,23 @@ class SlangPyHudPresenter:
         self._has_camera_frame = True
 
     def _update_bev_pil(self, bev_rgb: object) -> None:
-        bev_rgb = _as_rgb_host_uint8(bev_rgb)
-        # Wrap the raw BEV; the GoogleMaps recolour runs in
-        # :meth:`_get_bev_panel_image` *after* the panel-sized resize so the
-        # float32 pipeline processes ~0.22 MP instead of 1 MP.
-        if not bev_rgb.flags["C_CONTIGUOUS"]:
-            bev_rgb = np.ascontiguousarray(bev_rgb)
-        try:
-            self._latest_bev_pil = Image.fromarray(bev_rgb, mode="RGB")
-        except (ValueError, OSError):
-            return
-        self._bev_panel_cache_key = None
-        self._bev_panel_cache = None
+        # Keep CUDA event synchronization and host materialization off the
+        # presentation thread. The panel worker consumes this lazy source.
+        self._latest_bev_source = bev_rgb
+        self._bev_source_generation += 1
 
     # -- Vulkan / surface plumbing ---------------------------------
 
     def _create_device(self) -> Any:
         existing_device_handles = self._cuda_existing_device_handles()
-        enable_cuda_interop = not _env_truthy(DISABLE_CUDA_INTEROP_ENV)
-        if not enable_cuda_interop:
+        cuda_interop_requested = not _env_truthy(DISABLE_CUDA_INTEROP_ENV)
+        enable_cuda_interop = cuda_interop_requested and bool(existing_device_handles)
+        if not cuda_interop_requested:
             self._cuda_interop_unavailable_reason = (
                 f"disabled by {DISABLE_CUDA_INTEROP_ENV}"
             )
+        elif not existing_device_handles:
+            self._cuda_interop_unavailable_reason = "CUDA context unavailable"
         device_kwargs = {
             "type": self._spy.DeviceType.vulkan,
             "enable_debug_layers": False,
@@ -643,7 +703,11 @@ class SlangPyHudPresenter:
             return []
         try:
             if not torch.cuda.is_initialized():
-                return []
+                torch.cuda.init()
+            # The HUD is constructed before the model backend. Materialize
+            # the primary CUDA context on this thread so slangpy can bind
+            # Vulkan interop to the same device the backend will use.
+            torch.cuda.current_stream()
         except Exception:
             return []
 
@@ -781,6 +845,52 @@ class SlangPyHudPresenter:
         # race with whatever frame is in flight.
         self._pending_resize = self._normalise_present_size(width, height)
 
+    def _resize_window_for_native_model_frame(self, rgb: object) -> bool:
+        """Grow the window when a model-frame resolution needs more room.
+
+        The camera region never upscales smaller frames: they remain centered
+        at native resolution while the existing canvas and HUD stay visible.
+        Larger frames grow only the dimensions required to fit the source plus
+        the fixed-width HUD column. Window-manager clamping and later user
+        resizes remain authoritative until the source resolution changes.
+
+        Returns:
+            ``True`` when a resize was requested and this frame should be
+            dropped while presentation resources are rebuilt.
+        """
+        source_size = _rgb_source_size(rgb)
+        if source_size is None or source_size == getattr(
+            self, "_auto_sized_camera_src_size", None
+        ):
+            return False
+        source_width, source_height = source_size
+        current_width, current_height = self._current_window_size()
+        target_size = (
+            max(current_width, source_width + HUD_PANEL_WIDTH),
+            max(current_height, source_height, MIN_WINDOW_H),
+        )
+        if target_size == (current_width, current_height):
+            self._auto_sized_camera_src_size = source_size
+            return False
+        try:
+            self._window.resize(*target_size)
+        except Exception as exc:
+            logger.warning(
+                "[presenter] native model-frame window resize failed "
+                f"source={source_size} target={target_size} ({exc})",
+            )
+            return False
+        # Some SDL/window-manager combinations deliver the resize callback
+        # asynchronously. Stash the request as well so the next frame always
+        # rebuilds resources before presenting at the new dimensions.
+        self._pending_resize = target_size
+        self._auto_sized_camera_src_size = source_size
+        logger.info(
+            "[presenter] native model-frame window resize "
+            f"source={source_size} target={target_size}",
+        )
+        return True
+
     def _submit_ready_cuda_hud(self) -> bool:
         interop = self._cuda_hud_interop
         if interop is None:
@@ -788,7 +898,7 @@ class SlangPyHudPresenter:
         interop_frame = interop.ready_rgba_buffer()
         if interop_frame is None:
             return False
-        rgba_buffer, cuda_stream = interop_frame
+        rgba_buffer, _cuda_stream = interop_frame
         self._sync_window_size()
         if self._cuda_hud_interop is not interop:
             return False
@@ -821,13 +931,10 @@ class SlangPyHudPresenter:
                 [width, height, 1],
             )
             encoder.blit(surface_texture, self._display_texture)
-            submit_id = self._device.submit_command_buffer(
-                encoder.finish(),
-                cuda_stream=cuda_stream,
-            )
+            submit_id = self._device.submit_command_buffer(encoder.finish())
             interop.mark_submitted(rgba_buffer, submit_id)
-            del surface_texture
             self._surface.present()
+            del surface_texture
         except RuntimeError as exc:
             logger.warning(
                 f"[presenter] swapchain present failed ({exc}); reconfiguring",
@@ -873,8 +980,8 @@ class SlangPyHudPresenter:
                 self._composite_camera_gpu(encoder)
             encoder.blit(surface_texture, self._display_texture)
             self._device.submit_command_buffer(encoder.finish())
-            del surface_texture
             self._surface.present()
+            del surface_texture
         except RuntimeError as exc:
             logger.warning(
                 f"[presenter] swapchain present failed ({exc}); reconfiguring",
@@ -935,7 +1042,7 @@ class SlangPyHudPresenter:
         cam_h = screen_h
         if src_w <= 0 or src_h <= 0:
             return None
-        scale = min(cam_w / src_w, cam_h / src_h)
+        scale = min(1.0, cam_w / src_w, cam_h / src_h)
         fit_w = max(1, int(src_w * scale))
         fit_h = max(1, int(src_h * scale))
         offset_x = (cam_w - fit_w) // 2
@@ -1164,7 +1271,7 @@ class SlangPyHudPresenter:
         fw, fh = camera.size
         if fw <= 0 or fh <= 0 or aw <= 0 or ah <= 0:
             return
-        scale = min(aw / fw, ah / fh)
+        scale = min(1.0, aw / fw, ah / fh)
         target_w = max(1, int(fw * scale))
         target_h = max(1, int(fh * scale))
         cache_key = (id(camera), target_w, target_h)
@@ -1298,6 +1405,7 @@ class SlangPyHudPresenter:
         header_w = panel_size[0] - margin * 2
         header_y = py + 8
         variant_y = header_y + bar_h + 4
+        postprocess_y = variant_y + bar_h + 4
         self._scene_header_rect = (
             header_x,
             header_y,
@@ -1310,6 +1418,12 @@ class SlangPyHudPresenter:
             header_x + header_w,
             variant_y + bar_h,
         )
+        self._postprocess_rect = (
+            header_x,
+            postprocess_y,
+            header_x + header_w,
+            postprocess_y + bar_h,
+        )
 
         center_x = px + panel_size[0] // 2
         # ``speed_y`` is the top of the speed-digit chip. PIL renders
@@ -1318,7 +1432,7 @@ class SlangPyHudPresenter:
         # bar would still land the visible glyph inside the bar. Add a
         # ~12 px clearance below ``variant_y + bar_h`` so the digit
         # never overlaps the headers.
-        speed_y = variant_y + bar_h + 12
+        speed_y = postprocess_y + bar_h + 12
         self._draw_speed(canvas, draw, center_x, speed_y, int(self._speed_mph))
 
         # Light the reverse indicator red when reverse is engaged; the cached
@@ -1382,6 +1496,8 @@ class SlangPyHudPresenter:
             # Scene header reads "Preloading scenes..." while locked, so the
             # lock state has to invalidate the cached chrome too.
             self._scene_selection_locked(),
+            self._postprocess_preset,
+            self._postprocess_enabled,
         )
         if key == self._panel_chrome_cache_key and self._panel_chrome_cache is not None:
             return self._panel_chrome_cache
@@ -1461,12 +1577,55 @@ class SlangPyHudPresenter:
                 font=self._font_small,
             )
 
+        # Post-processing is selected by CLI and can be switched live for the
+        # local window. An empty preset remains visible but disabled so users
+        # know which launch option unlocks the control.
+        postprocess_y = variant_y + bar_h + 4
+        postprocess_rect = (
+            margin,
+            postprocess_y,
+            margin + header_w,
+            postprocess_y + bar_h,
+        )
+        postprocess_available = bool(self._postprocess_preset)
+        postprocess_clickable = postprocess_available and not (
+            self._scene_dropdown_open or self._variant_dropdown_open
+        )
+        d.rounded_rectangle(postprocess_rect, radius=6, fill=HEADER_BG + (255,))
+        d.text(
+            (margin + 10, postprocess_y + 6),
+            "Upsample 2x",
+            fill=TEXT_COLOR if postprocess_clickable else LABEL_COLOR,
+            font=self._font_small,
+        )
+        state_label = (
+            ("ON" if self._postprocess_enabled else "OFF")
+            if postprocess_available
+            else "N/A"
+        )
+        state_bbox = _measure_text(self._font_small, state_label)
+        state_w = state_bbox[2] - state_bbox[0]
+        state_fill = (
+            NVIDIA_GREEN
+            if self._postprocess_enabled and postprocess_clickable
+            else LABEL_COLOR
+        )
+        d.text(
+            (
+                margin + header_w - state_w - 10 - state_bbox[0],
+                postprocess_y + 6,
+            ),
+            state_label,
+            fill=state_fill,
+            font=self._font_small,
+        )
+
         # ``mph`` label baseline + reverse-indicator box. Speed-y must
         # match the live ``_draw_panel`` calculation; both place the
         # speed-digit chip-top ~12 px below the variant bar so PIL's
         # tight-bbox glyph chip clears the headers.
         center_x = panel_w // 2
-        speed_y = variant_y + bar_h + 12
+        speed_y = postprocess_y + bar_h + 12
         mbox = _measure_text(self._font_tiny, "mph")
         mw = mbox[2] - mbox[0]
         d.text(
@@ -1767,8 +1926,9 @@ class SlangPyHudPresenter:
         inner = (bev_rect[0] + 4, bev_rect[1] + 4, bev_rect[2] - 4, bev_rect[3] - 4)
         inner_w = inner[2] - inner[0]
         inner_h = inner[3] - inner[1]
+        self._bev_panel_target_size = (inner_w, inner_h)
 
-        if self._latest_bev_pil is None:
+        if self._latest_bev_source is None:
             text = "WAITING FOR BEV..."
             tbox = _measure_text(self._font_tiny, text)
             tw = tbox[2] - tbox[0]
@@ -1793,37 +1953,47 @@ class SlangPyHudPresenter:
         self._draw_bev_marker(draw, marker_cx, marker_cy, marker_size)
 
     def _get_bev_panel_image(self, target_size: tuple[int, int]) -> Image.Image | None:
-        if self._latest_bev_pil is None:
+        if self._latest_bev_source is None:
             return None
         target_w, target_h = target_size
         if target_w <= 0 or target_h <= 0:
             return None
-        key = (id(self._latest_bev_pil), target_w, target_h)
-        if key == self._bev_panel_cache_key and self._bev_panel_cache is not None:
-            return self._bev_panel_cache
-        from omnidreams.interactive_drive.demo import _apply_googlemaps_filter
-
-        bev = self._latest_bev_pil
-        # Cover-fit + crop, then GoogleMaps filter. Two ordering choices keep
-        # this cheap (~10 ms vs ~57 ms / tick at 1024 -> ~470 panel):
-        #   1) Resize before filtering so the per-pixel float32 filter runs on
-        #      ~0.22 MP not 1 MP; it commutes with bilinear resampling to
-        #      within ~2 channel units (visually identical).
-        #   2) BILINEAR not LANCZOS -- far cheaper, and the tint blend masks
-        #      the sharpness difference at minimap scale.
-        scale = max(target_w / bev.width, target_h / bev.height)
-        scaled_w = max(1, int(bev.width * scale))
-        scaled_h = max(1, int(bev.height * scale))
-        scaled = bev.resize((scaled_w, scaled_h), Image.Resampling.BILINEAR)
-        crop_left = (scaled_w - target_w) // 2
-        crop_top = (scaled_h - target_h) // 2
-        cropped = scaled.crop(
-            (crop_left, crop_top, crop_left + target_w, crop_top + target_h)
+        key = (
+            self._bev_panel_epoch,
+            self._bev_source_generation,
+            target_w,
+            target_h,
         )
-        filtered = _apply_googlemaps_filter(cropped)
-        self._bev_panel_cache = filtered
-        self._bev_panel_cache_key = key
-        return filtered
+        future = self._bev_panel_future
+        if future is not None and future.done():
+            try:
+                completed_key, completed_image = future.result()
+            except Exception as exc:
+                logger.warning(f"[presenter] BEV panel processing failed: {exc}")
+            else:
+                self._bev_panel_cache_key = completed_key
+                self._bev_panel_cache = completed_image
+            self._bev_panel_future = None
+
+        if key != self._bev_panel_cache_key and self._bev_panel_future is None:
+            from omnidreams.interactive_drive.demo import _apply_googlemaps_filter
+
+            self._bev_panel_future = self._bev_panel_exec.submit(
+                _build_bev_panel_image,
+                key,
+                self._latest_bev_source,
+                target_size,
+                _apply_googlemaps_filter,
+            )
+
+        cache_key = self._bev_panel_cache_key
+        if (
+            cache_key is not None
+            and cache_key[0] == self._bev_panel_epoch
+            and cache_key[2:] == target_size
+        ):
+            return self._bev_panel_cache
+        return None
 
     @staticmethod
     def _draw_bev_marker(
@@ -2171,6 +2341,23 @@ class SlangPyHudPresenter:
                     break
 
     def _handle_click(self, pos: tuple[int, int]) -> None:
+        dropdown_open = self._scene_dropdown_open or self._variant_dropdown_open
+        if (
+            not dropdown_open
+            and self._postprocess_rect
+            and _rect_contains(self._postprocess_rect, pos)
+        ):
+            if self._postprocess_preset:
+                self._postprocess_enabled = not self._postprocess_enabled
+                self._postprocess_callback(self._postprocess_enabled)
+                self._panel_chrome_cache_key = None
+                self._panel_chrome_cache = None
+                logger.info(
+                    "[demo] post-processing {} preset={!r}",
+                    "enabled" if self._postprocess_enabled else "disabled",
+                    self._postprocess_preset,
+                )
+            return
         # While scenes are still preloading, the scene/variant dropdowns are
         # locked (the only mouse-clickable HUD elements), so ignore clicks
         # until every scene is cached and selection is instant.
@@ -2319,6 +2506,20 @@ class SlangPyHudPresenter:
         self._model_can_prewarm = bool(can_prewarm)
         self._model_ready_probe = ready_probe
 
+    def set_postprocess_control(
+        self,
+        *,
+        preset: str,
+        enabled: bool,
+        callback: Callable[[bool], None],
+    ) -> None:
+        """Bind the local HUD toggle to the model worker's post-process state."""
+        self._postprocess_preset = preset
+        self._postprocess_enabled = bool(enabled and preset)
+        self._postprocess_callback = callback
+        self._panel_chrome_cache_key = None
+        self._panel_chrome_cache = None
+
     def set_scene_selection_locked(self, probe: Callable[[], bool]) -> None:
         """Lock scene/variant selection while ``probe()`` returns True (--preload-scenes).
 
@@ -2417,7 +2618,14 @@ class SlangPyHudPresenter:
         self._camera_resize_cache_key = None
         self._camera_resize_cache = None
         self._latest_camera_pil = None
-        self._latest_bev_pil = None
+        self._latest_bev_source = None
+        self._prepared_bev_source_key = None
+        self._bev_source_generation = 0
+        self._bev_panel_epoch = getattr(self, "_bev_panel_epoch", 0) + 1
+        bev_panel_future = getattr(self, "_bev_panel_future", None)
+        if bev_panel_future is not None:
+            bev_panel_future.cancel()
+            self._bev_panel_future = None
         self._bev_panel_cache_key = None
         self._bev_panel_cache = None
         # Panel chrome shows the scene label, so its cache key changes
@@ -2474,6 +2682,24 @@ def _prefetch_to_numpy(frame: object) -> None:
 
 def _has_cuda_tensor(frame: object) -> bool:
     return callable(getattr(frame, "to_cuda_tensor", None))
+
+
+def _rgb_source_size(frame: object) -> tuple[int, int] | None:
+    """Return an HWC RGB frame's ``(width, height)`` without a host copy."""
+    source = frame
+    to_cuda_tensor = getattr(frame, "to_cuda_tensor", None)
+    if callable(to_cuda_tensor):
+        try:
+            source = to_cuda_tensor()
+        except RuntimeError:
+            return None
+    shape = getattr(source, "shape", None)
+    if shape is None or len(shape) != 3:
+        return None
+    height, width = int(shape[0]), int(shape[1])
+    if width <= 0 or height <= 0:
+        return None
+    return (width, height)
 
 
 def _as_rgb_host_uint8(frame: object) -> np.ndarray:
