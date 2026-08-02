@@ -14,6 +14,7 @@
     ]
       (system:
         let
+          inherit (nixpkgs) lib;
           pkgs = import nixpkgs { inherit system; };
         in
         {
@@ -35,6 +36,18 @@
                 echo "Environment not initialized. Run: uv sync --extra dev --extra runners"
               fi
             '';
+
+            # Binary Python wheels need the C++ runtime, while CUDA loads the
+            # host NVIDIA driver from NixOS's stable run path. Do not add the
+            # full manylinux compatibility set here: LD_LIBRARY_PATH also
+            # affects direnv's Nix subprocesses and can make them load an
+            # incompatible libc or libstdc++.
+            LD_LIBRARY_PATH = lib.optionalString pkgs.stdenv.isLinux (
+              lib.makeLibraryPath [
+                pkgs.stdenv.cc.cc.lib
+                "/run/opengl-driver"
+              ]
+            );
           };
         });
 }
