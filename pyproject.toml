@@ -175,3 +175,6 @@ docs-ci = [
     "tqdm>=4.60",
     "transformers>=5.0,<6",
 ]
+dev = [
+    "dotenv>=0.9.9",
+]
