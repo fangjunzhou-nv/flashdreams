@@ -10,6 +10,7 @@
     with flake-utils.lib;
     eachSystem [
       system.x86_64-linux
+      system.aarch64-linux
       system.aarch64-darwin
     ]
       (system:
@@ -29,7 +30,7 @@
               # Python binaries do not run on NixOS without nix-ld.
               export UV_PYTHON_DOWNLOADS=never
 
-              if [ -d .venv ]; then
+              if [ -f .venv/bin/activate ]; then
                 source .venv/bin/activate
                 export PATH="$PWD/.venv/bin:$PATH"
               else
