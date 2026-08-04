@@ -867,7 +867,8 @@ class AcceleratedSelfAttention(nn.Module):
         use_tma: bool = True,
         fuse_qkv: bool = True,
         fuse_rope_kv_cache: bool = True,
-        use_fp8: bool = True,
+        use_cudnn: bool = True,
+        use_fp8: bool = False,
     ) -> None:
         """Initialize projections and independently configurable fast paths.
 
@@ -883,6 +884,9 @@ class AcceleratedSelfAttention(nn.Module):
             use_tma: Prefer TMA attention when tensor descriptors support the layout.
             fuse_qkv: Combine Q/K/V projections into one matrix multiplication.
             fuse_rope_kv_cache: Fuse Q/K postprocessing and the cache write.
+            use_cudnn: Prefer native-precision cuDNN attention while retaining the
+                fused projection and postprocessing fast paths. Unsupported inputs
+                fall back to Triton or PyTorch SDPA.
             use_fp8: Use FP8 projections and attention for eligible FP16/BF16 inputs.
         """
         super().__init__()
@@ -901,6 +905,7 @@ class AcceleratedSelfAttention(nn.Module):
         self.use_tma = use_tma
         self.fuse_qkv = fuse_qkv
         self.fuse_rope_kv_cache = fuse_rope_kv_cache
+        self.use_cudnn = use_cudnn
         self.use_fp8 = use_fp8
 
         if use_fp8:
@@ -953,6 +958,7 @@ class AcceleratedSelfAttention(nn.Module):
             "use_tma": self.use_tma,
             "fuse_qkv": self.fuse_qkv,
             "fuse_rope_kv_cache": self.fuse_rope_kv_cache,
+            "use_cudnn": self.use_cudnn,
             "use_fp8": self.use_fp8,
         }
 
@@ -1373,7 +1379,7 @@ class AcceleratedSelfAttention(nn.Module):
     def _supports_triton_attention(self, query: Tensor) -> bool:
         """Return whether the pointer-based Triton attention kernel is supported."""
         return (
-            any(self.optimization_settings.values())
+            (self.use_tma or self.fuse_qkv or self.fuse_rope_kv_cache or self.use_fp8)
             and not torch.is_grad_enabled()
             and query.is_cuda
             and query.dtype
@@ -1423,6 +1429,45 @@ class AcceleratedSelfAttention(nn.Module):
             value.transpose(1, 2),
             dropout_p=0.0,
             is_causal=False,
+        )
+        return output.transpose(1, 2)
+
+    def _supports_cudnn_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+    ) -> bool:
+        """Return whether cuDNN can execute the inference attention fast path."""
+        if (
+            not self.use_cudnn
+            or torch.is_grad_enabled()
+            or not query.is_cuda
+            or query.dtype != key.dtype
+            or query.dtype != value.dtype
+            or query.shape[0] == 0
+            or query.shape[1] == 0
+            or query.shape[2] == 0
+            or key.shape[1] == 0
+            or query.shape[-1] % 8 != 0
+            or query.shape[-1] > 256
+        ):
+            return False
+        return query.dtype in (torch.float16, torch.bfloat16)
+
+    @staticmethod
+    def _apply_cudnn_attention_blhd(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+    ) -> Tensor:
+        """Apply inference-only cuDNN attention without materializing LSE."""
+        output, *_ = torch.ops.aten._scaled_dot_product_cudnn_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            None,
+            False,
         )
         return output.transpose(1, 2)
 
@@ -1593,9 +1638,13 @@ class AcceleratedSelfAttention(nn.Module):
             device=x.device,
             dtype=attention_dtype,
         )
-        if not self._supports_triton_attention(attention_probe):
+        cached_key = kv_cache.cached_k()
+        cached_value = kv_cache.cached_v()
+        if self._supports_cudnn_attention(attention_probe, cached_key, cached_value):
+            attention_backend = "cudnn"
+        elif not self._supports_triton_attention(attention_probe):
             attention_backend = "sdpa"
-        elif self._supports_tma_attention(attention_probe):
+        elif self._supports_tma_attention(attention_probe, cached_key, cached_value):
             attention_backend = "triton-tma"
         else:
             attention_backend = "triton-pointer"
@@ -1652,7 +1701,12 @@ class AcceleratedSelfAttention(nn.Module):
         with nvtx.annotate("self_attention.attention"):
             cached_key = kv_cache.cached_k()
             cached_value = kv_cache.cached_v()
-            output = self._apply_attention_blhd(query, cached_key, cached_value)
+            if self._supports_cudnn_attention(query, cached_key, cached_value):
+                output = self._apply_cudnn_attention_blhd(
+                    query, cached_key, cached_value
+                )
+            else:
+                output = self._apply_attention_blhd(query, cached_key, cached_value)
         with nvtx.annotate("self_attention.output_projection"):
             output = output.reshape(batch_shape + (sequence_length, inner_dim))
             if self.use_fp8:

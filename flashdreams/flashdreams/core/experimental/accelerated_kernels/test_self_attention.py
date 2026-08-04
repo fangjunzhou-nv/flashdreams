@@ -136,6 +136,7 @@ def _make_native_reference(
         use_tma=False,
         fuse_qkv=False,
         fuse_rope_kv_cache=False,
+        use_cudnn=False,
         use_fp8=False,
     ).to(device=device, dtype=dtype)
     reference.load_state_dict(attention.state_dict(), strict=True)
@@ -908,6 +909,49 @@ def test_strict_fp8_mode_rejects_unsupported_execution() -> None:
         attention.initialize_cache(1, 2, 4, 0, torch.device("cpu"), torch.bfloat16)
 
 
+@pytest.mark.ci_cpu
+def test_speed_defaults_prefer_cudnn_with_native_storage() -> None:
+    """Keep the speed-oriented backend and storage policy explicit."""
+    attention = AcceleratedSelfAttention(32, 2, 16)
+
+    assert attention.use_cudnn
+    assert not attention.use_fp8
+    assert attention.optimization_settings == {
+        "use_tma": True,
+        "fuse_qkv": True,
+        "fuse_rope_kv_cache": True,
+        "use_cudnn": True,
+        "use_fp8": False,
+    }
+
+
+@pytest.mark.ci_gpu
+def test_native_inference_selects_cudnn_attention(
+    cuda_device: torch.device,
+) -> None:
+    """Select cuDNN for eligible native-precision inference inputs."""
+    attention = AcceleratedSelfAttention(256, 2, 128).to(
+        device=cuda_device,
+        dtype=torch.bfloat16,
+    )
+    attention.eval()
+    x = torch.zeros((1, 16, 256), device=cuda_device, dtype=torch.bfloat16)
+    kv_cache = attention.initialize_cache(
+        1,
+        16,
+        32,
+        0,
+        cuda_device,
+        torch.bfloat16,
+    )
+    kv_cache.before_update(0)
+
+    with torch.inference_mode():
+        metadata = attention._backend_metadata(x, kv_cache, None)
+
+    assert metadata["attention_backend"] == "cudnn"
+
+
 @dataclass(frozen=True)
 class _BenchmarkCase:
     """One full-forward benchmark shape and prefilled cache length."""
@@ -930,6 +974,7 @@ class _BenchmarkVariant:
     fuse_qkv: bool
     fuse_rope_kv_cache: bool
     use_fp8: bool
+    use_cudnn: bool = True
 
     def as_kwargs(self) -> dict[str, bool]:
         """Return constructor keyword arguments for this variant."""
@@ -938,6 +983,7 @@ class _BenchmarkVariant:
             "fuse_qkv": self.fuse_qkv,
             "fuse_rope_kv_cache": self.fuse_rope_kv_cache,
             "use_fp8": self.use_fp8,
+            "use_cudnn": self.use_cudnn,
         }
 
 
@@ -952,12 +998,13 @@ _BENCHMARK_CASES = (
 )
 
 _DROP_ONE_VARIANTS = (
-    _BenchmarkVariant("sdpa", False, False, False, False),
-    _BenchmarkVariant("all-on", True, True, True, True),
-    _BenchmarkVariant("without-tma", False, True, True, True),
-    _BenchmarkVariant("without-fused-qkv", True, False, True, True),
-    _BenchmarkVariant("without-fused-rope-cache", True, True, False, True),
-    _BenchmarkVariant("without-fp8", True, True, True, False),
+    _BenchmarkVariant("cudnn-reference", False, False, False, False),
+    _BenchmarkVariant("default", True, True, True, False),
+    _BenchmarkVariant("without-fused-qkv", True, False, True, False),
+    _BenchmarkVariant("without-fused-rope-cache", True, True, False, False),
+    _BenchmarkVariant("fp8", True, True, True, True),
+    _BenchmarkVariant("triton-native", True, True, True, False, False),
+    _BenchmarkVariant("triton-fp8", True, True, True, True, False),
 )
 
 _FACTORIAL_VARIANTS = tuple(
@@ -966,7 +1013,11 @@ _FACTORIAL_VARIANTS = tuple(
             f"tma-{int(values[0])}-qkv-{int(values[1])}-"
             f"rope-cache-{int(values[2])}-fp8-{int(values[3])}"
         ),
-        *values,
+        values[0],
+        values[1],
+        values[2],
+        values[3],
+        False,
     )
     for values in itertools.product((False, True), repeat=4)
 )
@@ -1106,7 +1157,7 @@ def test_self_attention_drop_one_benchmark(
     variant: _BenchmarkVariant,
     dtype: torch.dtype,
 ) -> None:
-    """Benchmark SDPA, all-on, and all-on-minus-one across the shape sweep."""
+    """Benchmark the default, reference, fallbacks, and drop-one variants."""
     _run_self_attention_benchmark(
         benchmark,
         cuda_device,
