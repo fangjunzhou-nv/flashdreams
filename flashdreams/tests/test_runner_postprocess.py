@@ -119,3 +119,18 @@ def test_all_rank_processor_stream_does_not_collect_on_nonzero_rank() -> None:
 
     assert stream is not None
     assert not stream.collect_output
+
+
+def test_runner_postprocess_preserves_expected_output_frames() -> None:
+    config = _config(
+        VideoPostprocessChainConfig(processors=(_RankZeroProcessorConfig(),))
+    )
+
+    stream = create_runner_postprocess_stream(
+        config,
+        world_size=1,
+        expected_output_frames=7,
+    )
+
+    assert stream is not None
+    assert stream.expected_output_frames == 7

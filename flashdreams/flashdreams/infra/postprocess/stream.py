@@ -93,9 +93,12 @@ class VideoPostprocessStream:
         profile: bool = False,
         collect_output: bool = True,
         move_to_cpu: bool = True,
+        expected_output_frames: int | None = None,
         empty_message: str = "post-processing emitted no video frames",
     ) -> None:
         postprocess.validate_execution(world_size=world_size)
+        if expected_output_frames is not None and expected_output_frames <= 0:
+            raise ValueError("expected_output_frames must be positive when provided")
         self.postprocess = postprocess
         self.output_layout = output_layout
         self.fps = fps
@@ -104,10 +107,13 @@ class VideoPostprocessStream:
         self.profile = profile
         self.collect_output = collect_output
         self.move_to_cpu = move_to_cpu
+        self.expected_output_frames = expected_output_frames
         self.empty_message = empty_message
         self.state = _VideoPostprocessStreamState()
         self._time_dim = _video_layout_time_dim(output_layout)
         self._chunks: list[Tensor] = []
+        self._preallocated_cpu_output: Tensor | None = None
+        self._preallocated_cpu_frames = 0
         self._closed = False
         self._prepared = False
         self.last_process_stats: VideoPostprocessStepStats | None = None
@@ -228,11 +234,54 @@ class VideoPostprocessStream:
     def _append_if_nonempty(self, output: Tensor) -> None:
         if not self.collect_output or output.shape[self._time_dim] == 0:
             return
-        self._chunks.append(output.cpu() if self.move_to_cpu else output)
+        if not self.move_to_cpu or self.expected_output_frames is None:
+            self._chunks.append(output.cpu() if self.move_to_cpu else output)
+            return
+
+        num_frames = int(output.shape[self._time_dim])
+        if self._preallocated_cpu_output is None:
+            output_shape = list(output.shape)
+            output_shape[self._time_dim] = self.expected_output_frames
+            self._preallocated_cpu_output = torch.empty(
+                output_shape,
+                device="cpu",
+                dtype=output.dtype,
+            )
+            self._preallocated_cpu_output.zero_()
+        else:
+            expected_shape = list(self._preallocated_cpu_output.shape)
+            expected_shape[self._time_dim] = num_frames
+            if tuple(output.shape) != tuple(expected_shape):
+                raise ValueError(
+                    "collected output shape changed outside the time dimension: "
+                    f"expected {tuple(expected_shape)}, got {tuple(output.shape)}"
+                )
+
+        end = self._preallocated_cpu_frames + num_frames
+        if end > self.expected_output_frames:
+            raise ValueError(
+                "collected output exceeded expected_output_frames: "
+                f"capacity={self.expected_output_frames}, requested_end={end}"
+            )
+        output_slice: list[slice] = [slice(None)] * output.ndim
+        output_slice[self._time_dim] = slice(self._preallocated_cpu_frames, end)
+        self._preallocated_cpu_output[tuple(output_slice)].copy_(output)
+        self._preallocated_cpu_frames = end
 
     def _collected_output(self) -> Tensor | None:
         if not self.collect_output:
             return None
+        if self._preallocated_cpu_output is not None:
+            if self._preallocated_cpu_frames != self.expected_output_frames:
+                raise ValueError(
+                    "collected output did not fill expected_output_frames: "
+                    f"expected={self.expected_output_frames}, "
+                    f"collected={self._preallocated_cpu_frames}"
+                )
+            output = self._preallocated_cpu_output
+            self._preallocated_cpu_output = None
+            self._preallocated_cpu_frames = 0
+            return output
         if not self._chunks:
             raise ValueError(self.empty_message)
         output = torch.cat(self._chunks, dim=self._time_dim)
@@ -246,6 +295,7 @@ def create_runner_postprocess_stream(
     world_size: int,
     is_rank_zero: bool = True,
     fps: float | None = None,
+    expected_output_frames: int | None = None,
 ) -> VideoPostprocessStream | None:
     """Create a runner post-processing stream, or ``None`` when skipped."""
     postprocess = getattr(config, "postprocess")
@@ -280,6 +330,7 @@ def create_runner_postprocess_stream(
         profile=bool(
             getattr(getattr(config, "pipeline", None), "enable_sync_and_profile", False)
         ),
+        expected_output_frames=expected_output_frames,
     )
 
 

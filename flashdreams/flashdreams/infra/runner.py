@@ -170,6 +170,7 @@ class Runner(ABC, Generic[RunnerConfigT, PipelineT]):
         *,
         fps: float | None = None,
         move_to_cpu: bool = True,
+        expected_output_frames: int | None = None,
     ) -> VideoPostprocessStream:
         """Create one stateful post-processing stream for a rollout."""
         stream = create_runner_postprocess_stream(
@@ -177,6 +178,7 @@ class Runner(ABC, Generic[RunnerConfigT, PipelineT]):
             world_size=self.world_size,
             is_rank_zero=self.is_rank_zero,
             fps=fps,
+            expected_output_frames=expected_output_frames,
         )
         if stream is not None:
             stream.collect_output = self.is_rank_zero
@@ -192,6 +194,7 @@ class Runner(ABC, Generic[RunnerConfigT, PipelineT]):
             fps=fps,
             collect_output=self.is_rank_zero,
             move_to_cpu=move_to_cpu,
+            expected_output_frames=expected_output_frames,
         )
 
     @abstractmethod

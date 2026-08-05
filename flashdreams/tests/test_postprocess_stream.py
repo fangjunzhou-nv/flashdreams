@@ -162,6 +162,58 @@ def test_stream_collects_generated_chunks_without_postprocess() -> None:
     assert torch.equal(output[:, :, 2:], second)
 
 
+def test_stream_preallocates_known_cpu_output_capacity() -> None:
+    stream = VideoPostprocessStream(
+        postprocess=VideoPostprocessChainConfig(),
+        output_layout="bcthw",
+        expected_output_frames=3,
+    )
+    first = torch.ones((1, 3, 2, 4, 5))
+    second = torch.full((1, 3, 1, 4, 5), 2.0)
+
+    stream.process(first, autoregressive_index=0)
+    stream.process(second, autoregressive_index=1)
+    output = stream.finish()
+
+    assert output is not None
+    assert output.shape == (1, 3, 3, 4, 5)
+    assert torch.equal(output[:, :, :2], first)
+    assert torch.equal(output[:, :, 2:], second)
+    assert stream._chunks == []
+
+
+def test_stream_rejects_underfilled_preallocated_output() -> None:
+    stream = VideoPostprocessStream(
+        postprocess=VideoPostprocessChainConfig(),
+        output_layout="tchw",
+        expected_output_frames=2,
+    )
+    stream.process(torch.ones((1, 3, 4, 5)), autoregressive_index=0)
+
+    with pytest.raises(ValueError, match="did not fill expected_output_frames"):
+        stream.finish()
+
+
+def test_stream_rejects_preallocated_output_overflow() -> None:
+    stream = VideoPostprocessStream(
+        postprocess=VideoPostprocessChainConfig(),
+        output_layout="tchw",
+        expected_output_frames=2,
+    )
+
+    with pytest.raises(ValueError, match="exceeded expected_output_frames"):
+        stream.process(torch.ones((3, 3, 4, 5)), autoregressive_index=0)
+
+
+def test_stream_rejects_nonpositive_expected_output_frames() -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        VideoPostprocessStream(
+            postprocess=VideoPostprocessChainConfig(),
+            output_layout="tchw",
+            expected_output_frames=0,
+        )
+
+
 def test_chain_propagates_output_spec_to_downstream_session() -> None:
     chain = VideoPostprocessChainConfig(
         processors=(_ScaleSpecConfig(scale=2), _BufferConfig())

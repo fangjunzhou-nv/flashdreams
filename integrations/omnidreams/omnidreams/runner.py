@@ -391,14 +391,28 @@ class OmnidreamsRunner(Runner[OmnidreamsRunnerConfig, OmnidreamsPipeline]):
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-        postprocess_stream = self.create_postprocess_stream(fps=cfg.output_fps)
-        stats_history: list[dict[str, object]] = []
-        start = 0
+        rollout_frame_counts: list[int] = []
+        expected_output_frames = 0
         for i in range(cfg.total_blocks):
             num_frames = self.pipeline.get_num_frames(i)
-            end = start + num_frames
+            end = expected_output_frames + num_frames
             if end > hdmap_num_frames:
                 break
+            rollout_frame_counts.append(num_frames)
+            expected_output_frames = end
+
+        postprocess_stream = self.create_postprocess_stream(
+            fps=cfg.output_fps,
+            expected_output_frames=(
+                expected_output_frames
+                if expected_output_frames > 0 and not cfg.postprocess.is_enabled()
+                else None
+            ),
+        )
+        stats_history: list[dict[str, object]] = []
+        start = 0
+        for i, num_frames in enumerate(rollout_frame_counts):
+            end = start + num_frames
             if self.is_rank_zero:
                 logger.info(
                     f"[{cfg.runner_name}] AR step {i}/{cfg.total_blocks}, "
