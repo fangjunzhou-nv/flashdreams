@@ -124,6 +124,25 @@ def test_kvcache_relative_rope_does_not_mutate_cached_keys(monkeypatch) -> None:
     torch.testing.assert_close(cache._k, before)
 
 
+def test_wan_block_configures_accelerated_self_attention() -> None:
+    """Wire WAN-specific compatibility settings into the core attention module."""
+    block = wan_modules.Block(
+        dim=32,
+        ffn_dim=64,
+        num_heads=2,
+        apply_rope_before_kvcache=False,
+        cp_method="ulysses",
+    )
+
+    assert isinstance(block.self_attn, wan_modules.AcceleratedSelfAttention)
+    assert block.self_attn.qk_norm_scope == "inner"
+    assert block.self_attn.q_norm.weight.shape == (32,)
+    assert block.self_attn.k_norm.weight.shape == (32,)
+    assert block.self_attn.rope_interleaved
+    assert not block.self_attn.apply_rope_before_kvcache
+    assert block.self_attn.attn_op.method == "ulysses"
+
+
 def test_wan21_uses_no_cp_group_when_not_distributed(monkeypatch) -> None:
     """Without ``torch.distributed.init``, the transformer auto-detects cp_size=1."""
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)

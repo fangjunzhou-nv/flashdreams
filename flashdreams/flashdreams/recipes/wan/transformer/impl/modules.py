@@ -32,6 +32,9 @@ from flashdreams.core.attention import (
     NativeAttention,
 )
 from flashdreams.core.attention.rope import apply_rope_freqs
+from flashdreams.core.experimental.accelerated_kernels.self_attention import (
+    AcceleratedSelfAttention,
+)
 
 
 def sinusoidal_embedding_1d(dim: int, position: Tensor) -> Tensor:
@@ -523,11 +526,15 @@ class Block(nn.Module):
 
         # Core submodules
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.self_attn = SelfAttention(
+        self.self_attn = AcceleratedSelfAttention(
             query_dim=dim,
             n_heads=num_heads,
             head_dim=dim // num_heads,
-            eps=eps,
+            qkv_bias=True,
+            output_bias=True,
+            qk_norm_eps=eps,
+            qk_norm_scope="inner",
+            rope_interleaved=True,
             apply_rope_before_kvcache=apply_rope_before_kvcache,
             cp_method=cp_method,
         )

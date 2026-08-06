@@ -203,10 +203,14 @@ Current state
 
 The current
 ``flashdreams.core.experimental.accelerated_kernels.self_attention`` module is a
-useful optimized OmniDreams path, but it is not yet a drop-in implementation for
-the other families. It assumes that one input produces Q, K, and V; couples the
-forward pass to a rolling self-attention cache; uses per-head Q/K RMSNorm; and
-rejects context parallelism (CP).
+streaming self-attention implementation for both the OmniDreams/Cosmos and WAN
+families. Its explicit policies cover biased or biasless projections, per-head or
+full-inner-width Q/K RMSNorm, half-split or interleaved RoPE, standard or
+cache-relative K rotation, legacy WAN checkpoint names, and a
+context-parallelism (CP) fallback. It still assumes that one input produces Q,
+K, and V and couples the forward pass to a rolling self-attention cache, so
+cross-attention and specialized multi-source branches continue to use composed
+operators.
 
 The common attention implementation must represent the following differences
 explicitly instead of inferring them from an integration name.
@@ -271,9 +275,9 @@ PRoPE output projections. Neither policy needs a model-specific branch in
 Context parallelism
 ~~~~~~~~~~~~~~~~~~~
 
-CP support is required before the WAN recipe can adopt the module broadly. The
-first implementation should keep the existing context-parallel attention path
-as the fallback while still accelerating compatible projection,
+The WAN recipe passes its CP method and process group to the accelerated module.
+When CP is active, the module keeps the existing context-parallel attention path
+as the correctness fallback while still using compatible projection,
 normalization, RoPE, and cache operations. A future local Triton attention
 backend may participate directly in ring attention if it returns the local
 log-sum-exp values required for cross-rank merging.
@@ -473,14 +477,14 @@ Phase 1: decompose existing attention
 Phase 2: WAN semantics and cache
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-#. Add full-inner-width Q/K normalization, projection biases, interleaved and
-   cache-relative RoPE, and independent multi-source composition.
+#. Extend the implemented full-inner-width Q/K normalization, projection biases,
+   interleaved and cache-relative RoPE beyond streaming self-attention to
+   independent multi-source composition.
 #. Preserve the existing context-parallel backend as the correctness fallback.
 #. Introduce pointer-stable circular and segmented K/V views and migrate cache
    update semantics before replacing the mathematical attention backend.
-#. Adopt the module in the shared WAN recipe. This automatically reaches most
-   WAN-family integrations while specialized branches continue to compose the
-   projected operator directly.
+#. Continue adoption from the shared WAN recipe into specialized branches that
+   need to compose the projected operator directly.
 
 Phase 3: repeated block fusions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

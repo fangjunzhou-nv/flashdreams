@@ -27,6 +27,13 @@ Run CUDA correctness and the manual benchmark from the workspace root with::
       flashdreams/flashdreams/core/experimental/accelerated_kernels/test_self_attention.py \
       -m manual --runxfail --benchmark-only --benchmark-time-unit=ms \
       --benchmark-save-data --benchmark-json=/tmp/self_attention_benchmark.json
+
+    uv run --package flashdreams --no-sync python -m pytest \
+      flashdreams/flashdreams/core/experimental/accelerated_kernels/test_self_attention.py \
+      -m manual -k wan_style --runxfail --benchmark-only \
+      --benchmark-time-unit=ms \
+      --benchmark-json=/tmp/wan_self_attention_benchmark.json
+
 """
 
 import itertools
@@ -34,7 +41,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 import torch
@@ -132,7 +139,10 @@ def _make_native_reference(
         output_bias=output_bias,
         qk_norm=qk_norm,
         qk_norm_eps=qk_norm_eps,
+        qk_norm_scope=attention.qk_norm_scope,
         rope_interleaved=attention.rope_interleaved,
+        apply_rope_before_kvcache=attention.apply_rope_before_kvcache,
+        cp_method=attention.attn_op.method,
         use_tma=False,
         fuse_qkv=False,
         fuse_rope_kv_cache=False,
@@ -160,15 +170,39 @@ def _sdpa_reference_step(
         attention.n_heads,
         attention.head_dim,
     )
-    query = attention.q_norm(attention.q_proj(x).reshape(head_shape))
-    key = attention.k_norm(attention.k_proj(x).reshape(head_shape))
+    query = attention.q_proj(x)
+    key = attention.k_proj(x)
     value = attention.v_proj(x).reshape(head_shape)
-    query = attention._apply_rope(query, rope_freqs)
-    key = attention._apply_rope(key, rope_freqs)
+    if attention.qk_norm_scope == "inner":
+        query = attention.q_norm(query)
+        key = attention.k_norm(key)
+    query = query.reshape(head_shape)
+    key = key.reshape(head_shape)
+    if attention.qk_norm_scope == "head":
+        query = attention.q_norm(query)
+        key = attention.k_norm(key)
+
+    if rope_freqs is None:
+        query_rope_freqs = key_rope_freqs = cached_key_rope_freqs = None
+    elif attention.apply_rope_before_kvcache:
+        query_rope_freqs = key_rope_freqs = rope_freqs
+        cached_key_rope_freqs = None
+    else:
+        write_end = kv_cache.write_end
+        write_start = write_end - kv_cache.chunk_size
+        query_rope_freqs = rope_freqs[write_start:write_end]
+        key_rope_freqs = None
+        cached_key_rope_freqs = rope_freqs[: kv_cache.size]
+
+    query = attention._apply_rope(query, query_rope_freqs)
+    key = attention._apply_rope(key, key_rope_freqs)
     kv_cache.update(key, value)
+    cached_key = kv_cache.cached_k()
+    if cached_key_rope_freqs is not None:
+        cached_key = attention._apply_rope(cached_key, cached_key_rope_freqs)
     output = F.scaled_dot_product_attention(
         query.transpose(1, 2),
-        kv_cache.cached_k().transpose(1, 2),
+        cached_key.transpose(1, 2),
         kv_cache.cached_v().transpose(1, 2),
         dropout_p=0.0,
         is_causal=False,
@@ -264,8 +298,10 @@ class _CorrectnessCase:
     qkv_bias: bool = False
     output_bias: bool = False
     qk_norm: bool = True
+    qk_norm_scope: Literal["head", "inner"] = "head"
     use_rope: bool = True
     rope_interleaved: bool = False
+    apply_rope_before_kvcache: bool = True
     use_fp8: bool = False
 
 
@@ -313,6 +349,25 @@ _CORRECTNESS_CASES = (
         id="b1-l17-q400-h2-d192-bf16-pointer",
     ),
     pytest.param(
+        _CorrectnessCase(
+            (1,),
+            7,
+            64,
+            2,
+            32,
+            torch.bfloat16,
+            3,
+            sink_chunks=1,
+            qkv_bias=True,
+            output_bias=True,
+            qk_norm_scope="inner",
+            rope_interleaved=True,
+            apply_rope_before_kvcache=False,
+            use_fp8=True,
+        ),
+        id="wan-relative-rope-inner-norm-bf16-fp8",
+    ),
+    pytest.param(
         _CorrectnessCase((1,), 7, 320, 1, 256, torch.float32, 1),
         id="b1-l7-q320-h1-d256-fp32-sdpa-fallback",
     ),
@@ -339,7 +394,9 @@ def test_accelerated_self_attention_matches_sdpa_across_architectures(
         qkv_bias=case.qkv_bias,
         output_bias=case.output_bias,
         qk_norm=case.qk_norm,
+        qk_norm_scope=case.qk_norm_scope,
         rope_interleaved=case.rope_interleaved,
+        apply_rope_before_kvcache=case.apply_rope_before_kvcache,
         use_fp8=case.use_fp8,
     ).to(device=cuda_device, dtype=case.dtype)
     attention.eval()
@@ -379,7 +436,11 @@ def test_accelerated_self_attention_matches_sdpa_across_architectures(
             )
             rope_freqs = (
                 _make_rope_freqs(
-                    case.sequence_length,
+                    (
+                        case.sequence_length
+                        if case.apply_rope_before_kvcache
+                        else window_size + sink_size
+                    ),
                     case.head_dim,
                     cuda_device,
                     generator,
@@ -795,6 +856,150 @@ def test_all_optimizations_disabled_matches_sdpa_on_cpu() -> None:
 
 
 @pytest.mark.ci_cpu
+@pytest.mark.parametrize(
+    "apply_rope_before_kvcache",
+    (True, False),
+    ids=("standard-rope", "cache-relative-rope"),
+)
+def test_wan_mode_matches_sdpa_across_rolling_cache_boundary(
+    apply_rope_before_kvcache: bool,
+) -> None:
+    """Preserve WAN normalization and RoPE semantics through cache rolling."""
+    torch.manual_seed(23)
+    attention = AcceleratedSelfAttention(
+        64,
+        2,
+        32,
+        qkv_bias=True,
+        output_bias=True,
+        qk_norm_scope="inner",
+        rope_interleaved=True,
+        apply_rope_before_kvcache=apply_rope_before_kvcache,
+        use_tma=False,
+        fuse_qkv=False,
+        fuse_rope_kv_cache=False,
+        use_fp8=False,
+    ).eval()
+    reference_attention = _make_native_reference(
+        attention, torch.device("cpu"), torch.float32
+    )
+    chunk_size = 5
+    window_size = 2 * chunk_size
+    sink_size = chunk_size
+    candidate_cache = attention.initialize_cache(
+        1,
+        chunk_size,
+        window_size,
+        sink_size,
+        torch.device("cpu"),
+        torch.float32,
+    )
+    reference_cache = _initialize_reference_cache(
+        reference_attention,
+        1,
+        chunk_size,
+        window_size,
+        sink_size,
+        torch.device("cpu"),
+        torch.float32,
+    )
+    generator = torch.Generator().manual_seed(9876)
+    rope_length = chunk_size if apply_rope_before_kvcache else window_size + sink_size
+
+    with torch.inference_mode():
+        for chunk_index in range(5):
+            x = torch.randn((1, chunk_size, 64), generator=generator)
+            rope_freqs = _make_rope_freqs(
+                rope_length,
+                32,
+                torch.device("cpu"),
+                generator,
+                interleaved=True,
+            )
+            candidate_cache.before_update(chunk_index)
+            reference_cache.before_update(chunk_index)
+            expected = _sdpa_reference_step(
+                reference_attention, x, reference_cache, rope_freqs
+            )
+            actual = attention(x, candidate_cache, rope_freqs)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            torch.testing.assert_close(
+                candidate_cache.cached_k(),
+                reference_cache.cached_k(),
+                atol=0,
+                rtol=0,
+            )
+            candidate_cache.after_update(chunk_index)
+            reference_cache.after_update(chunk_index)
+
+
+@pytest.mark.ci_cpu
+def test_wan_state_dict_keys_load_strictly_with_inner_norm() -> None:
+    """Translate WAN Q/K/V/O and norm names under a nested module prefix."""
+    source = AcceleratedSelfAttention(
+        32,
+        2,
+        16,
+        qkv_bias=True,
+        output_bias=True,
+        qk_norm_scope="inner",
+        use_fp8=False,
+    )
+    source_wrapper = torch.nn.ModuleDict(
+        {"block": torch.nn.ModuleDict({"self_attn": source})}
+    )
+    aliases = {
+        ".q_proj.": ".q.",
+        ".k_proj.": ".k.",
+        ".v_proj.": ".v.",
+        ".output_proj.": ".o.",
+        ".q_norm.": ".norm_q.",
+        ".k_norm.": ".norm_k.",
+    }
+    legacy_state = {}
+    for key, value in source_wrapper.state_dict().items():
+        for accelerated_name, wan_name in aliases.items():
+            key = key.replace(accelerated_name, wan_name)
+        legacy_state[key] = value
+
+    native = AcceleratedSelfAttention(
+        32,
+        2,
+        16,
+        qkv_bias=True,
+        output_bias=True,
+        qk_norm_scope="inner",
+        use_fp8=False,
+    )
+    native_wrapper = torch.nn.ModuleDict(
+        {"block": torch.nn.ModuleDict({"self_attn": native})}
+    )
+    native_wrapper.load_state_dict(legacy_state, strict=True)
+    for expected, actual in zip(
+        source_wrapper.state_dict().values(),
+        native_wrapper.state_dict().values(),
+    ):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    packed = AcceleratedSelfAttention(
+        32,
+        2,
+        16,
+        qkv_bias=True,
+        output_bias=True,
+        qk_norm_scope="inner",
+        use_fp8=True,
+    )
+    packed_wrapper = torch.nn.ModuleDict(
+        {"block": torch.nn.ModuleDict({"self_attn": packed})}
+    )
+    packed_wrapper.load_state_dict(legacy_state, strict=True)
+    assert packed.q_norm.weight.shape == (32,)
+    assert packed.k_norm.weight.shape == (32,)
+    assert packed.qkv_proj.weight.shape == (96, 32)
+
+
+@pytest.mark.ci_cpu
 def test_fp8_mode_keeps_only_packed_projection_state() -> None:
     """Persist packed FP8 weights without native or derived weight mirrors."""
     torch.manual_seed(8)
@@ -963,6 +1168,13 @@ class _BenchmarkCase:
     n_heads: int
     head_dim: int
     cache_chunks: int
+    sink_chunks: int = 0
+    attention_style: Literal["cosmos", "wan"] = "cosmos"
+    qkv_bias: bool = False
+    output_bias: bool = False
+    qk_norm_scope: Literal["head", "inner"] = "head"
+    rope_interleaved: bool = False
+    apply_rope_before_kvcache: bool = True
 
 
 @dataclass(frozen=True)
@@ -997,6 +1209,22 @@ _BENCHMARK_CASES = (
     _BenchmarkCase("omni-7040-history3", 1, 80 * 44 * 2, 2048, 16, 128, 3),
 )
 
+_WAN_BENCHMARK_CASE = _BenchmarkCase(
+    name="wan14b-lingbot-464x832-window15-sink3",
+    batch_size=1,
+    sequence_length=3 * 29 * 52,
+    query_dim=5120,
+    n_heads=40,
+    head_dim=128,
+    cache_chunks=5,
+    sink_chunks=1,
+    attention_style="wan",
+    qkv_bias=True,
+    output_bias=True,
+    qk_norm_scope="inner",
+    rope_interleaved=True,
+)
+
 _DROP_ONE_VARIANTS = (
     _BenchmarkVariant("cudnn-reference", False, False, False, False),
     _BenchmarkVariant("default", True, True, True, False),
@@ -1029,6 +1257,21 @@ _BENCHMARK_DTYPES = (
 )
 
 
+@pytest.mark.ci_cpu
+def test_wan_benchmark_case_matches_lingbot_geometry() -> None:
+    """Keep the WAN benchmark aligned with the interactive LingBot preset."""
+    case = _WAN_BENCHMARK_CASE
+    assert case.attention_style == "wan"
+    assert case.sequence_length == 3 * (464 // 8 // 2) * (832 // 8 // 2)
+    assert case.cache_chunks * 3 == 15
+    assert case.sink_chunks * 3 == 3
+    assert case.qkv_bias
+    assert case.output_bias
+    assert case.qk_norm_scope == "inner"
+    assert case.rope_interleaved
+    assert case.apply_rope_before_kvcache
+
+
 def _benchmark_rounds() -> int:
     """Return the configured number of measured benchmark rounds."""
     return int(os.getenv("FLASHDREAMS_ATTENTION_BENCHMARK_ROUNDS", "50"))
@@ -1058,6 +1301,11 @@ def _run_self_attention_benchmark(
         case.query_dim,
         case.n_heads,
         case.head_dim,
+        qkv_bias=case.qkv_bias,
+        output_bias=case.output_bias,
+        qk_norm_scope=case.qk_norm_scope,
+        rope_interleaved=case.rope_interleaved,
+        apply_rope_before_kvcache=case.apply_rope_before_kvcache,
         **variant.as_kwargs(),
     ).to(device=cuda_device, dtype=dtype)
     attention.eval()
@@ -1068,30 +1316,38 @@ def _run_self_attention_benchmark(
         generator=generator,
     )
     rope_freqs = _make_rope_freqs(
-        case.sequence_length,
+        (
+            case.sequence_length
+            if case.apply_rope_before_kvcache
+            else (case.cache_chunks + case.sink_chunks) * case.sequence_length
+        ),
         case.head_dim,
         cuda_device,
         generator,
-        interleaved=False,
+        interleaved=case.rope_interleaved,
     )
     window_size = case.cache_chunks * case.sequence_length
+    sink_size = case.sink_chunks * case.sequence_length
     kv_cache = attention.initialize_cache(
         case.batch_size,
         case.sequence_length,
         window_size,
-        0,
+        sink_size,
         cuda_device,
         dtype,
     )
 
+    current_chunk_index = case.cache_chunks + case.sink_chunks
     with torch.inference_mode():
-        for chunk_index in range(case.cache_chunks):
+        for chunk_index in range(current_chunk_index):
             kv_cache.before_update(chunk_index)
             attention(x, kv_cache, rope_freqs)
             kv_cache.after_update(chunk_index)
-        torch.cuda.synchronize(cuda_device)
+        kv_cache.before_update(current_chunk_index)
         metadata = attention._backend_metadata(x, kv_cache, rope_freqs)
-    current_chunk_index = case.cache_chunks - 1
+        attention(x, kv_cache, rope_freqs)
+        kv_cache.after_update(current_chunk_index)
+        torch.cuda.synchronize(cuda_device)
 
     @torch.inference_mode()
     def run_attention() -> Tensor:
@@ -1108,6 +1364,7 @@ def _run_self_attention_benchmark(
             "study": study,
             "variant": variant.name,
             "device": torch.cuda.get_device_name(cuda_device),
+            "attention_style": case.attention_style,
             "compute_capability": ".".join(
                 str(value) for value in torch.cuda.get_device_capability(cuda_device)
             ),
@@ -1118,11 +1375,19 @@ def _run_self_attention_benchmark(
             "dtype": str(dtype),
             "batch_size": case.batch_size,
             "sequence_length": case.sequence_length,
-            "cached_sequence_length": window_size,
+            "cached_sequence_length": window_size + sink_size,
+            "window_sequence_length": window_size,
+            "sink_sequence_length": sink_size,
             "cache_chunks": case.cache_chunks,
+            "sink_chunks": case.sink_chunks,
             "query_dim": case.query_dim,
             "n_heads": case.n_heads,
             "head_dim": case.head_dim,
+            "qkv_bias": case.qkv_bias,
+            "output_bias": case.output_bias,
+            "qk_norm_scope": case.qk_norm_scope,
+            "rope_interleaved": case.rope_interleaved,
+            "apply_rope_before_kvcache": case.apply_rope_before_kvcache,
             "tokens_per_forward": case.batch_size * case.sequence_length,
             "warmup_rounds": _benchmark_warmup_rounds(),
             "rounds": _benchmark_rounds(),
@@ -1194,4 +1459,24 @@ def test_self_attention_omnidreams_factorial_benchmark(
         variant,
         dtype,
         study="factorial",
+    )
+
+
+@pytest.mark.manual
+@pytest.mark.parametrize("dtype", _BENCHMARK_DTYPES)
+@pytest.mark.parametrize("variant", _FACTORIAL_VARIANTS, ids=lambda item: item.name)
+def test_self_attention_wan_style_factorial_benchmark(
+    benchmark: Any,
+    cuda_device: torch.device,
+    variant: _BenchmarkVariant,
+    dtype: torch.dtype,
+) -> None:
+    """Benchmark all optimization combinations on a LingBot WAN 14B shape."""
+    _run_self_attention_benchmark(
+        benchmark,
+        cuda_device,
+        _WAN_BENCHMARK_CASE,
+        variant,
+        dtype,
+        study="wan-style-factorial",
     )

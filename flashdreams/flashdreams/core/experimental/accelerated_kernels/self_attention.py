@@ -17,6 +17,7 @@
 
 import math
 from collections.abc import Callable
+from typing import Literal
 
 import nvtx
 import torch
@@ -26,6 +27,7 @@ import triton.language as tl
 from torch import Tensor, nn
 from torch.distributed import ProcessGroup
 
+from flashdreams.core.attention.cp import ContextParallelAttention
 from flashdreams.core.attention.kvcache import BlockKVCache
 
 _FP8_MAX = 448.0
@@ -845,6 +847,12 @@ class AcceleratedSelfAttention(nn.Module):
     query_dim: int
     """Input and output feature width, independent of the attention inner width."""
 
+    qk_norm_scope: Literal["head", "inner"]
+    """Feature scope used by Q/K RMS normalization."""
+
+    apply_rope_before_kvcache: bool
+    """Whether K is rotated before being written to the cache."""
+
     qkv_proj: _PackedFP8Linear
     q_proj: nn.Linear
     k_proj: nn.Linear
@@ -863,7 +871,10 @@ class AcceleratedSelfAttention(nn.Module):
         output_bias: bool = False,
         qk_norm: bool = True,
         qk_norm_eps: float = 1e-6,
+        qk_norm_scope: Literal["head", "inner"] = "head",
         rope_interleaved: bool = False,
+        apply_rope_before_kvcache: bool = True,
+        cp_method: Literal["ring", "ulysses"] = "ring",
         use_tma: bool = True,
         fuse_qkv: bool = True,
         fuse_rope_kv_cache: bool = True,
@@ -880,7 +891,12 @@ class AcceleratedSelfAttention(nn.Module):
             output_bias: Add bias to the output projection.
             qk_norm: Apply per-head RMS normalization to projected Q/K.
             qk_norm_eps: Epsilon used by Q/K RMS normalization.
+            qk_norm_scope: Normalize each head independently with ``"head"`` or
+                normalize the complete projected width with ``"inner"``.
             rope_interleaved: Rotate adjacent feature pairs instead of half splits.
+            apply_rope_before_kvcache: Store rotated K when true. When false,
+                store unrotated K and apply cache-relative RoPE on cache reads.
+            cp_method: Context-parallel attention strategy used when enabled.
             use_tma: Prefer TMA attention when tensor descriptors support the layout.
             fuse_qkv: Combine Q/K/V projections into one matrix multiplication.
             fuse_rope_kv_cache: Fuse Q/K postprocessing and the cache write.
@@ -896,12 +912,21 @@ class AcceleratedSelfAttention(nn.Module):
             raise ValueError(f"n_heads must be positive; got {n_heads}.")
         if head_dim <= 0:
             raise ValueError(f"head_dim must be positive; got {head_dim}.")
+        if qk_norm_scope not in ("head", "inner"):
+            raise ValueError(
+                "qk_norm_scope must be either 'head' or 'inner'; "
+                f"got {qk_norm_scope!r}."
+            )
+        if cp_method not in ("ring", "ulysses"):
+            raise ValueError(f"Unsupported context parallel method: {cp_method!r}.")
 
         inner_dim = n_heads * head_dim
         self.query_dim = query_dim
         self.n_heads = n_heads
         self.head_dim = head_dim
+        self.qk_norm_scope = qk_norm_scope
         self.rope_interleaved = rope_interleaved
+        self.apply_rope_before_kvcache = apply_rope_before_kvcache
         self.use_tma = use_tma
         self.fuse_qkv = fuse_qkv
         self.fuse_rope_kv_cache = fuse_rope_kv_cache
@@ -941,11 +966,15 @@ class AcceleratedSelfAttention(nn.Module):
             self.register_buffer("_fused_qkv_weight", None, persistent=False)
             self.register_buffer("_fused_qkv_bias", None, persistent=False)
 
+        norm_dim = head_dim if qk_norm_scope == "head" else inner_dim
         self.q_norm: nn.Module = (
-            nn.RMSNorm(head_dim, eps=qk_norm_eps) if qk_norm else nn.Identity()
+            nn.RMSNorm(norm_dim, eps=qk_norm_eps) if qk_norm else nn.Identity()
         )
         self.k_norm: nn.Module = (
-            nn.RMSNorm(head_dim, eps=qk_norm_eps) if qk_norm else nn.Identity()
+            nn.RMSNorm(norm_dim, eps=qk_norm_eps) if qk_norm else nn.Identity()
+        )
+        self.attn_op = ContextParallelAttention(
+            qkv_format="bshd", backend="cudnn", method=cp_method
         )
         if not use_fp8:
             self._refresh_derived_weights()
@@ -963,11 +992,42 @@ class AcceleratedSelfAttention(nn.Module):
         }
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None) -> None:
-        """Reject context parallelism while accepting the single-rank no-op."""
-        if cp_group is not None:
-            raise NotImplementedError(
-                "AcceleratedSelfAttention does not support context parallelism."
-            )
+        """Enable or disable the context-parallel attention fallback."""
+        self.attn_op.set_context_parallel_group(cp_group)
+
+    def is_context_parallel_enabled(self) -> bool:
+        """Return whether context-parallel attention is active."""
+        return self.attn_op.is_context_parallel_enabled()
+
+    def context_parallel_size(self) -> int:
+        """Return the context-parallel world size, or one when disabled."""
+        return self.attn_op.context_parallel_size()
+
+    @staticmethod
+    def _translate_legacy_state_dict_keys(
+        state_dict: dict[str, Tensor], prefix: str
+    ) -> None:
+        """Translate WAN projection and normalization names to the core schema."""
+        aliases = {
+            "q": "q_proj",
+            "k": "k_proj",
+            "v": "v_proj",
+            "o": "output_proj",
+            "norm_q": "q_norm",
+            "norm_k": "k_norm",
+        }
+        for source_name, target_name in aliases.items():
+            for suffix in ("weight", "bias"):
+                source_key = prefix + f"{source_name}.{suffix}"
+                target_key = prefix + f"{target_name}.{suffix}"
+                if source_key not in state_dict:
+                    continue
+                if target_key in state_dict:
+                    raise RuntimeError(
+                        "Checkpoint mixes legacy WAN and accelerated attention keys: "
+                        f"{source_key!r} and {target_key!r}."
+                    )
+                state_dict[target_key] = state_dict.pop(source_key)
 
     @staticmethod
     def _normalize_packed_weight(weight: Tensor) -> Tensor:
@@ -1084,6 +1144,7 @@ class AcceleratedSelfAttention(nn.Module):
         error_msgs: list[str],
     ) -> None:
         """Load packed checkpoints and transparently upgrade legacy weights."""
+        self._translate_legacy_state_dict_keys(state_dict, prefix)
         if self.use_fp8:
             self._prepare_packed_state_dict(state_dict, prefix)
         else:
@@ -1204,12 +1265,14 @@ class AcceleratedSelfAttention(nn.Module):
             isinstance(self.q_norm, nn.RMSNorm)
             and isinstance(self.k_norm, nn.RMSNorm)
             and self.q_norm.eps == self.k_norm.eps
+            and self.qk_norm_scope == "head"
         ) or (
             isinstance(self.q_norm, nn.Identity)
             and isinstance(self.k_norm, nn.Identity)
         )
         return (
             self.fuse_rope_kv_cache
+            and self.apply_rope_before_kvcache
             and not torch.is_grad_enabled()
             and x.is_cuda
             and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -1261,6 +1324,37 @@ class AcceleratedSelfAttention(nn.Module):
             value.reshape(head_shape),
         )
 
+    def _normalize_qk(self, query: Tensor, key: Tensor) -> tuple[Tensor, Tensor]:
+        """Apply Q/K RMS normalization in the configured feature scope."""
+        if self.qk_norm_scope == "head":
+            return self.q_norm(query), self.k_norm(key)
+
+        query_shape = query.shape
+        key_shape = key.shape
+        return (
+            self.q_norm(query.flatten(-2)).reshape(query_shape),
+            self.k_norm(key.flatten(-2)).reshape(key_shape),
+        )
+
+    def _slice_rope_freqs(
+        self,
+        rope_freqs: Tensor | None,
+        kv_cache: BlockKVCache,
+    ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+        """Select RoPE angles for current Q/K and cache-relative K reads."""
+        if rope_freqs is None:
+            return None, None, None
+        if self.apply_rope_before_kvcache:
+            return rope_freqs, rope_freqs, None
+
+        write_end = kv_cache.write_end
+        write_start = write_end - kv_cache.chunk_size
+        return (
+            rope_freqs[write_start:write_end],
+            None,
+            rope_freqs[: kv_cache.size],
+        )
+
     def _apply_rope(self, x: Tensor, rope_freqs: Tensor | None) -> Tensor:
         """Apply optional rotary embeddings in the configured pair layout."""
         if rope_freqs is None:
@@ -1289,12 +1383,14 @@ class AcceleratedSelfAttention(nn.Module):
         key: Tensor,
         value: Tensor,
         kv_cache: BlockKVCache,
-        rope_freqs: Tensor | None,
+        query_rope_freqs: Tensor | None,
+        key_rope_freqs: Tensor | None,
     ) -> Tensor:
         """Postprocess Q/K and write the current K/V chunk into the cache."""
-        if not self._supports_fused_postprocess(query, kv_cache, rope_freqs):
-            query = self._apply_rope(self.q_norm(query), rope_freqs)
-            key = self._apply_rope(self.k_norm(key), rope_freqs)
+        if not self._supports_fused_postprocess(query, kv_cache, query_rope_freqs):
+            query, key = self._normalize_qk(query, key)
+            query = self._apply_rope(query, query_rope_freqs)
+            key = self._apply_rope(key, key_rope_freqs)
             kv_cache.update(key, value)
             return query.to(torch.float8_e4m3fn) if self.use_fp8 else query
 
@@ -1317,7 +1413,7 @@ class AcceleratedSelfAttention(nn.Module):
         apply_norm = isinstance(self.q_norm, nn.RMSNorm)
         query_weight = self.q_norm.weight if apply_norm else query.reshape(-1)
         key_weight = self.k_norm.weight if apply_norm else key.reshape(-1)
-        rope_pointer = rope_freqs if rope_freqs is not None else query
+        rope_pointer = query_rope_freqs if query_rope_freqs is not None else query
         norm_eps = self.q_norm.eps if isinstance(self.q_norm, nn.RMSNorm) else 0.0
         _qkv_postprocess_cache_kernel[grid](
             query,
@@ -1345,7 +1441,7 @@ class AcceleratedSelfAttention(nn.Module):
             EPS=norm_eps,
             HEAD_DIM_HALF=self.head_dim // 2,
             APPLY_NORM=apply_norm,
-            APPLY_ROPE=rope_freqs is not None,
+            APPLY_ROPE=query_rope_freqs is not None,
             INTERLEAVED=self.rope_interleaved,
             BLOCK_S=block_s,
             BLOCK_H=block_h,
@@ -1607,10 +1703,17 @@ class AcceleratedSelfAttention(nn.Module):
                 f"{expected_cache_shape}; got {actual_cache_shape}."
             )
         if rope_freqs is None:
+            if not self.apply_rope_before_kvcache:
+                raise ValueError("Cache-relative RoPE requires full-cache rope_freqs.")
             return
         if self.head_dim % 2 != 0:
             raise ValueError("RoPE requires an even head_dim.")
-        expected_rope_shape = (x.shape[-2], 1, 1, self.head_dim)
+        rope_length = (
+            x.shape[-2]
+            if self.apply_rope_before_kvcache
+            else kv_cache._k.shape[kv_cache.seq_dim]
+        )
+        expected_rope_shape = (rope_length, 1, 1, self.head_dim)
         if tuple(rope_freqs.shape) != expected_rope_shape:
             raise ValueError(
                 f"rope_freqs must have shape {expected_rope_shape}; "
@@ -1632,22 +1735,36 @@ class AcceleratedSelfAttention(nn.Module):
         use_fused_postprocess = self._supports_fused_postprocess(
             x, kv_cache, rope_freqs
         )
-        attention_dtype = torch.float8_e4m3fn if use_fp8 else x.dtype
-        attention_probe = torch.empty(
-            (1, max(x.shape[-2], 1), self.n_heads, self.head_dim),
-            device=x.device,
-            dtype=attention_dtype,
-        )
-        cached_key = kv_cache.cached_k()
-        cached_value = kv_cache.cached_v()
-        if self._supports_cudnn_attention(attention_probe, cached_key, cached_value):
-            attention_backend = "cudnn"
-        elif not self._supports_triton_attention(attention_probe):
-            attention_backend = "sdpa"
-        elif self._supports_tma_attention(attention_probe, cached_key, cached_value):
-            attention_backend = "triton-tma"
+        if self.is_context_parallel_enabled():
+            attention_backend = f"context-parallel-{self.attn_op.method}"
         else:
-            attention_backend = "triton-pointer"
+            attention_dtype = (
+                torch.float8_e4m3fn
+                if use_fp8 and self.apply_rope_before_kvcache
+                else x.dtype
+            )
+            attention_probe = torch.empty(
+                (1, max(x.shape[-2], 1), self.n_heads, self.head_dim),
+                device=x.device,
+                dtype=attention_dtype,
+            )
+            cached_key = kv_cache.cached_k()
+            cached_value = kv_cache.cached_v()
+            if cached_key.dtype != attention_dtype:
+                cached_key = attention_probe[:, :1]
+                cached_value = attention_probe[:, :1]
+            if self._supports_cudnn_attention(
+                attention_probe, cached_key, cached_value
+            ):
+                attention_backend = "cudnn"
+            elif not self._supports_triton_attention(attention_probe):
+                attention_backend = "sdpa"
+            elif self._supports_tma_attention(
+                attention_probe, cached_key, cached_value
+            ):
+                attention_backend = "triton-tma"
+            else:
+                attention_backend = "triton-pointer"
         return {
             **self.optimization_settings,
             "fp8_effective": use_fp8,
@@ -1676,8 +1793,9 @@ class AcceleratedSelfAttention(nn.Module):
         Args:
             x: Current token chunk of shape ``[..., L, query_dim]``.
             kv_cache: Cache prepared with :meth:`BlockKVCache.before_update`.
-            rope_freqs: Optional full-width RoPE angles with shape
-                ``[L, 1, 1, head_dim]``; ``None`` disables RoPE.
+            rope_freqs: Full-width RoPE angles. Standard mode expects shape
+                ``[L, 1, 1, head_dim]``. Cache-relative mode expects the cache
+                capacity in place of ``L``.
 
         Returns:
             Projected attention output with shape ``[..., L, query_dim]``.
@@ -1687,6 +1805,9 @@ class AcceleratedSelfAttention(nn.Module):
         sequence_length = x.shape[-2]
         inner_dim = self.n_heads * self.head_dim
         self._validate_fp8_forward(x, kv_cache)
+        query_rope_freqs, key_rope_freqs, cached_key_rope_freqs = (
+            self._slice_rope_freqs(rope_freqs, kv_cache)
+        )
 
         with nvtx.annotate("self_attention.qkv_projection"):
             query, key, value = self._project_qkv(x)
@@ -1696,12 +1817,21 @@ class AcceleratedSelfAttention(nn.Module):
                 key,
                 value,
                 kv_cache,
-                rope_freqs,
+                query_rope_freqs,
+                key_rope_freqs,
             )
         with nvtx.annotate("self_attention.attention"):
             cached_key = kv_cache.cached_k()
             cached_value = kv_cache.cached_v()
-            if self._supports_cudnn_attention(query, cached_key, cached_value):
+            if cached_key_rope_freqs is not None or self.is_context_parallel_enabled():
+                query = query.to(x.dtype)
+                cached_key = cached_key.to(x.dtype)
+                cached_value = cached_value.to(x.dtype)
+            if cached_key_rope_freqs is not None:
+                cached_key = self._apply_rope(cached_key, cached_key_rope_freqs)
+            if self.is_context_parallel_enabled():
+                output = self.attn_op(query, cached_key, cached_value)
+            elif self._supports_cudnn_attention(query, cached_key, cached_value):
                 output = self._apply_cudnn_attention_blhd(
                     query, cached_key, cached_value
                 )
