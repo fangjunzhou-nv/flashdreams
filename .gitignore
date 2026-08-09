@@ -91,6 +91,7 @@ celerybeat-schedule
 .env
 .venv
 .venv*
+.direnv/
 env/
 venv/
 ENV/
