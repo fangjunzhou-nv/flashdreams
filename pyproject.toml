@@ -128,6 +128,7 @@ markers = [
 # flashdreams/_pytest_plugins.
 test = [
     "pytest>=8.0",
+    "pytest-benchmark>=5.1",
     "pytest-asyncio>=0.23",
     "pytest-manual-marker>=2.0",
     "tomli>=2.0",
