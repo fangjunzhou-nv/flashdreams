@@ -136,6 +136,7 @@ test = [
 ]
 lint = [
     "pre-commit>=4.3.0",
+    "ruff==0.12.7",
     "sphinx>=7.0",
     "ty>=0.0.39",
     {include-group = "test"},
