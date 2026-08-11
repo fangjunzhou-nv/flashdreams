@@ -15,7 +15,7 @@
 
 """Microbenchmarks for Omnidreams model modules.
 
-Run the DiT block benchmark with::
+Run the module benchmarks with::
 
     uv run --group test pytest \
         integrations/omnidreams/benchmarks/test_modules.py \
@@ -26,7 +26,12 @@ from __future__ import annotations
 
 import pytest
 import torch
-from omnidreams.transformer.impl.modules import Block
+from omnidreams.transformer.impl.modules import (
+    Block,
+    CrossAttention,
+    GPT2FeedForward,
+    SelfAttention,
+)
 from omnidreams.transformer.impl.network import CosmosDiTNetworkConfig
 from pytest_benchmark.fixture import BenchmarkFixture
 
@@ -34,7 +39,7 @@ from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 
 pytestmark = pytest.mark.manual
 
-_GPU_REASON = "Omnidreams DiT block benchmark requires CUDA"
+_GPU_REASON = "Omnidreams DiT module benchmarks require CUDA"
 
 # Production single-view, 720p chunk-2 geometry. The VAE reduces 720x1280 to
 # 90x160 latents, and the DiT's 2x2 spatial patching produces 45x80 tokens per
@@ -169,6 +174,281 @@ def test_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
 
     def synchronized_forward() -> torch.Tensor:
         result = forward(steady_chunk_idx, rope_freqs[steady_chunk_idx])
+        torch.cuda.synchronize()
+        return result
+
+    output = benchmark.pedantic(
+        synchronized_forward,
+        iterations=1,
+        rounds=_BENCHMARK_ROUNDS,
+        warmup_rounds=_WARMUP_ROUNDS,
+    )
+
+    assert output.shape == x.shape
+    assert torch.isfinite(output).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
+@torch.inference_mode()
+def test_self_attention_benchmark(benchmark: BenchmarkFixture) -> None:
+    """Benchmark self-attention against a full production KV window."""
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("Omnidreams self-attention benchmark requires bfloat16 support")
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(_SEED)
+    config = CosmosDiTNetworkConfig()
+    attention = SelfAttention(
+        query_dim=config.model_channels,
+        context_dim=None,
+        n_heads=config.num_heads,
+        head_dim=config.model_channels // config.num_heads,
+        cp_method=config.cp_method,
+    ).to(device=device, dtype=dtype)
+    attention.eval()
+
+    patch_t = _CHUNK_SIZE_T // config.patch_temporal
+    patch_h = _LATENT_HEIGHT // config.patch_spatial
+    patch_w = _LATENT_WIDTH // config.patch_spatial
+    tokens_per_frame = patch_h * patch_w
+    chunk_tokens = patch_t * tokens_per_frame
+    window_tokens = _WINDOW_SIZE_T * tokens_per_frame
+    x = torch.randn(
+        (
+            _BATCH_SIZE,
+            _NUM_VIEWS,
+            chunk_tokens,
+            config.model_channels,
+        ),
+        device=device,
+        dtype=dtype,
+    )
+    cache = attention.initialize_cache(
+        batch_size=_BATCH_SIZE * _NUM_VIEWS,
+        chunk_size=chunk_tokens,
+        window_size=window_tokens,
+        sink_size=0,
+        device=device,
+        dtype=dtype,
+    )
+    rope = RotaryPositionEmbedding3D(
+        head_dim=config.model_channels // config.num_heads,
+        len_h=patch_h,
+        len_w=patch_w,
+        len_t=patch_t,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
+        device=device,
+    )
+
+    steady_chunk_idx = _WINDOW_SIZE_T // _CHUNK_SIZE_T - 1
+    rope_freqs = [rope.shift_t(chunk_idx) for chunk_idx in range(steady_chunk_idx + 1)]
+    for chunk_idx, chunk_rope_freqs in enumerate(rope_freqs):
+        cache.before_update(chunk_idx)
+        output = attention(x, kv_cache=cache, rope_freqs=chunk_rope_freqs)
+        cache.after_update(chunk_idx)
+    torch.cuda.synchronize()
+
+    benchmark.group = "omnidreams-dit-self-attention"
+    benchmark.extra_info.update(
+        {
+            "module": "self_attention",
+            "batch_size": _BATCH_SIZE,
+            "num_views": _NUM_VIEWS,
+            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
+            "chunk_tokens": chunk_tokens,
+            "window_tokens": window_tokens,
+            "model_channels": config.model_channels,
+            "num_heads": config.num_heads,
+            "parameter_count": sum(
+                parameter.numel() for parameter in attention.parameters()
+            ),
+            "checkpoint": "random_init",
+            "dtype": str(dtype),
+            "attention_backend": "cudnn",
+            "cache_state": "full_window",
+            "gpu": torch.cuda.get_device_name(device),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "seed": _SEED,
+        }
+    )
+
+    # Repeated denoising evaluations at one autoregressive position overwrite
+    # the final cache chunk while attending over the same full window.
+    cache.before_update(steady_chunk_idx)
+
+    def synchronized_forward() -> torch.Tensor:
+        result = attention(
+            x,
+            kv_cache=cache,
+            rope_freqs=rope_freqs[steady_chunk_idx],
+        )
+        torch.cuda.synchronize()
+        return result
+
+    output = benchmark.pedantic(
+        synchronized_forward,
+        iterations=1,
+        rounds=_BENCHMARK_ROUNDS,
+        warmup_rounds=_WARMUP_ROUNDS,
+    )
+    cache.after_update(steady_chunk_idx)
+
+    assert output.shape == x.shape
+    assert torch.isfinite(output).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
+@torch.inference_mode()
+def test_cross_attention_benchmark(benchmark: BenchmarkFixture) -> None:
+    """Benchmark cross-attention against the cached production text context."""
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("Omnidreams cross-attention benchmark requires bfloat16 support")
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(_SEED)
+    config = CosmosDiTNetworkConfig()
+    attention = CrossAttention(
+        query_dim=config.model_channels,
+        context_dim=config.crossattn_emb_channels,
+        n_heads=config.num_heads,
+        head_dim=config.model_channels // config.num_heads,
+        cp_method=config.cp_method,
+    ).to(device=device, dtype=dtype)
+    attention.eval()
+
+    patch_t = _CHUNK_SIZE_T // config.patch_temporal
+    patch_h = _LATENT_HEIGHT // config.patch_spatial
+    patch_w = _LATENT_WIDTH // config.patch_spatial
+    chunk_tokens = patch_t * patch_h * patch_w
+    x = torch.randn(
+        (
+            _BATCH_SIZE,
+            _NUM_VIEWS,
+            chunk_tokens,
+            config.model_channels,
+        ),
+        device=device,
+        dtype=dtype,
+    )
+    context = torch.randn(
+        (
+            _BATCH_SIZE,
+            _NUM_VIEWS,
+            _TEXT_TOKENS,
+            config.crossattn_emb_channels,
+        ),
+        device=device,
+        dtype=dtype,
+    )
+    cache = attention.initialize_cache(context)
+    torch.cuda.synchronize()
+
+    benchmark.group = "omnidreams-dit-cross-attention"
+    benchmark.extra_info.update(
+        {
+            "module": "cross_attention",
+            "batch_size": _BATCH_SIZE,
+            "num_views": _NUM_VIEWS,
+            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
+            "chunk_tokens": chunk_tokens,
+            "text_tokens": _TEXT_TOKENS,
+            "model_channels": config.model_channels,
+            "context_channels": config.crossattn_emb_channels,
+            "num_heads": config.num_heads,
+            "parameter_count": sum(
+                parameter.numel() for parameter in attention.parameters()
+            ),
+            "checkpoint": "random_init",
+            "dtype": str(dtype),
+            "attention_backend": "cudnn",
+            "cache_state": "static_context",
+            "gpu": torch.cuda.get_device_name(device),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "seed": _SEED,
+        }
+    )
+
+    def synchronized_forward() -> torch.Tensor:
+        result = attention(x, kv_cache=cache)
+        torch.cuda.synchronize()
+        return result
+
+    output = benchmark.pedantic(
+        synchronized_forward,
+        iterations=1,
+        rounds=_BENCHMARK_ROUNDS,
+        warmup_rounds=_WARMUP_ROUNDS,
+    )
+
+    assert output.shape == x.shape
+    assert torch.isfinite(output).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
+@torch.inference_mode()
+def test_mlp_benchmark(benchmark: BenchmarkFixture) -> None:
+    """Benchmark the production-configured DiT feed-forward module."""
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("Omnidreams MLP benchmark requires bfloat16 support")
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(_SEED)
+    config = CosmosDiTNetworkConfig()
+    intermediate_channels = int(config.model_channels * config.mlp_ratio)
+    mlp = GPT2FeedForward(
+        d_model=config.model_channels,
+        d_ff=intermediate_channels,
+    ).to(device=device, dtype=dtype)
+    mlp.eval()
+
+    patch_t = _CHUNK_SIZE_T // config.patch_temporal
+    patch_h = _LATENT_HEIGHT // config.patch_spatial
+    patch_w = _LATENT_WIDTH // config.patch_spatial
+    chunk_tokens = patch_t * patch_h * patch_w
+    x = torch.randn(
+        (
+            _BATCH_SIZE,
+            _NUM_VIEWS,
+            chunk_tokens,
+            config.model_channels,
+        ),
+        device=device,
+        dtype=dtype,
+    )
+    torch.cuda.synchronize()
+
+    benchmark.group = "omnidreams-dit-mlp"
+    benchmark.extra_info.update(
+        {
+            "module": "mlp",
+            "batch_size": _BATCH_SIZE,
+            "num_views": _NUM_VIEWS,
+            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
+            "chunk_tokens": chunk_tokens,
+            "model_channels": config.model_channels,
+            "mlp_ratio": config.mlp_ratio,
+            "intermediate_channels": intermediate_channels,
+            "parameter_count": sum(parameter.numel() for parameter in mlp.parameters()),
+            "checkpoint": "random_init",
+            "dtype": str(dtype),
+            "gpu": torch.cuda.get_device_name(device),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "seed": _SEED,
+        }
+    )
+
+    def synchronized_forward() -> torch.Tensor:
+        result = mlp(x)
         torch.cuda.synchronize()
         return result
 
