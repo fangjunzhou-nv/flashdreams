@@ -329,6 +329,14 @@ class SlangPyHudPresenter:
         # present with a generic SLANG_FAIL. ``window.size`` is
         # ``math.uint2``, indexed like a 2-vector.
         self._configured_size = self._current_window_size()
+        # A clamped initial window means the window manager or HiDPI policy
+        # rejected the requested native-size canvas. Retrying a larger resize
+        # after the first model frame can leave Vulkan's swapchain permanently
+        # out of date, so keep that canvas and fit the camera inside it.
+        self._native_model_auto_resize_enabled = (
+            self._configured_size[0] >= DEFAULT_WINDOW_W
+            and self._configured_size[1] >= DEFAULT_WINDOW_H
+        )
         self._configure_surface(*self._configured_size)
         self._display_texture = self._build_display_texture(*self._configured_size)
         self._cuda_hud_interop = self._create_cuda_hud_interop(*self._configured_size)
@@ -594,28 +602,63 @@ class SlangPyHudPresenter:
         return True
 
     def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         self._should_close_flag = True
         bev_panel_exec = getattr(self, "_bev_panel_exec", None)
         if bev_panel_exec is not None:
             bev_panel_exec.shutdown(wait=True, cancel_futures=True)
             self._bev_panel_exec = None
-        if self._cuda_hud_interop is not None:
+        cuda_hud_interop = getattr(self, "_cuda_hud_interop", None)
+        if cuda_hud_interop is not None:
             with contextlib.suppress(Exception):
-                self._cuda_hud_interop.close()
-            self._cuda_hud_interop = None
+                cuda_hud_interop.close()
         retired_interops = getattr(self, "_retired_cuda_hud_interops", [])
         for interop in retired_interops:
             with contextlib.suppress(Exception):
                 interop.close()
-        retired_interops.clear()
-        if self._wheel is not None:
+        wheel = getattr(self, "_wheel", None)
+        if wheel is not None:
             try:
-                self._wheel.stop()
+                wheel.stop()
             except Exception as exc:  # noqa: BLE001 -- defensive teardown
                 logger.warning(f"[presenter] wheel.stop() failed: {exc!r}")
             self._wheel = None
-        with contextlib.suppress(Exception):
-            self._window.close()
+
+        # SlangPy devices own cyclic native resources and must be closed
+        # explicitly before interpreter shutdown. Drain both GPU queues before
+        # releasing shared interop buffers, then tear down the swapchain while
+        # its native window is still alive. Leaving this to Python's cyclic GC
+        # can destroy Vulkan objects in an unsafe order and segfault at exit.
+        device = getattr(self, "_device", None)
+        if device is not None:
+            with contextlib.suppress(Exception):
+                device.wait_for_idle()
+        surface = getattr(self, "_surface", None)
+        if surface is not None:
+            with contextlib.suppress(Exception):
+                surface.unconfigure()
+
+        self._cuda_hud_interop = None
+        cuda_hud_interop = None
+        retired_interops.clear()
+        interop = None
+        self._camera_texture = None
+        self._camera_fit_texture = None
+        self._display_texture = None
+        self._surface = None
+        surface = None
+
+        if device is not None:
+            with contextlib.suppress(Exception):
+                device.close()
+        self._device = None
+        window = getattr(self, "_window", None)
+        if window is not None:
+            with contextlib.suppress(Exception):
+                window.close()
+        self._window = None
 
     # -- Frame helpers ---------------------------------------------
 
@@ -851,8 +894,10 @@ class SlangPyHudPresenter:
         The camera region never upscales smaller frames: they remain centered
         at native resolution while the existing canvas and HUD stay visible.
         Larger frames grow only the dimensions required to fit the source plus
-        the fixed-width HUD column. Window-manager clamping and later user
-        resizes remain authoritative until the source resolution changes.
+        the fixed-width HUD column. When the window manager clamped the initial
+        window, keep that authoritative size and scale the camera to fit instead.
+        Later user resizes remain authoritative until the source resolution
+        changes.
 
         Returns:
             ``True`` when a resize was requested and this frame should be
@@ -863,8 +908,15 @@ class SlangPyHudPresenter:
             self, "_auto_sized_camera_src_size", None
         ):
             return False
-        source_width, source_height = source_size
         current_width, current_height = self._current_window_size()
+        if (
+            not getattr(self, "_native_model_auto_resize_enabled", True)
+            or current_width < DEFAULT_WINDOW_W
+            or current_height < DEFAULT_WINDOW_H
+        ):
+            self._auto_sized_camera_src_size = source_size
+            return False
+        source_width, source_height = source_size
         target_size = (
             max(current_width, source_width + HUD_PANEL_WIDTH),
             max(current_height, source_height, MIN_WINDOW_H),
