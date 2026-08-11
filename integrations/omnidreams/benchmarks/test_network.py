@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from omnidreams.runner import DEFAULT_VIDEO_HEIGHT, DEFAULT_VIDEO_WIDTH
 from omnidreams.transformer import CosmosTransformer, CosmosTransformerConfig
 from omnidreams.transformer.impl.network import (
     CosmosDiTNetwork,
@@ -33,20 +34,26 @@ from omnidreams.transformer.impl.network import (
 )
 from pytest_benchmark.fixture import BenchmarkFixture
 
+from flashdreams.core.attention import ContextParallelAttention
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
+from flashdreams.infra.acceleration import (
+    CUDAGraphDispatch,
+    cuda_graph_capture_ar_index,
+)
+from flashdreams.infra.compile import compile_module
 
 pytestmark = pytest.mark.manual
 
 _GPU_REASON = "Omnidreams DiT network benchmark requires CUDA"
 
-# Production single-view distilled model geometry: 720p pixels become 90x160
-# latents, the DiT consumes two latent frames per chunk, and the local window
-# retains three chunks. HDMap conditioning uses the Wan-VAE's 16 latent channels.
+# Production single-view distilled runner geometry: 704x1280 pixels become
+# 88x160 latents, the DiT consumes two latent frames per chunk, and the local
+# window retains three chunks. HDMap conditioning uses 16 latent channels.
 _BATCH_SIZE = 1
 _NUM_VIEWS = 1
-_PIXEL_HEIGHT = 720
-_PIXEL_WIDTH = 1280
-_LATENT_HEIGHT = 90
+_PIXEL_HEIGHT = DEFAULT_VIDEO_HEIGHT
+_PIXEL_WIDTH = DEFAULT_VIDEO_WIDTH
+_LATENT_HEIGHT = 88
 _LATENT_WIDTH = 160
 _CHUNK_SIZE_T = 2
 _WINDOW_SIZE_T = 6
@@ -63,7 +70,7 @@ _NATIVE_ATTENTION_BACKEND = "cudnn"
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @torch.inference_mode()
 def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
-    """Benchmark all 28 production-configured DiT blocks at steady state."""
+    """Benchmark the production compiled PyTorch DiT at steady state."""
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Omnidreams DiT network benchmark requires bfloat16 support")
 
@@ -79,6 +86,15 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
     network = CosmosDiTNetwork(config).to(device=device, dtype=dtype)
     network.eval()
     network.update_parameters_after_loading_checkpoint()
+    parameter_count = sum(parameter.numel() for parameter in network.parameters())
+    attention_modules = [
+        module
+        for module in network.modules()
+        if isinstance(module, ContextParallelAttention)
+    ]
+    assert attention_modules
+    attention_backends = {attention.backend for attention in attention_modules}
+    assert attention_backends == {"cudnn"}
 
     patch_t = _CHUNK_SIZE_T // config.patch_temporal
     patch_h = _LATENT_HEIGHT // config.patch_spatial
@@ -134,8 +150,21 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
         device=device,
     )
 
+    network = compile_module(network)
+    capture_chunk_idx = cuda_graph_capture_ar_index(
+        sink_size_t=0,
+        window_size_t=_WINDOW_SIZE_T,
+        len_t=_CHUNK_SIZE_T,
+    )
+    graph_dispatch = CUDAGraphDispatch(
+        network,
+        enabled=True,
+        capture_ar_idx=capture_chunk_idx,
+        warmup_iters=2,
+    )
+
     def forward(chunk_idx: int, rope_freqs: torch.Tensor) -> torch.Tensor:
-        return network(
+        return graph_dispatch.select(chunk_idx, uncond=False)(
             x=x,
             timesteps=timestep,
             rope_freqs=rope_freqs,
@@ -147,14 +176,15 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
             eager_mode=False,
         )
 
-    # Fill every per-block KV cache before timing. Cache preparation/finalization
-    # and RoPE shifts are deliberately outside the timed network call, matching
-    # CosmosTransformerCache.start/finalize in the production denoising loop.
-    steady_chunk_idx = _WINDOW_SIZE_T // _CHUNK_SIZE_T - 1
-    rope_freqs = [rope.shift_t(chunk_idx) for chunk_idx in range(steady_chunk_idx + 1)]
-    for chunk_idx, chunk_rope_freqs in enumerate(rope_freqs):
+    # Fill and roll every per-block KV cache through the production CUDA-graph
+    # threshold before timing. Benchmark warmups finish graph capture.
+    benchmark_chunk_idx = capture_chunk_idx + 1
+    rope_freqs = [
+        rope.shift_t(chunk_idx) for chunk_idx in range(benchmark_chunk_idx + 1)
+    ]
+    for chunk_idx in range(capture_chunk_idx + 1):
         cache.before_update(chunk_idx)
-        output = forward(chunk_idx, chunk_rope_freqs)
+        output = forward(chunk_idx, rope_freqs[chunk_idx])
         cache.after_update(chunk_idx)
     torch.cuda.synchronize()
 
@@ -172,14 +202,15 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
             "model_channels": config.model_channels,
             "num_blocks": config.num_blocks,
             "num_heads": config.num_heads,
-            "parameter_count": sum(
-                parameter.numel() for parameter in network.parameters()
-            ),
+            "parameter_count": parameter_count,
             "checkpoint": "random_init",
             "dtype": str(dtype),
-            "attention_backend": "cudnn",
-            "compiled": False,
-            "cuda_graph": False,
+            "execution_backend": "pytorch",
+            "attention_backend": attention_backends.pop(),
+            "compiled": True,
+            "cuda_graph": True,
+            "cache_prefill_chunks": capture_chunk_idx + 1,
+            "benchmark_ar_index": benchmark_chunk_idx,
             "diffusion_timestep": _DIFFUSION_TIMESTEP,
             "gpu": torch.cuda.get_device_name(device),
             "torch": torch.__version__,
@@ -189,13 +220,12 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
         }
     )
 
-    # Multiple scheduler evaluations at one AR index overwrite the same cache
-    # positions. Leave the final chunk active across warmup and measured rounds.
-    cache.before_update(steady_chunk_idx)
+    # Repeated scheduler evaluations overwrite one production steady-state slot.
+    cache.before_update(benchmark_chunk_idx)
     torch.cuda.reset_peak_memory_stats(device)
 
     def synchronized_forward() -> torch.Tensor:
-        result = forward(steady_chunk_idx, rope_freqs[steady_chunk_idx])
+        result = forward(benchmark_chunk_idx, rope_freqs[benchmark_chunk_idx])
         torch.cuda.synchronize()
         return result
 
@@ -205,7 +235,7 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
         rounds=_BENCHMARK_ROUNDS,
         warmup_rounds=_WARMUP_ROUNDS,
     )
-    cache.after_update(steady_chunk_idx)
+    cache.after_update(benchmark_chunk_idx)
     benchmark.extra_info["peak_cuda_memory_bytes"] = torch.cuda.max_memory_allocated(
         device
     )
@@ -247,7 +277,7 @@ def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
         window_size_t=_WINDOW_SIZE_T,
         sink_size_t=0,
         compile_network=False,
-        use_cuda_graph=False,
+        use_cuda_graph=True,
         native_dit_acceleration="required",
         native_dit_backend=_NATIVE_DIT_BACKEND,
         native_dit_attention_backend=_NATIVE_ATTENTION_BACKEND,
@@ -329,11 +359,12 @@ def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
             input=hdmap_condition,
         )
 
-    # The first call builds the native runtime and FP8 weights. Fill the
-    # rolling cache before timing so conversion, extension setup, and cache
-    # growth are excluded from the steady-state forward measurement.
-    steady_chunk_idx = _WINDOW_SIZE_T // _CHUNK_SIZE_T - 1
-    for chunk_idx in range(steady_chunk_idx + 1):
+    # Build the native runtime and FP8 weights, then fill and roll the cache
+    # through the production CUDA-graph threshold. Benchmark warmups finish
+    # graph capture before measured rounds.
+    capture_chunk_idx = transformer._cuda_graph_capture_ar_idx
+    benchmark_chunk_idx = capture_chunk_idx + 1
+    for chunk_idx in range(capture_chunk_idx + 1):
         cache.start(chunk_idx)
         output = forward()
         cache.finalize(chunk_idx)
@@ -344,6 +375,8 @@ def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
     assert native_selection is not None and native_selection.enabled
     assert native_executor is not None
 
+    assert native_executor._uses_fp8_dit is True
+    assert native_executor._attention_backend == _NATIVE_ATTENTION_BACKEND
     benchmark.group = "omnidreams-dit-network"
     benchmark.extra_info.update(
         {
@@ -367,7 +400,8 @@ def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
             "native_extension": native_selection.reason,
             "compiled": transformer_config.compile_network,
             "cuda_graph": transformer_config.use_cuda_graph,
-            "cache_prefill_chunks": steady_chunk_idx + 1,
+            "cache_prefill_chunks": capture_chunk_idx + 1,
+            "benchmark_ar_index": benchmark_chunk_idx,
             "diffusion_timestep": _DIFFUSION_TIMESTEP,
             "gpu": torch.cuda.get_device_name(device),
             "torch": torch.__version__,
@@ -377,9 +411,8 @@ def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
         }
     )
 
-    # Leave the final autoregressive position active across warmup and
-    # measured rounds. Repeated scheduler evaluations overwrite this slot.
-    cache.start(steady_chunk_idx)
+    # Repeated scheduler evaluations overwrite one production steady-state slot.
+    cache.start(benchmark_chunk_idx)
     torch.cuda.reset_peak_memory_stats(device)
 
     def synchronized_forward() -> torch.Tensor:
@@ -393,7 +426,7 @@ def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
         rounds=_BENCHMARK_ROUNDS,
         warmup_rounds=_WARMUP_ROUNDS,
     )
-    cache.finalize(steady_chunk_idx)
+    cache.finalize(benchmark_chunk_idx)
     benchmark.extra_info["peak_cuda_memory_bytes"] = torch.cuda.max_memory_allocated(
         device
     )

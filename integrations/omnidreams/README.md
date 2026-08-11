@@ -245,8 +245,16 @@ with one of these files:
 
 - `test_modules.py` benchmarks individual DiT blocks, attention layers, and the
   MLP.
-- `test_network.py` benchmarks the complete DiT network.
-- `test_pipeline.py` benchmarks the steady-state full generation pipeline.
+- `test_network.py` benchmarks one steady-state DiT evaluation through the
+  production transformer execution modes: compiled cuDNN SDPA plus CUDA graph
+  replay for PyTorch, and the native FP8 cuDNN backend plus CUDA graph replay.
+  It uses production tensor geometry with random weights, so checkpoint loading
+  and startup are excluded.
+- `test_pipeline.py` benchmarks the steady-state full generation pipeline at
+  the runner's production 704x1280 resolution and scheduler configuration. It
+  preserves the production PyTorch cuDNN SDPA backend; attention alternatives
+  must be benchmarked as explicitly labelled variants rather than silently
+  replacing the baseline.
 
 Keep `--group test` on both commands. A plain
 `uv sync --project integrations/omnidreams` installs only the integration's

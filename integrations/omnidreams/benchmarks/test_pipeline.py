@@ -31,6 +31,7 @@ import pytest
 import torch
 from omnidreams.config import SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF
 from omnidreams.pipeline import OmnidreamsPipeline
+from omnidreams.runner import DEFAULT_VIDEO_HEIGHT, DEFAULT_VIDEO_WIDTH
 from omnidreams.transformer import CosmosTransformer, CosmosTransformerConfig
 from omnidreams.vae_native import OmnidreamsWanVAEEncoderConfig
 from pytest_benchmark.fixture import BenchmarkFixture
@@ -46,10 +47,9 @@ _GPU_REASON = "OmniDreams full-pipeline benchmark requires CUDA"
 
 _BATCH_SIZE = 1
 _NUM_VIEWS = 1
-_PIXEL_HEIGHT = 640
-_PIXEL_WIDTH = 1168
+_PIXEL_HEIGHT = DEFAULT_VIDEO_HEIGHT
+_PIXEL_WIDTH = DEFAULT_VIDEO_WIDTH
 _TEXT_TOKENS = 512
-_DENOISING_TIMESTEPS = (1000, 100)
 _WARMUP_ROUNDS = 3
 _BENCHMARK_ROUNDS = 20
 _SEED = 0
@@ -124,10 +124,6 @@ def _run_full_pipeline_benchmark(
         enable_sync_and_profile=False,
         diffusion_model={
             "seed": _SEED,
-            "scheduler": {
-                "denoising_timesteps": list(_DENOISING_TIMESTEPS),
-                "num_inference_steps": len(_DENOISING_TIMESTEPS),
-            },
             "transformer": {
                 "compile_network": not native_dit,
                 # Keep cache finalization identical across the comparison;
@@ -148,18 +144,16 @@ def _run_full_pipeline_benchmark(
 
     parameter_count = sum(parameter.numel() for parameter in pipeline.parameters())
 
-    # The regular PyTorch DiT constructs ContextParallelAttention with cuDNN
-    # SDPA by default. Select PyTorch Flash SDPA before the first call. The
-    # native case bypasses these modules and selects cuDNN in its executor.
+    # Preserve the production PyTorch cuDNN SDPA backend. The native case
+    # bypasses these modules and selects its FP8 cuDNN path in the executor.
     attention_modules = [
         module
         for module in pipeline.modules()
         if isinstance(module, ContextParallelAttention)
     ]
     assert attention_modules
-    if not native_dit:
-        for attention in attention_modules:
-            attention.backend = "flash"
+    pytorch_attention_backends = {attention.backend for attention in attention_modules}
+    assert pytorch_attention_backends == {"cudnn"}
     diffusion_config = pipeline_config.diffusion_model
     transformer_config = diffusion_config.transformer
     scheduler_config = diffusion_config.scheduler
@@ -301,7 +295,7 @@ def _run_full_pipeline_benchmark(
         assert native_selection is None
         assert native_executor is None
         dit_execution = "pytorch"
-        dit_attention_backend = "flash"
+        dit_attention_backend = pytorch_attention_backends.pop()
         dit_kv_cache_dtype = str(dtype)
         native_extension = None
         compiler_cache_state = (
