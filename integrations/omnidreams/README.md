@@ -160,6 +160,59 @@ explicitly to opt into Sparge/SageAttention-3 experiments. Use
 `native_dit_sparge_hybrid_period > 1` with `"sparge"` to enable the FP8
 Sparge/SageAttention-3 hybrid schedule when the extension and GPU support it.
 
+## Run tests
+
+Run tests from the workspace root. Sync the OmniDreams `dev` extra, which
+provides the interactive-drive test dependencies, together with the workspace
+`test` group, which provides pytest and its shared plugins:
+
+```bash
+uv sync --package flashdreams-omnidreams --extra dev --group test
+```
+
+Run all tests that participate in CPU or GPU CI with:
+
+```bash
+uv run --package flashdreams-omnidreams --extra dev --group test pytest \
+  integrations/omnidreams/tests \
+  -m "not manual" -v
+```
+
+Use the tier markers to run a narrower suite:
+
+```bash
+# CPU-safe tests
+uv run --package flashdreams-omnidreams --extra dev --group test pytest \
+  integrations/omnidreams/tests -m ci_cpu -v
+
+# Tests that require CUDA, libGL, or cv2
+uv run --package flashdreams-omnidreams --extra dev --group test pytest \
+  integrations/omnidreams/tests -m ci_gpu -v
+```
+
+Heavy, credential-dependent, or environment-specific tests use the `manual`
+marker. For example, run the end-to-end streaming pipeline test on a suitable
+GPU with access to the required checkpoints:
+
+```bash
+uv run --package flashdreams-omnidreams --extra dev --group test pytest \
+  integrations/omnidreams/tests/test_omnidreams_pipeline.py::test_omnidreams_streaming_inference \
+  -p no:manual_marker -m manual -v -s
+```
+
+The native CUDA extension build smoke test is opt-in because it performs a
+clean extension build:
+
+```bash
+OMNIDREAMS_SINGLEVIEW_RUN_NATIVE_BUILD_TEST=1 \
+uv run --package flashdreams-omnidreams --extra dev --group test pytest \
+  integrations/omnidreams/tests/test_omnidreams_singleview_native.py::test_cuda_native_extension_builds \
+  -m ci_gpu -v -s
+```
+
+Keep `--extra dev --group test` on `uv run`: it synchronizes the shared `.venv`
+before launching pytest, and omitted selections may be removed.
+
 ## Run benchmarks
 
 The OmniDreams benchmarks are manual, GPU-only pytest tests. Run them from the
