@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from omnidreams.transformer import CosmosTransformer, CosmosTransformerConfig
 from omnidreams.transformer.impl.network import (
     CosmosDiTNetwork,
     CosmosDiTNetworkConfig,
@@ -55,6 +56,8 @@ _DIFFUSION_TIMESTEP = 450.0
 _WARMUP_ROUNDS = 3
 _BENCHMARK_ROUNDS = 20
 _SEED = 0
+_NATIVE_DIT_BACKEND = "fp8_kvcache_cudnn"
+_NATIVE_ATTENTION_BACKEND = "cudnn"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
@@ -212,6 +215,194 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
         _NUM_VIEWS,
         chunk_tokens,
         config.out_channels * patch_volume,
+    )
+    assert output.shape == expected_output_shape
+    assert torch.isfinite(output).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
+@torch.inference_mode()
+def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
+    """Benchmark the production native CUDA DiT backend at steady state."""
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("Omnidreams native DiT benchmark requires bfloat16 support")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("Omnidreams native DiT benchmark requires float8_e4m3fn")
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(_SEED)
+
+    network_config = CosmosDiTNetworkConfig(
+        additional_concat_ch=_HDMAP_CHANNELS,
+        enable_cross_view_attn=False,
+        cp_method="ring",
+    )
+    transformer_config = CosmosTransformerConfig(
+        network=network_config,
+        dtype=dtype,
+        batch_shape=(_BATCH_SIZE,),
+        num_views=_NUM_VIEWS,
+        len_t=_CHUNK_SIZE_T,
+        window_size_t=_WINDOW_SIZE_T,
+        sink_size_t=0,
+        compile_network=False,
+        use_cuda_graph=False,
+        native_dit_acceleration="required",
+        native_dit_backend=_NATIVE_DIT_BACKEND,
+        native_dit_attention_backend=_NATIVE_ATTENTION_BACKEND,
+    )
+    transformer = CosmosTransformer(transformer_config).to(device=device, dtype=dtype)
+    transformer.eval()
+    parameter_count = sum(parameter.numel() for parameter in transformer.parameters())
+
+    x_unpatched = torch.randn(
+        (
+            _BATCH_SIZE,
+            _NUM_VIEWS,
+            _CHUNK_SIZE_T,
+            network_config.in_channels,
+            _LATENT_HEIGHT,
+            _LATENT_WIDTH,
+        ),
+        device=device,
+        dtype=dtype,
+    )
+    hdmap_unpatched = torch.randn(
+        (
+            _BATCH_SIZE,
+            _NUM_VIEWS,
+            _CHUNK_SIZE_T,
+            network_config.additional_concat_ch,
+            _LATENT_HEIGHT,
+            _LATENT_WIDTH,
+        ),
+        device=device,
+        dtype=dtype,
+    )
+    image_embeddings = torch.randn(
+        (
+            _BATCH_SIZE,
+            _NUM_VIEWS,
+            1,
+            network_config.in_channels,
+            _LATENT_HEIGHT,
+            _LATENT_WIDTH,
+        ),
+        device=device,
+        dtype=dtype,
+    )
+    context = torch.randn(
+        (
+            _BATCH_SIZE,
+            _NUM_VIEWS,
+            _TEXT_TOKENS,
+            network_config.crossattn_proj_in_channels,
+        ),
+        device=device,
+        dtype=dtype,
+    )
+    timestep = torch.tensor(_DIFFUSION_TIMESTEP, device=device, dtype=dtype)
+
+    cache = transformer.initialize_autoregressive_cache(
+        height=_LATENT_HEIGHT,
+        width=_LATENT_WIDTH,
+        text_embeddings=context,
+        image_embeddings=image_embeddings,
+    )
+    x = transformer.patchify_and_maybe_split_cp(x_unpatched)
+    hdmap_condition = transformer.patchify_and_maybe_split_cp(hdmap_unpatched)
+
+    patch_t = _CHUNK_SIZE_T // network_config.patch_temporal
+    patch_h = _LATENT_HEIGHT // network_config.patch_spatial
+    patch_w = _LATENT_WIDTH // network_config.patch_spatial
+    patch_volume = network_config.patch_temporal * network_config.patch_spatial**2
+    tokens_per_frame = patch_h * patch_w
+    chunk_tokens = patch_t * tokens_per_frame
+    window_tokens = _WINDOW_SIZE_T * tokens_per_frame
+
+    def forward() -> torch.Tensor:
+        return transformer.predict_flow(
+            noisy_latent=x,
+            timestep=timestep,
+            cache=cache,
+            input=hdmap_condition,
+        )
+
+    # The first call builds the native runtime and FP8 weights. Fill the
+    # rolling cache before timing so conversion, extension setup, and cache
+    # growth are excluded from the steady-state forward measurement.
+    steady_chunk_idx = _WINDOW_SIZE_T // _CHUNK_SIZE_T - 1
+    for chunk_idx in range(steady_chunk_idx + 1):
+        cache.start(chunk_idx)
+        output = forward()
+        cache.finalize(chunk_idx)
+    torch.cuda.synchronize()
+
+    native_selection = transformer._optimized_dit_selection
+    native_executor = transformer._optimized_dit_executor
+    assert native_selection is not None and native_selection.enabled
+    assert native_executor is not None
+
+    benchmark.group = "omnidreams-dit-network"
+    benchmark.extra_info.update(
+        {
+            "batch_size": _BATCH_SIZE,
+            "num_views": _NUM_VIEWS,
+            "pixel_resolution": [_PIXEL_HEIGHT, _PIXEL_WIDTH],
+            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
+            "chunk_tokens": chunk_tokens,
+            "window_tokens": window_tokens,
+            "text_tokens": _TEXT_TOKENS,
+            "hdmap_channels": network_config.additional_concat_ch,
+            "model_channels": network_config.model_channels,
+            "num_blocks": network_config.num_blocks,
+            "num_heads": network_config.num_heads,
+            "parameter_count": parameter_count,
+            "checkpoint": "random_init",
+            "dtype": str(dtype),
+            "execution_backend": "native_cuda",
+            "native_dit_backend": transformer_config.native_dit_backend,
+            "attention_backend": native_executor._attention_backend,
+            "native_extension": native_selection.reason,
+            "compiled": transformer_config.compile_network,
+            "cuda_graph": transformer_config.use_cuda_graph,
+            "cache_prefill_chunks": steady_chunk_idx + 1,
+            "diffusion_timestep": _DIFFUSION_TIMESTEP,
+            "gpu": torch.cuda.get_device_name(device),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "seed": _SEED,
+        }
+    )
+
+    # Leave the final autoregressive position active across warmup and
+    # measured rounds. Repeated scheduler evaluations overwrite this slot.
+    cache.start(steady_chunk_idx)
+    torch.cuda.reset_peak_memory_stats(device)
+
+    def synchronized_forward() -> torch.Tensor:
+        result = forward()
+        torch.cuda.synchronize()
+        return result
+
+    output = benchmark.pedantic(
+        synchronized_forward,
+        iterations=1,
+        rounds=_BENCHMARK_ROUNDS,
+        warmup_rounds=_WARMUP_ROUNDS,
+    )
+    cache.finalize(steady_chunk_idx)
+    benchmark.extra_info["peak_cuda_memory_bytes"] = torch.cuda.max_memory_allocated(
+        device
+    )
+
+    expected_output_shape = (
+        _BATCH_SIZE,
+        _NUM_VIEWS,
+        chunk_tokens,
+        network_config.out_channels * patch_volume,
     )
     assert output.shape == expected_output_shape
     assert torch.isfinite(output).all()
