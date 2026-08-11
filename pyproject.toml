@@ -109,7 +109,7 @@ invalid-method-override = "ignore"
 replace-imports-with-any = ["flash_attn.**", "transformer_engine.**", "triton.**"]
 
 [tool.pytest.ini_options]
-addopts = "--import-mode=importlib -p flashdreams._pytest_plugins.marker_enforcement"
+addopts = "--import-mode=importlib -p flashdreams._pytest_plugins.marker_enforcement --benchmark-time-unit=ms"
 norecursedirs = [
     "parity_check",
     "parity_check_v2",
