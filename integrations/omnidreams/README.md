@@ -160,6 +160,40 @@ explicitly to opt into Sparge/SageAttention-3 experiments. Use
 `native_dit_sparge_hybrid_period > 1` with `"sparge"` to enable the FP8
 Sparge/SageAttention-3 hybrid schedule when the extension and GPU support it.
 
+## Run benchmarks
+
+The OmniDreams benchmarks are manual, GPU-only pytest tests. Run them from the
+workspace root on a supported NVIDIA GPU. First sync the OmniDreams package and
+the workspace `test` dependency group, which provides both `pytest` and
+`pytest-benchmark`:
+
+```bash
+uv sync --package flashdreams-omnidreams --group test
+```
+
+Run the complete benchmark suite with:
+
+```bash
+uv run --package flashdreams-omnidreams --group test pytest \
+  integrations/omnidreams/benchmarks \
+  -p no:manual_marker -m manual --benchmark-only -v
+```
+
+To run a narrower benchmark, replace the benchmark directory in that command
+with one of these files:
+
+- `test_modules.py` benchmarks individual DiT blocks, attention layers, and the
+  MLP.
+- `test_network.py` benchmarks the complete DiT network.
+- `test_pipeline.py` benchmarks the steady-state full generation pipeline.
+
+Keep `--group test` on both commands. A plain
+`uv sync --project integrations/omnidreams` installs only the integration's
+runtime dependencies, so a later `uv run pytest` cannot find the benchmark
+test tools. The benchmarks manage their warmup and measured rounds internally;
+when publishing results, also record the commit, GPU and software stack, model
+configuration, and any fallback warnings.
+
 ## Run WebRTC server
 
 From the workspace root, run:
