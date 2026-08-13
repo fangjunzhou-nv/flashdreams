@@ -36,6 +36,7 @@ import torch
 from pytest_benchmark.fixture import BenchmarkFixture
 from torch import Tensor
 
+from flashdreams.accelerated.impl import TritonMultiHeadAttention
 from flashdreams.accelerated.multi_head_attention import QKNormScope
 from flashdreams.accelerated.reference import TorchMultiHeadAttention
 from flashdreams.core.attention import BlockKVCache, RotaryPositionEmbedding3D
@@ -57,9 +58,10 @@ _BENCHMARK_ROUNDS = 20
 """Measured calls used for each implementation comparison."""
 
 _ModelFamily = Literal["cosmos", "wan"]
-_Implementation = Literal["recipe", "accelerated_torch"]
+_Implementation = Literal["recipe", "accelerated_torch", "accelerated_triton"]
 _Attention = (
     TorchMultiHeadAttention
+    | TritonMultiHeadAttention
     | cosmos_modules.MultiHeadAttention
     | wan_modules.MultiHeadAttention
 )
@@ -175,11 +177,11 @@ def _make_attention(
     config: _AttentionBenchmarkConfig,
     implementation: _Implementation,
 ) -> _Attention:
-    """Build a recipe attention module or its weight-matched Torch reference.
+    """Build a recipe module or weight-matched accelerated implementation.
 
     Args:
         config: Multi-head attention dimensions and family.
-        implementation: Recipe module or generic Torch reference to return.
+        implementation: Recipe, Torch, or Triton implementation to return.
 
     Returns:
         Configured multi-head attention module with deterministic random weights.
@@ -203,7 +205,19 @@ def _make_attention(
             rope_interleaved=False,
         )
         torch_attention.load_state_dict(recipe_attention.state_dict())
-        return torch_attention
+        if implementation == "accelerated_torch":
+            return torch_attention
+        triton_attention = TritonMultiHeadAttention(
+            query_dim=config.query_dim,
+            n_heads=config.n_heads,
+            head_dim=config.head_dim,
+            qkv_bias=False,
+            output_bias=False,
+            qk_norm_scope=QKNormScope.HEAD,
+            rope_interleaved=False,
+        )
+        triton_attention.load_state_dict(torch_attention.state_dict())
+        return triton_attention
 
     recipe_attention = wan_modules.MultiHeadAttention(
         query_dim=config.query_dim,
@@ -228,7 +242,19 @@ def _make_attention(
     torch_attention.output_proj.load_state_dict(recipe_attention.o.state_dict())
     torch_attention.q_norm.load_state_dict(recipe_attention.norm_q.state_dict())
     torch_attention.k_norm.load_state_dict(recipe_attention.norm_k.state_dict())
-    return torch_attention
+    if implementation == "accelerated_torch":
+        return torch_attention
+    triton_attention = TritonMultiHeadAttention(
+        query_dim=config.query_dim,
+        n_heads=config.n_heads,
+        head_dim=config.head_dim,
+        qkv_bias=True,
+        output_bias=True,
+        qk_norm_scope=QKNormScope.INNER,
+        rope_interleaved=True,
+    )
+    triton_attention.load_state_dict(torch_attention.state_dict())
+    return triton_attention
 
 
 @torch.inference_mode()
@@ -243,7 +269,7 @@ def _benchmark_multi_head_attention(
     Args:
         benchmark: Pytest benchmark fixture used to record synchronized timings.
         config: Multi-head attention dimensions and family.
-        implementation: Recipe module or accelerated Torch reference to measure.
+        implementation: Recipe, Torch, or Triton implementation to measure.
     """
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Multi-head attention benchmark requires bfloat16 support.")
@@ -310,9 +336,11 @@ def _benchmark_multi_head_attention(
             "qkv_bias": model_family == "wan",
             "output_bias": model_family == "wan",
             "qk_norm_scope": "inner" if model_family == "wan" else "head",
-            "attention_backend": (
-                "auto_sdpa" if implementation == "accelerated_torch" else "cudnn"
-            ),
+            "attention_backend": {
+                "recipe": "cudnn",
+                "accelerated_torch": "auto_sdpa",
+                "accelerated_triton": "triton_tma_flash_attention_2",
+            }[implementation],
             "cache_state": "full_window",
             "cache_prefill_chunks": config.window_chunks,
             "benchmark_chunk_idx": benchmark_chunk_idx,
@@ -399,4 +427,26 @@ def test_wan_accelerated_torch_multi_head_attention_benchmark(
         benchmark,
         config=_WAN_CONFIG,
         implementation="accelerated_torch",
+    )
+
+
+def test_cosmos_accelerated_triton_multi_head_attention_benchmark(
+    benchmark: BenchmarkFixture,
+) -> None:
+    """Benchmark accelerated Triton attention configured for Cosmos."""
+    _benchmark_multi_head_attention(
+        benchmark,
+        config=_COSMOS_CONFIG,
+        implementation="accelerated_triton",
+    )
+
+
+def test_wan_accelerated_triton_multi_head_attention_benchmark(
+    benchmark: BenchmarkFixture,
+) -> None:
+    """Benchmark accelerated Triton attention configured for Wan."""
+    _benchmark_multi_head_attention(
+        benchmark,
+        config=_WAN_CONFIG,
+        implementation="accelerated_triton",
     )
