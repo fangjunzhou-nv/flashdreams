@@ -45,6 +45,54 @@ def _allocate_tma_workspace(
 triton.set_allocator(_allocate_tma_workspace)
 
 
+_TMA_ATTENTION_CONFIGS = [
+    triton.Config(
+        {"BLOCK_M": block_m, "BLOCK_N": block_n},
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    for block_m, block_n, num_warps, num_stages in (
+        (16, 32, 4, 2),
+        (32, 32, 4, 2),
+        (64, 32, 4, 3),
+        (64, 64, 4, 3),
+        (64, 64, 8, 3),
+        (128, 32, 4, 3),
+        (128, 64, 8, 3),
+    )
+]
+
+
+def _prune_tma_attention_configs(
+    configs: list[triton.Config],
+    named_args: dict[str, object],
+    **meta: object,
+) -> list[triton.Config]:
+    """Drop tiles that waste work or exceed wide-head shared memory."""
+    query_length = named_args["query_length"]
+    key_length = named_args["key_length"]
+    head_dim = meta["HEAD_DIM"]
+    assert isinstance(query_length, int)
+    assert isinstance(key_length, int)
+    assert isinstance(head_dim, int)
+    maximum_block_m = min(128, max(16, int(triton.next_power_of_2(query_length))))
+    if head_dim > 128:
+        maximum_block_m = min(maximum_block_m, 64)
+    maximum_block_n = min(64, max(32, int(triton.next_power_of_2(key_length))))
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_M"] <= maximum_block_m
+        and config.kwargs["BLOCK_N"] <= maximum_block_n
+    ]
+
+
+@triton.autotune(
+    configs=_TMA_ATTENTION_CONFIGS,
+    key=["num_heads", "query_length", "key_length", "element_size", "HEAD_DIM"],
+    prune_configs_by={"early_config_prune": _prune_tma_attention_configs},
+    cache_results=True,
+)
 @triton.jit
 def _flash_attention_2_tma_kernel(
     query_ptr,
@@ -70,6 +118,7 @@ def _flash_attention_2_tma_kernel(
     num_heads,
     query_length,
     key_length,
+    element_size,
     scale,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -178,7 +227,7 @@ def is_tma_flash_attention_supported(
         return False
     if query.dtype != key.dtype or query.dtype != value.dtype:
         return False
-    if query.dtype not in (torch.float16, torch.bfloat16):
+    if query.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
         return False
 
     batch_size, _, num_heads, head_dim = query.shape
@@ -227,7 +276,7 @@ def flash_attention_2_tma(
         raise ValueError("key and value sequence length must be positive")
     if not is_tma_flash_attention_supported(query, key, value):
         raise RuntimeError(
-            "TMA FlashAttention2 requires matching CUDA FP16/BF16 tensors, "
+            "TMA FlashAttention2 requires matching CUDA FP16/BF16/FP8 tensors, "
             "compute capability 9.0 or newer, a power-of-two head_dim in "
             "[16, 256], and tensor-descriptor-compatible strides"
         )
@@ -239,16 +288,6 @@ def flash_attention_2_tma(
     )
     if batch_size == 0 or num_heads == 0 or query_length == 0:
         return output
-
-    # Bound tiles so descriptors and the FP32 accumulator fit in shared memory.
-    # Tiny sequences use smaller power-of-two tiles to limit masked work.
-    maximum_block_m = 128 if head_dim <= 128 else 64
-    block_m = min(
-        maximum_block_m,
-        max(16, int(triton.next_power_of_2(query_length))),
-    )
-    block_n = min(64, max(16, int(triton.next_power_of_2(key_length))))
-    num_warps = 8 if block_m == 128 or head_dim > 128 else 4
 
     # Reorder logical strides for the per-plane [B, H, L, D] descriptor view;
     # this is metadata only and does not transpose or copy a tensor.
@@ -271,7 +310,15 @@ def flash_attention_2_tma(
         output.stride(1),
         output.stride(3),
     )
-    grid = (triton.cdiv(query_length, block_m), batch_size * num_heads)
+
+    # Autotuning selects the launch shape once per geometry and storage width,
+    # then reuses the cached result for steady-state calls.
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
+        return (
+            triton.cdiv(query_length, meta["BLOCK_M"]),
+            batch_size * num_heads,
+        )
+
     _flash_attention_2_tma_kernel[grid](
         query,
         key,
@@ -284,12 +331,9 @@ def flash_attention_2_tma(
         num_heads,
         query_length,
         key_length,
+        query.element_size(),
         1.0 / math.sqrt(head_dim) if scale is None else scale,
         HEAD_DIM=head_dim,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        num_warps=num_warps,
-        num_stages=3,
     )
     return output
 

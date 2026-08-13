@@ -430,7 +430,8 @@ def fused_rms_rope_kv_cache_update(
         cache_write_length: Number of source tokens written into the cache.
 
     Returns:
-        Processed queries with shape ``[B, L, H, D]``.
+        Processed queries with shape ``[B, L, H, D]`` and the cache storage
+        dtype. An FP8 cache therefore feeds FP8 attention without another cast.
 
     Raises:
         ValueError: Tensor shapes, cache bounds, or normalization inputs differ.
@@ -454,10 +455,18 @@ def fused_rms_rope_kv_cache_update(
     tensors = (query, key, value, key_cache, value_cache)
     if not all(x.is_cuda for x in tensors):
         raise RuntimeError("fused RMS/RoPE/cache update requires CUDA tensors")
-    if len({x.device for x in tensors}) != 1 or len({x.dtype for x in tensors}) != 1:
-        raise RuntimeError("Q/K/V and cache tensors must share a device and dtype")
+    if len({x.device for x in tensors}) != 1:
+        raise RuntimeError("Q/K/V and cache tensors must share a device")
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise RuntimeError("Q/K/V tensors must share a dtype")
+    if key_cache.dtype != value_cache.dtype:
+        raise RuntimeError("K/V cache tensors must share a dtype")
     if query.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError("fused RMS/RoPE/cache update requires FP16 or BF16")
+    if key_cache.dtype not in (query.dtype, torch.float8_e4m3fn):
+        raise RuntimeError(
+            "K/V cache storage must match Q/K/V or use torch.float8_e4m3fn"
+        )
     if not key_cache.is_contiguous() or not value_cache.is_contiguous():
         raise RuntimeError("K/V cache storage must be contiguous")
     if query.stride(-1) != 1 or key.stride(-1) != 1 or value.stride(-1) != 1:
@@ -513,7 +522,7 @@ def fused_rms_rope_kv_cache_update(
     query_output = torch.empty(
         query.shape,
         device=query.device,
-        dtype=query.dtype,
+        dtype=key_cache.dtype,
     )
     if batch_size == 0 or sequence_length == 0 or num_heads == 0:
         return query_output

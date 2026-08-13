@@ -25,7 +25,11 @@ from flashdreams.accelerated.impl import TritonMultiHeadAttention
 from flashdreams.accelerated.impl.triton import flash_attention_2_tma
 from flashdreams.accelerated.multi_head_attention import QKNormScope
 from flashdreams.accelerated.reference import TorchMultiHeadAttention
-from flashdreams.core.attention import BlockKVCache, RotaryPositionEmbedding3D
+from flashdreams.core.attention import (
+    BlockKVCache,
+    FP8BlockKVCache,
+    RotaryPositionEmbedding3D,
+)
 
 pytestmark = pytest.mark.ci_gpu
 
@@ -172,6 +176,98 @@ def test_triton_attention_matches_reference_through_window_roll(
                 reference_cache.cached_v(),
                 atol=0,
                 rtol=0,
+            )
+            reference_cache.after_update(chunk_idx)
+            triton_cache.after_update(chunk_idx)
+
+
+@pytest.mark.parametrize(
+    ("qk_norm_scope", "rope_interleaved", "projection_bias"),
+    [
+        pytest.param(QKNormScope.HEAD, False, False, id="cosmos"),
+        pytest.param(QKNormScope.INNER, True, True, id="wan"),
+    ],
+)
+def test_fp8_triton_attention_matches_bf16_reference_through_window_roll(
+    tma_device: torch.device,
+    qk_norm_scope: QKNormScope,
+    rope_interleaved: bool,
+    projection_bias: bool,
+) -> None:
+    """Bound FP8 projection, cache, attention, and output error through a roll."""
+    torch.manual_seed(17)
+    reference = TorchMultiHeadAttention(
+        query_dim=128,
+        n_heads=2,
+        head_dim=64,
+        qkv_bias=projection_bias,
+        output_bias=projection_bias,
+        qk_norm_scope=qk_norm_scope,
+        rope_interleaved=rope_interleaved,
+    ).to(device=tma_device, dtype=torch.bfloat16)
+    triton_attention = TritonMultiHeadAttention(
+        query_dim=128,
+        n_heads=2,
+        head_dim=64,
+        qkv_bias=projection_bias,
+        output_bias=projection_bias,
+        qk_norm_scope=qk_norm_scope,
+        rope_interleaved=rope_interleaved,
+        use_fp8=True,
+    ).to(device=tma_device, dtype=torch.bfloat16)
+    triton_attention.load_state_dict(reference.state_dict())
+    reference.eval()
+    triton_attention.eval()
+
+    reference_cache = _make_cache(tma_device)
+    triton_cache = triton_attention.initialize_cache(
+        batch_size=1,
+        chunk_size=16,
+        window_size=32,
+        sink_size=0,
+        device=tma_device,
+        dtype=torch.bfloat16,
+    )
+    assert isinstance(triton_cache, FP8BlockKVCache)
+    rope = RotaryPositionEmbedding3D(
+        head_dim=64,
+        len_t=1,
+        len_h=1,
+        len_w=16,
+        interleaved=rope_interleaved,
+        device=tma_device,
+    )
+    generator = torch.Generator(device=tma_device).manual_seed(19)
+
+    with torch.inference_mode():
+        for chunk_idx in range(3):
+            x = torch.randn(
+                1,
+                16,
+                128,
+                generator=generator,
+                device=tma_device,
+                dtype=torch.bfloat16,
+            )
+            rope_freqs = rope.shift_t(chunk_idx)
+            reference_cache.before_update(chunk_idx)
+            triton_cache.before_update(chunk_idx)
+
+            expected = reference(x, reference_cache, rope_freqs)
+            actual = triton_attention(x, triton_cache, rope_freqs)
+
+            torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+            torch.testing.assert_close(
+                triton_cache.cached_k().to(torch.bfloat16),
+                reference_cache.cached_k(),
+                atol=1.25e-1,
+                rtol=1.25e-1,
+            )
+            torch.testing.assert_close(
+                triton_cache.cached_v().to(torch.bfloat16),
+                reference_cache.cached_v(),
+                atol=1.25e-1,
+                rtol=1.25e-1,
             )
             reference_cache.after_update(chunk_idx)
             triton_cache.after_update(chunk_idx)

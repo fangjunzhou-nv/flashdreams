@@ -365,3 +365,38 @@ class BlockKVCache:
         self._prev_chunk_idx = -1
         self._curr_chunk_idx = None
         self._n_cached = 0
+
+
+@dataclass
+class FP8BlockKVCache(BlockKVCache):
+    """Block K/V cache stored in unscaled E4M3 FP8 tensors.
+
+    The cache preserves :class:`BlockKVCache` lifecycle and rolling-window
+    semantics. Incoming tensors are converted to ``torch.float8_e4m3fn`` by the
+    ordinary cache assignment, so callers may write projected FP16 or BF16 K/V
+    without a separate quantization step.
+
+    This cache intentionally carries no auxiliary scale tensors. It is intended
+    for normalized queries/keys and inference activations whose range fits E4M3;
+    consumers must explicitly opt into the corresponding FP8 attention policy.
+    """
+
+    dtype: torch.dtype = field(default=torch.float8_e4m3fn, init=False)
+    """Fixed E4M3 storage dtype."""
+
+    @classmethod
+    def from_tensor(cls, k: Tensor, v: Tensor, seq_dim: int) -> Self:
+        """Build a single-chunk FP8 cache from native-precision K/V tensors."""
+        cache = cls(
+            k_shape=k.shape,
+            v_shape=v.shape,
+            seq_dim=seq_dim,
+            chunk_size=k.shape[seq_dim],
+            window_size=k.shape[seq_dim],
+            device=k.device,
+        )
+        cache.before_update(0)
+        cache.update(k, v)
+        cache.after_update(0)
+        cache._curr_chunk_idx = 0
+        return cache

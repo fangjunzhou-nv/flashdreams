@@ -39,7 +39,11 @@ from torch import Tensor
 from flashdreams.accelerated.impl import TritonMultiHeadAttention
 from flashdreams.accelerated.multi_head_attention import QKNormScope
 from flashdreams.accelerated.reference import TorchMultiHeadAttention
-from flashdreams.core.attention import BlockKVCache, RotaryPositionEmbedding3D
+from flashdreams.core.attention import (
+    BlockKVCache,
+    FP8BlockKVCache,
+    RotaryPositionEmbedding3D,
+)
 from flashdreams.recipes.cosmos.transformer.impl import modules as cosmos_modules
 from flashdreams.recipes.wan.transformer.impl import modules as wan_modules
 
@@ -58,7 +62,12 @@ _BENCHMARK_ROUNDS = 20
 """Measured calls used for each implementation comparison."""
 
 _ModelFamily = Literal["cosmos", "wan"]
-_Implementation = Literal["recipe", "accelerated_torch", "accelerated_triton"]
+_Implementation = Literal[
+    "recipe",
+    "accelerated_torch",
+    "accelerated_triton",
+    "accelerated_triton_fp8",
+]
 _Attention = (
     TorchMultiHeadAttention
     | TritonMultiHeadAttention
@@ -149,8 +158,29 @@ _WAN_CONFIG = _AttentionBenchmarkConfig(
 def _make_cache(
     config: _AttentionBenchmarkConfig,
     device: torch.device,
+    use_fp8: bool = False,
 ) -> BlockKVCache:
     """Build a rolling cache for one benchmark case."""
+    if use_fp8:
+        return FP8BlockKVCache(
+            k_shape=(
+                _BATCH_SIZE,
+                config.window_size,
+                config.n_heads,
+                config.head_dim,
+            ),
+            v_shape=(
+                _BATCH_SIZE,
+                config.window_size,
+                config.n_heads,
+                config.head_dim,
+            ),
+            seq_dim=1,
+            chunk_size=config.chunk_size,
+            window_size=config.window_size,
+            sink_size=_SINK_SIZE,
+            device=device,
+        )
     return BlockKVCache(
         k_shape=(
             _BATCH_SIZE,
@@ -214,6 +244,7 @@ def _make_attention(
             qkv_bias=False,
             output_bias=False,
             qk_norm_scope=QKNormScope.HEAD,
+            use_fp8=implementation == "accelerated_triton_fp8",
             rope_interleaved=False,
         )
         triton_attention.load_state_dict(torch_attention.state_dict())
@@ -251,6 +282,7 @@ def _make_attention(
         qkv_bias=True,
         output_bias=True,
         qk_norm_scope=QKNormScope.INNER,
+        use_fp8=implementation == "accelerated_triton_fp8",
         rope_interleaved=True,
     )
     triton_attention.load_state_dict(torch_attention.state_dict())
@@ -306,7 +338,11 @@ def _benchmark_multi_head_attention(
     rope_freqs = [
         rope.shift_t(chunk_idx) for chunk_idx in range(benchmark_chunk_idx + 1)
     ]
-    cache = _make_cache(config, device)
+    cache = _make_cache(
+        config,
+        device,
+        use_fp8=implementation == "accelerated_triton_fp8",
+    )
 
     # Fill the local window before timing so every measured call uses the same
     # full-context shape and overwrites the final cache slot in place.
@@ -340,7 +376,16 @@ def _benchmark_multi_head_attention(
                 "recipe": "cudnn",
                 "accelerated_torch": "auto_sdpa",
                 "accelerated_triton": "triton_tma_flash_attention_2",
+                "accelerated_triton_fp8": "triton_tma_flash_attention_2_fp8",
             }[implementation],
+            "projection_backend": (
+                "row_scaled_fp8_fused_qkv_output"
+                if implementation == "accelerated_triton_fp8"
+                else "native_fused_qkv"
+                if implementation == "accelerated_triton"
+                else "separate_qkv"
+            ),
+            "cache_dtype": str(cache._k.dtype),
             "cache_state": "full_window",
             "cache_prefill_chunks": config.window_chunks,
             "benchmark_chunk_idx": benchmark_chunk_idx,
@@ -449,4 +494,26 @@ def test_wan_accelerated_triton_multi_head_attention_benchmark(
         benchmark,
         config=_WAN_CONFIG,
         implementation="accelerated_triton",
+    )
+
+
+def test_cosmos_accelerated_triton_fp8_multi_head_attention_benchmark(
+    benchmark: BenchmarkFixture,
+) -> None:
+    """Benchmark end-to-end FP8 Triton attention configured for Cosmos."""
+    _benchmark_multi_head_attention(
+        benchmark,
+        config=_COSMOS_CONFIG,
+        implementation="accelerated_triton_fp8",
+    )
+
+
+def test_wan_accelerated_triton_fp8_multi_head_attention_benchmark(
+    benchmark: BenchmarkFixture,
+) -> None:
+    """Benchmark end-to-end FP8 Triton attention configured for Wan."""
+    _benchmark_multi_head_attention(
+        benchmark,
+        config=_WAN_CONFIG,
+        implementation="accelerated_triton_fp8",
     )
