@@ -31,6 +31,7 @@ from flashdreams.core.distributed.context_parallel import (
 from flashdreams.infra.config import InstantiateConfig
 
 from .modules import (
+    AttentionBackend,
     Block,
     BlockCache,
     FinalLayer,
@@ -119,6 +120,9 @@ class CosmosDiTNetworkConfig(InstantiateConfig):
     cp_method: Literal["ring", "ulysses"] = "ring"
     """Context-parallel attention method for transformer attention ops."""
 
+    attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS
+    """Attention implementation used by every DiT block."""
+
     view_condition_dim: int = 16
     """Embedding dim for the per-view conditioning vector."""
 
@@ -177,6 +181,7 @@ class CosmosDiTNetwork(nn.Module):
                     adaln_lora_dim=self.config.adaln_lora_dim,
                     enable_cross_view_attn=self.config.enable_cross_view_attn,
                     cp_method=self.config.cp_method,
+                    attention_backend=self.config.attention_backend,
                 )
                 for _ in range(self.config.num_blocks)
             ]

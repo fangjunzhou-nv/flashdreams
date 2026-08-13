@@ -36,10 +36,14 @@ from omnidreams.transformer import CosmosTransformer, CosmosTransformerConfig
 from omnidreams.vae_native import OmnidreamsWanVAEEncoderConfig
 from pytest_benchmark.fixture import BenchmarkFixture
 
-from flashdreams.core.attention import ContextParallelAttention
 from flashdreams.infra.config import derive_config
 from flashdreams.infra.diffusion.scheduler.fm import FlowMatchSchedulerConfig
 from flashdreams.recipes.taehv import TeahvVAEDecoderConfig
+from integrations.omnidreams.benchmarks.cases import (
+    PIPELINE_CASES,
+    AttentionBenchmarkCase,
+    skip_unsupported_device,
+)
 
 pytestmark = pytest.mark.manual
 
@@ -58,42 +62,38 @@ _NATIVE_ATTENTION_BACKEND = "cudnn"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-def test_full_pipeline_generate_benchmark(benchmark: BenchmarkFixture) -> None:
-    """Benchmark PyTorch DiT pipeline generation at steady state."""
-    _run_full_pipeline_benchmark(benchmark, native_dit=False, stage="generate")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-def test_full_pipeline_finalize_benchmark(benchmark: BenchmarkFixture) -> None:
-    """Benchmark PyTorch DiT pipeline finalization at steady state."""
-    _run_full_pipeline_benchmark(benchmark, native_dit=False, stage="finalize")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-def test_native_cuda_full_pipeline_generate_benchmark(
+@pytest.mark.parametrize("case", PIPELINE_CASES, ids=lambda case: case.pytest_id)
+def test_full_pipeline_generate_benchmark(
     benchmark: BenchmarkFixture,
+    case: AttentionBenchmarkCase,
 ) -> None:
-    """Benchmark native CUDA FP8-KV-cache pipeline generation."""
-    if not hasattr(torch, "float8_e4m3fn"):
-        pytest.skip("OmniDreams native DiT benchmark requires float8_e4m3fn")
-    _run_full_pipeline_benchmark(benchmark, native_dit=True, stage="generate")
+    """Benchmark pipeline generation for one DiT implementation."""
+    _run_full_pipeline_benchmark(
+        benchmark,
+        case=case,
+        stage="generate",
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-def test_native_cuda_full_pipeline_finalize_benchmark(
+@pytest.mark.parametrize("case", PIPELINE_CASES, ids=lambda case: case.pytest_id)
+def test_full_pipeline_finalize_benchmark(
     benchmark: BenchmarkFixture,
+    case: AttentionBenchmarkCase,
 ) -> None:
-    """Benchmark native CUDA FP8-KV-cache pipeline finalization."""
-    if not hasattr(torch, "float8_e4m3fn"):
-        pytest.skip("OmniDreams native DiT benchmark requires float8_e4m3fn")
-    _run_full_pipeline_benchmark(benchmark, native_dit=True, stage="finalize")
+    """Benchmark pipeline finalization for one DiT implementation."""
+    _run_full_pipeline_benchmark(
+        benchmark,
+        case=case,
+        stage="finalize",
+    )
 
 
 @torch.inference_mode()
 def _run_full_pipeline_benchmark(
     benchmark: BenchmarkFixture,
     *,
-    native_dit: bool,
+    case: AttentionBenchmarkCase,
     stage: Literal["generate", "finalize"],
 ) -> None:
     """Run one DiT backend and pipeline-stage benchmark variant."""
@@ -103,6 +103,11 @@ def _run_full_pipeline_benchmark(
     device = torch.device("cuda")
     torch.manual_seed(_SEED)
     torch.backends.cudnn.benchmark = True
+    native_dit = case.native_dit
+    if native_dit and not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("OmniDreams native DiT benchmark requires float8_e4m3fn")
+    attention_backend = case.attention_backend
+    skip_unsupported_device(case, device)
 
     # One-shot prompt and first-frame encoders run before streaming begins in
     # production. Replace them with correctly shaped precomputed embeddings so
@@ -113,11 +118,7 @@ def _run_full_pipeline_benchmark(
     native_attention = _NATIVE_ATTENTION_BACKEND if native_dit else "auto"
     pipeline_config = derive_config(
         SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
-        name=(
-            "omnidreams-full-pipeline-native-fp8-benchmark"
-            if native_dit
-            else "omnidreams-full-pipeline-pytorch-benchmark"
-        ),
+        name=f"omnidreams-full-pipeline-{case.pytest_id}-benchmark",
         text_encoder=None,
         image_encoder=None,
         synthetic_text_max_length=_TEXT_TOKENS,
@@ -126,6 +127,7 @@ def _run_full_pipeline_benchmark(
             "seed": _SEED,
             "transformer": {
                 "compile_network": not native_dit,
+                "network": {"attention_backend": attention_backend},
                 # Keep cache finalization identical across the comparison;
                 # this performs the final context-noise DiT update before
                 # committing each autoregressive cache position.
@@ -144,16 +146,6 @@ def _run_full_pipeline_benchmark(
 
     parameter_count = sum(parameter.numel() for parameter in pipeline.parameters())
 
-    # Preserve the production PyTorch cuDNN SDPA backend. The native case
-    # bypasses these modules and selects its FP8 cuDNN path in the executor.
-    attention_modules = [
-        module
-        for module in pipeline.modules()
-        if isinstance(module, ContextParallelAttention)
-    ]
-    assert attention_modules
-    pytorch_attention_backends = {attention.backend for attention in attention_modules}
-    assert pytorch_attention_backends == {"cudnn"}
     diffusion_config = pipeline_config.diffusion_model
     transformer_config = diffusion_config.transformer
     scheduler_config = diffusion_config.scheduler
@@ -164,6 +156,7 @@ def _run_full_pipeline_benchmark(
     assert isinstance(encoder_config, OmnidreamsWanVAEEncoderConfig)
     assert isinstance(decoder_config, TeahvVAEDecoderConfig)
     network_config = transformer_config.network
+    assert network_config.attention_backend is attention_backend
 
     transformer = pipeline.diffusion_model.transformer
     assert isinstance(transformer, CosmosTransformer)
@@ -285,6 +278,10 @@ def _run_full_pipeline_benchmark(
             assert all(cache_tensor.dtype == torch.uint8 for cache_tensor in fp8_caches)
         dit_execution = "native_cuda"
         dit_attention_backend = native_executor._attention_backend
+        dit_self_attention_backend = native_executor._attention_backend
+        dit_cross_attention_backend = native_executor._attention_backend
+        dit_self_kv_cache_dtype = "float8_e4m3fn (uint8 native storage)"
+        dit_cross_kv_cache_dtype = "float8_e4m3fn (uint8 native storage)"
         dit_kv_cache_dtype = "float8_e4m3fn (uint8 native storage)"
         native_extension = native_selection.reason
         compiler_cache_state = (
@@ -295,8 +292,15 @@ def _run_full_pipeline_benchmark(
         assert native_selection is None
         assert native_executor is None
         dit_execution = "pytorch"
-        dit_attention_backend = pytorch_attention_backends.pop()
-        dit_kv_cache_dtype = str(dtype)
+        dit_attention_backend = case.self_attention_operator
+        dit_self_attention_backend = case.self_attention_operator
+        dit_cross_attention_backend = case.cross_attention_operator
+        first_block_cache = cache.transformer_cache.network_cache.block_caches[0]
+        dit_self_kv_cache_dtype = str(first_block_cache.self_attn.dtype)
+        dit_cross_kv_cache_dtype = str(first_block_cache.cross_attn.dtype)
+        dit_kv_cache_dtype = (
+            f"self={dit_self_kv_cache_dtype}, cross={dit_cross_kv_cache_dtype}"
+        )
         native_extension = None
         compiler_cache_state = (
             "host-dependent; compile, CUDA graph capture, and autotune excluded "
@@ -340,9 +344,14 @@ def _run_full_pipeline_benchmark(
             "hdmap_encoder_checkpoint": encoder_config.checkpoint_path,
             "decoder_checkpoint": decoder_config.checkpoint_path,
             "dtype": str(dtype),
+            "implementation": case.implementation,
             "dit_execution": dit_execution,
             "dit_attention_backend": dit_attention_backend,
+            "dit_self_attention_backend": dit_self_attention_backend,
+            "dit_cross_attention_backend": dit_cross_attention_backend,
             "dit_kv_cache_dtype": dit_kv_cache_dtype,
+            "dit_self_attention_kv_cache_dtype": dit_self_kv_cache_dtype,
+            "dit_cross_attention_kv_cache_dtype": dit_cross_kv_cache_dtype,
             "native_dit_acceleration": transformer_config.native_dit_acceleration,
             "native_dit_backend": transformer_config.native_dit_backend,
             "native_dit_attention_backend": (

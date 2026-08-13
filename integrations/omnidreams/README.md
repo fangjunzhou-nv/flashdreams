@@ -262,18 +262,23 @@ uv run --package flashdreams-omnidreams --group test pytest \
 To run a narrower benchmark, replace the benchmark directory in that command
 with one of these files:
 
-- `test_modules.py` benchmarks individual DiT blocks, attention layers, and the
-  MLP.
-- `test_network.py` benchmarks one steady-state DiT evaluation through the
-  production transformer execution modes: compiled cuDNN SDPA plus CUDA graph
-  replay for PyTorch, and the native FP8 cuDNN backend plus CUDA graph replay.
-  It uses production tensor geometry with random weights, so checkpoint loading
-  and startup are excluded.
-- `test_pipeline.py` benchmarks the steady-state full generation pipeline at
-  the runner's production 704x1280 resolution and scheduler configuration. It
-  preserves the production PyTorch cuDNN SDPA backend; attention alternatives
-  must be benchmarked as explicitly labelled variants rather than silently
-  replacing the baseline.
+- `test_modules.py` benchmarks the DiT block, self-attention, and
+  cross-attention with the `omnidreams_torch` and `triton`
+  implementations. The backend-independent MLP is benchmarked once.
+- `test_network.py` benchmarks one steady-state DiT evaluation with the
+  `omnidreams_torch`, `triton`, and native `cuda`
+  implementations. It uses production tensor geometry with random weights, so
+  checkpoint loading and startup are excluded.
+- `test_pipeline.py` benchmarks steady-state generation and finalization with
+  the `omnidreams_torch`, `triton`, and native `cuda`
+  implementations at the runner's production 704x1280 resolution and scheduler
+  configuration.
+
+The Triton implementation uses row-scaled FP8 projections and an E4M3 cache
+for self-attention; text and cross-view attention remain BF16.
+
+The Triton cases require an NVIDIA GPU with compute capability 9.0 or newer;
+they skip cleanly on older GPUs.
 
 Keep `--group test` on both commands. A plain
 `uv sync --project integrations/omnidreams` installs only the integration's

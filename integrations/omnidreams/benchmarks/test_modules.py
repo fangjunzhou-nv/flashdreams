@@ -27,15 +27,19 @@ from __future__ import annotations
 import pytest
 import torch
 from omnidreams.transformer.impl.modules import (
+    AttentionBackend,
     Block,
-    CrossAttention,
     GPT2FeedForward,
-    SelfAttention,
 )
 from omnidreams.transformer.impl.network import CosmosDiTNetworkConfig
 from pytest_benchmark.fixture import BenchmarkFixture
 
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
+from integrations.omnidreams.benchmarks.cases import (
+    PYTORCH_ATTENTION_CASES,
+    AttentionBenchmarkCase,
+    skip_unsupported_device,
+)
 
 pytestmark = pytest.mark.manual
 
@@ -56,30 +60,56 @@ _BENCHMARK_ROUNDS = 20
 _SEED = 0
 
 
+def _make_block(
+    config: CosmosDiTNetworkConfig,
+    case: AttentionBenchmarkCase,
+) -> Block:
+    """Build a backend-selected block with shared random weights."""
+
+    def make(backend: AttentionBackend) -> Block:
+        # Keep this constructor in lockstep with CosmosDiTNetwork.__init__.
+        return Block(
+            x_dim=config.model_channels,
+            context_dim=config.crossattn_emb_channels,
+            num_heads=config.num_heads,
+            mlp_ratio=config.mlp_ratio,
+            use_adaln_lora=config.use_adaln_lora,
+            adaln_lora_dim=config.adaln_lora_dim,
+            enable_cross_view_attn=config.enable_cross_view_attn,
+            cp_method=config.cp_method,
+            attention_backend=backend,
+        )
+
+    torch.manual_seed(_SEED)
+    omnidreams_block = make(AttentionBackend.OMNIDREAMS)
+    if case.attention_backend is AttentionBackend.OMNIDREAMS:
+        return omnidreams_block
+
+    block = make(case.attention_backend)
+    block.load_state_dict(omnidreams_block.state_dict(), strict=True)
+    return block
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
+@pytest.mark.parametrize(
+    "case", PYTORCH_ATTENTION_CASES, ids=lambda case: case.pytest_id
+)
 @torch.inference_mode()
-def test_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
+def test_dit_block_benchmark(
+    benchmark: BenchmarkFixture,
+    case: AttentionBenchmarkCase,
+) -> None:
     """Benchmark a production-configured DiT block with a full KV window."""
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Omnidreams DiT block benchmark requires bfloat16 support")
 
     device = torch.device("cuda")
+    skip_unsupported_device(case, device)
     dtype = torch.bfloat16
-    torch.manual_seed(_SEED)
     config = CosmosDiTNetworkConfig()
-
-    # Keep this constructor in lockstep with CosmosDiTNetwork.__init__.
-    block = Block(
-        x_dim=config.model_channels,
-        context_dim=config.crossattn_emb_channels,
-        num_heads=config.num_heads,
-        mlp_ratio=config.mlp_ratio,
-        use_adaln_lora=config.use_adaln_lora,
-        adaln_lora_dim=config.adaln_lora_dim,
-        enable_cross_view_attn=config.enable_cross_view_attn,
-        cp_method=config.cp_method,
-    ).to(device=device, dtype=dtype)
+    block = _make_block(config, case).to(device=device, dtype=dtype)
     block.eval()
+    generator = torch.Generator(device=device).manual_seed(_SEED)
 
     patch_t = _CHUNK_SIZE_T // config.patch_temporal
     patch_h = _LATENT_HEIGHT // config.patch_spatial
@@ -97,12 +127,21 @@ def test_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
             tokens_per_frame,
             config.model_channels,
         ),
+        generator=generator,
         device=device,
         dtype=dtype,
     )
-    emb = torch.randn((_BATCH_SIZE, config.model_channels), device=device, dtype=dtype)
+    emb = torch.randn(
+        (_BATCH_SIZE, config.model_channels),
+        generator=generator,
+        device=device,
+        dtype=dtype,
+    )
     adaln_lora = torch.randn(
-        (_BATCH_SIZE, 3 * config.model_channels), device=device, dtype=dtype
+        (_BATCH_SIZE, 3 * config.model_channels),
+        generator=generator,
+        device=device,
+        dtype=dtype,
     )
     context = torch.randn(
         (
@@ -111,6 +150,7 @@ def test_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
             _TEXT_TOKENS,
             config.crossattn_emb_channels,
         ),
+        generator=generator,
         device=device,
         dtype=dtype,
     )
@@ -162,12 +202,26 @@ def test_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
             "text_tokens": _TEXT_TOKENS,
             "model_channels": config.model_channels,
             "num_heads": config.num_heads,
+            "parameter_count": sum(
+                parameter.numel() for parameter in block.parameters()
+            ),
+            "checkpoint": "random_init_shared_weights",
             "dtype": str(dtype),
-            "attention_backend": "cudnn",
+            "implementation": case.implementation,
+            "attention_backend": case.self_attention_operator,
+            "self_attention_backend": case.self_attention_operator,
+            "cross_attention_backend": case.cross_attention_operator,
+            "self_attention_cache_dtype": str(cache.self_attn.dtype),
+            "cross_attention_cache_dtype": str(cache.cross_attn.dtype),
+            "cache_state": "full_window_static_context",
+            "cache_prefill_chunks": steady_chunk_idx + 1,
+            "benchmark_chunk_idx": steady_chunk_idx,
             "gpu": torch.cuda.get_device_name(device),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
             "cudnn": torch.backends.cudnn.version(),
+            "warmup_rounds": _WARMUP_ROUNDS,
+            "benchmark_rounds": _BENCHMARK_ROUNDS,
             "seed": _SEED,
         }
     )
@@ -189,24 +243,25 @@ def test_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
+@pytest.mark.parametrize(
+    "case", PYTORCH_ATTENTION_CASES, ids=lambda case: case.pytest_id
+)
 @torch.inference_mode()
-def test_self_attention_benchmark(benchmark: BenchmarkFixture) -> None:
+def test_self_attention_benchmark(
+    benchmark: BenchmarkFixture,
+    case: AttentionBenchmarkCase,
+) -> None:
     """Benchmark self-attention against a full production KV window."""
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Omnidreams self-attention benchmark requires bfloat16 support")
 
     device = torch.device("cuda")
+    skip_unsupported_device(case, device)
     dtype = torch.bfloat16
-    torch.manual_seed(_SEED)
     config = CosmosDiTNetworkConfig()
-    attention = SelfAttention(
-        query_dim=config.model_channels,
-        context_dim=None,
-        n_heads=config.num_heads,
-        head_dim=config.model_channels // config.num_heads,
-        cp_method=config.cp_method,
-    ).to(device=device, dtype=dtype)
+    attention = _make_block(config, case).self_attn.to(device=device, dtype=dtype)
     attention.eval()
+    generator = torch.Generator(device=device).manual_seed(_SEED)
 
     patch_t = _CHUNK_SIZE_T // config.patch_temporal
     patch_h = _LATENT_HEIGHT // config.patch_spatial
@@ -221,6 +276,7 @@ def test_self_attention_benchmark(benchmark: BenchmarkFixture) -> None:
             chunk_tokens,
             config.model_channels,
         ),
+        generator=generator,
         device=device,
         dtype=dtype,
     )
@@ -264,14 +320,20 @@ def test_self_attention_benchmark(benchmark: BenchmarkFixture) -> None:
             "parameter_count": sum(
                 parameter.numel() for parameter in attention.parameters()
             ),
-            "checkpoint": "random_init",
+            "checkpoint": "random_init_shared_weights",
             "dtype": str(dtype),
-            "attention_backend": "cudnn",
+            "implementation": case.implementation,
+            "attention_backend": case.self_attention_operator,
+            "cache_dtype": str(cache.dtype),
             "cache_state": "full_window",
+            "cache_prefill_chunks": steady_chunk_idx + 1,
+            "benchmark_chunk_idx": steady_chunk_idx,
             "gpu": torch.cuda.get_device_name(device),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
             "cudnn": torch.backends.cudnn.version(),
+            "warmup_rounds": _WARMUP_ROUNDS,
+            "benchmark_rounds": _BENCHMARK_ROUNDS,
             "seed": _SEED,
         }
     )
@@ -302,24 +364,25 @@ def test_self_attention_benchmark(benchmark: BenchmarkFixture) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
+@pytest.mark.parametrize(
+    "case", PYTORCH_ATTENTION_CASES, ids=lambda case: case.pytest_id
+)
 @torch.inference_mode()
-def test_cross_attention_benchmark(benchmark: BenchmarkFixture) -> None:
+def test_cross_attention_benchmark(
+    benchmark: BenchmarkFixture,
+    case: AttentionBenchmarkCase,
+) -> None:
     """Benchmark cross-attention against the cached production text context."""
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Omnidreams cross-attention benchmark requires bfloat16 support")
 
     device = torch.device("cuda")
+    skip_unsupported_device(case, device)
     dtype = torch.bfloat16
-    torch.manual_seed(_SEED)
     config = CosmosDiTNetworkConfig()
-    attention = CrossAttention(
-        query_dim=config.model_channels,
-        context_dim=config.crossattn_emb_channels,
-        n_heads=config.num_heads,
-        head_dim=config.model_channels // config.num_heads,
-        cp_method=config.cp_method,
-    ).to(device=device, dtype=dtype)
+    attention = _make_block(config, case).cross_attn.to(device=device, dtype=dtype)
     attention.eval()
+    generator = torch.Generator(device=device).manual_seed(_SEED)
 
     patch_t = _CHUNK_SIZE_T // config.patch_temporal
     patch_h = _LATENT_HEIGHT // config.patch_spatial
@@ -332,6 +395,7 @@ def test_cross_attention_benchmark(benchmark: BenchmarkFixture) -> None:
             chunk_tokens,
             config.model_channels,
         ),
+        generator=generator,
         device=device,
         dtype=dtype,
     )
@@ -342,6 +406,7 @@ def test_cross_attention_benchmark(benchmark: BenchmarkFixture) -> None:
             _TEXT_TOKENS,
             config.crossattn_emb_channels,
         ),
+        generator=generator,
         device=device,
         dtype=dtype,
     )
@@ -363,14 +428,18 @@ def test_cross_attention_benchmark(benchmark: BenchmarkFixture) -> None:
             "parameter_count": sum(
                 parameter.numel() for parameter in attention.parameters()
             ),
-            "checkpoint": "random_init",
+            "checkpoint": "random_init_shared_weights",
             "dtype": str(dtype),
-            "attention_backend": "cudnn",
+            "implementation": case.implementation,
+            "attention_backend": case.cross_attention_operator,
+            "cache_dtype": str(cache.dtype),
             "cache_state": "static_context",
             "gpu": torch.cuda.get_device_name(device),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
             "cudnn": torch.backends.cudnn.version(),
+            "warmup_rounds": _WARMUP_ROUNDS,
+            "benchmark_rounds": _BENCHMARK_ROUNDS,
             "seed": _SEED,
         }
     )
