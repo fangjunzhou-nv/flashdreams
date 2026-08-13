@@ -20,7 +20,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_triton import (
+    SDPABackend,
+    TritonMultiHeadAttention,
+)
 from flashdreams.core.attention import RotaryPositionEmbedding3D
 from flashdreams.recipes.wan.transformer.impl.modules import (
     AttentionBackend,
@@ -42,8 +45,12 @@ def tma_device() -> torch.device:
     return device
 
 
+@pytest.mark.parametrize(
+    "sdpa_backend", tuple(SDPABackend), ids=lambda backend: backend.value
+)
 def test_triton_self_attention_matches_default_through_window_roll(
     tma_device: torch.device,
+    sdpa_backend: SDPABackend,
 ) -> None:
     """Compare Triton with Wan self-attention through cache fill and roll."""
     torch.manual_seed(7)
@@ -57,6 +64,7 @@ def test_triton_self_attention_matches_default_through_window_roll(
         ffn_dim=512,
         num_heads=2,
         attention_backend=AttentionBackend.TRITON,
+        sdpa_backend=sdpa_backend,
     )
     triton_block.load_state_dict(default_block.state_dict(), strict=True)
 
@@ -70,6 +78,7 @@ def test_triton_self_attention_matches_default_through_window_roll(
     assert isinstance(reference, SelfAttention)
     assert isinstance(actual_attention, TritonMultiHeadAttention)
     assert actual_attention.use_fp8 is True
+    assert actual_attention.sdpa_backend is sdpa_backend
 
     batch_size = 1
     len_t, len_h, len_w = 1, 1, 16
@@ -90,6 +99,9 @@ def test_triton_self_attention_matches_default_through_window_roll(
         sink_size=0,
         device=tma_device,
         dtype=torch.bfloat16,
+    )
+    assert actual_cache.dtype is (
+        torch.float8_e4m3fn if sdpa_backend is SDPABackend.TRITON else torch.bfloat16
     )
     rope = RotaryPositionEmbedding3D(
         head_dim=128,

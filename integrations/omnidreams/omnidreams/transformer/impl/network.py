@@ -24,6 +24,7 @@ from einops import rearrange
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
+from flashdreams.accelerated.multi_head_attention_triton import SDPABackend
 from flashdreams.core.distributed.context_parallel import (
     cat_outputs_cp,
     split_inputs_cp,
@@ -123,6 +124,9 @@ class CosmosDiTNetworkConfig(InstantiateConfig):
     attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS
     """Attention implementation used by every DiT block."""
 
+    sdpa_backend: SDPABackend = SDPABackend.CUDNN
+    """SDPA implementation used by accelerated self-attention."""
+
     view_condition_dim: int = 16
     """Embedding dim for the per-view conditioning vector."""
 
@@ -136,6 +140,7 @@ class CosmosDiTNetwork(nn.Module):
     def __init__(self, config: CosmosDiTNetworkConfig):
         super().__init__()
         self.config = config
+        self.sdpa_backend = SDPABackend(config.sdpa_backend)
 
         # add 1 for the condition mask
         in_channels = config.in_channels + 1
@@ -182,6 +187,7 @@ class CosmosDiTNetwork(nn.Module):
                     enable_cross_view_attn=self.config.enable_cross_view_attn,
                     cp_method=self.config.cp_method,
                     attention_backend=self.config.attention_backend,
+                    sdpa_backend=self.sdpa_backend,
                 )
                 for _ in range(self.config.num_blocks)
             ]

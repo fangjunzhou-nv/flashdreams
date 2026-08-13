@@ -78,6 +78,7 @@ def _make_block(
             enable_cross_view_attn=config.enable_cross_view_attn,
             cp_method=config.cp_method,
             attention_backend=backend,
+            sdpa_backend=config.sdpa_backend,
         )
 
     torch.manual_seed(_SEED)

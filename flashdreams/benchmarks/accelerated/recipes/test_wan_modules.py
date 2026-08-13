@@ -92,6 +92,7 @@ def _make_block(
             apply_rope_before_kvcache=config.apply_rope_before_kvcache,
             cp_method=config.cp_method,
             attention_backend=selected_backend,
+            sdpa_backend=config.sdpa_backend,
         )
 
     torch.manual_seed(_SEED)
@@ -113,7 +114,7 @@ def _self_attention_operator(backend: AttentionBackend) -> str:
     """Return the concrete self-attention operator name for a backend."""
     if backend is AttentionBackend.WAN:
         return "cudnn"
-    return "triton_tma_flash_attention_2_fp8"
+    return "torch_cudnn_sdpa"
 
 
 @pytest.mark.parametrize(

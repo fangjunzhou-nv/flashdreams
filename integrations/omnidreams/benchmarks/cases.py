@@ -62,7 +62,7 @@ OMNIDREAMS_TORCH_CASE = AttentionBenchmarkCase(
 TRITON_CASE = AttentionBenchmarkCase(
     implementation="triton",
     attention_backend=AttentionBackend.TRITON,
-    self_attention_operator="triton_tma_flash_attention_2_fp8",
+    self_attention_operator="torch_cudnn_sdpa",
     cross_attention_operator="triton_tma_flash_attention_2",
     minimum_compute_capability=(9, 0),
 )

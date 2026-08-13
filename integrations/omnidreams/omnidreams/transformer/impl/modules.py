@@ -29,7 +29,10 @@ from torch.distributed import ProcessGroup
 
 from flashdreams.accelerated.multi_head_attention import QKNormScope
 from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
-from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_triton import (
+    SDPABackend,
+    TritonMultiHeadAttention,
+)
 from flashdreams.accelerated.triton import flash_attention_2_tma
 from flashdreams.core.attention import BlockKVCache, ContextParallelAttention
 from flashdreams.core.attention.rope import apply_rope_freqs
@@ -42,7 +45,7 @@ class AttentionBackend(str, Enum):
     """Use the integration's context-parallel cuDNN attention."""
 
     TRITON = "triton"
-    """Use FP8 Triton self-attention and BF16 Triton cross-attention."""
+    """Use Triton-accelerated self- and cross-attention."""
 
 
 class GPT2FeedForward(nn.Module):
@@ -593,7 +596,7 @@ class _TritonCrossAttention(TorchMultiHeadAttention):
 
 
 class _TritonSelfAttention(TritonMultiHeadAttention):
-    """FP8 streaming self-attention adapted to the Omnidreams block contract."""
+    """Accelerated self-attention adapted to the Omnidreams contract."""
 
     def __init__(
         self,
@@ -602,8 +605,9 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
         n_heads: int = 8,
         head_dim: int = 64,
         cp_method: Literal["ring", "ulysses"] = "ring",
+        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
     ) -> None:
-        """Initialize bias-free, per-head-normalized FP8 Triton self-attention.
+        """Initialize bias-free, FP8-projected self-attention.
 
         Args:
             query_dim: Feature dimension of input and output tokens.
@@ -613,6 +617,7 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
             head_dim: Per-head feature dimension.
             cp_method: Ignored context-parallel method retained for constructor
                 compatibility with Omnidreams attention.
+            sdpa_backend: Scaled-dot-product attention implementation.
 
         Raises:
             ValueError: ``context_dim`` differs from ``query_dim``.
@@ -635,6 +640,7 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
             qk_norm_scope=QKNormScope.HEAD,
             rope_interleaved=False,
             use_fp8=True,
+            sdpa_backend=sdpa_backend,
         )
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None) -> None:
@@ -688,11 +694,13 @@ class Block(nn.Module):
         enable_cross_view_attn: bool = False,
         cp_method: Literal["ring", "ulysses"] = "ring",
         attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS,
+        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
     ) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.enable_cross_view_attn = enable_cross_view_attn
         self.attention_backend = AttentionBackend(attention_backend)
+        self.sdpa_backend = SDPABackend(sdpa_backend)
 
         # Self-attention
         self.layer_norm_self_attn = nn.LayerNorm(
@@ -725,6 +733,7 @@ class Block(nn.Module):
                 n_heads=num_heads,
                 head_dim=x_dim // num_heads,
                 cp_method=cp_method,
+                sdpa_backend=self.sdpa_backend,
             )
             self.cross_attn = _TritonCrossAttention(
                 query_dim=x_dim,

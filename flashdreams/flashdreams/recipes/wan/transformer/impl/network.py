@@ -26,6 +26,7 @@ from einops import rearrange
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
+from flashdreams.accelerated.multi_head_attention_triton import SDPABackend
 from flashdreams.core.distributed.context_parallel import (
     cat_outputs_cp,
     split_inputs_cp,
@@ -111,6 +112,8 @@ class WanDiTNetworkConfig(InstantiateConfig):
     """Context-parallel attention method for transformer attention ops."""
     attention_backend: AttentionBackend = AttentionBackend.WAN
     """Self-attention implementation used by every transformer block."""
+    sdpa_backend: SDPABackend = SDPABackend.CUDNN
+    """SDPA implementation used by accelerated self-attention."""
 
 
 @dataclass
@@ -179,6 +182,7 @@ class WanDiTNetwork(nn.Module):
         self.apply_rope_before_kvcache = config.apply_rope_before_kvcache
         self.cp_method = config.cp_method
         self.attention_backend = AttentionBackend(config.attention_backend)
+        self.sdpa_backend = SDPABackend(config.sdpa_backend)
 
         # Embedding layers
         in_dim = config.in_dim + 1 if self.concat_padding_mask else config.in_dim
@@ -235,6 +239,7 @@ class WanDiTNetwork(nn.Module):
             apply_rope_before_kvcache=self.apply_rope_before_kvcache,
             cp_method=self.cp_method,
             attention_backend=self.attention_backend,
+            sdpa_backend=self.sdpa_backend,
         )
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None = None) -> None:

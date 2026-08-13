@@ -94,7 +94,7 @@ def _self_attention_operator(backend: AttentionBackend) -> str:
     """Return the concrete self-attention operator name for a backend."""
     if backend is AttentionBackend.WAN:
         return "cudnn"
-    return "triton_tma_flash_attention_2_fp8"
+    return "torch_cudnn_sdpa"
 
 
 def _make_block(
@@ -114,6 +114,7 @@ def _make_block(
             eps=config.eps,
             cp_method=config.cp_method,
             attention_backend=selected_backend,
+            sdpa_backend=config.sdpa_backend,
         )
 
     # Allocate this 14B-sized block directly in BF16 on the target GPU. This

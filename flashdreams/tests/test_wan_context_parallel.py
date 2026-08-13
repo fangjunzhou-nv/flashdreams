@@ -8,6 +8,10 @@ from typing import Any, cast
 import pytest
 import torch
 
+from flashdreams.accelerated.multi_head_attention_triton import (
+    SDPABackend,
+    TritonMultiHeadAttention,
+)
 from flashdreams.core.attention.kvcache import BlockKVCache
 from flashdreams.recipes.wan.transformer.impl import modules as wan_modules
 from flashdreams.recipes.wan.transformer.impl.network import WanDiTNetworkConfig
@@ -161,6 +165,33 @@ def test_wan21_requires_tokens_divisible_by_cp_size(monkeypatch) -> None:
             width=2,
             text_embeddings=torch.zeros(1, 1, 1),
         )
+
+
+@pytest.mark.parametrize(
+    "sdpa_backend", tuple(SDPABackend), ids=lambda backend: backend.value
+)
+def test_wan_network_propagates_sdpa_backend(
+    sdpa_backend: SDPABackend,
+) -> None:
+    """Propagate the configured SDPA implementation through every DiT block."""
+    config = WanDiTNetworkConfig(
+        dim=64,
+        ffn_dim=128,
+        num_heads=4,
+        num_layers=1,
+        patch_embedding_type="linear",
+        attention_backend=wan_modules.AttentionBackend.TRITON,
+        sdpa_backend=sdpa_backend,
+    )
+
+    network = config.setup()
+    block = network.blocks[0]
+
+    assert config.sdpa_backend is sdpa_backend
+    assert network.sdpa_backend is sdpa_backend
+    assert block.sdpa_backend is sdpa_backend
+    assert isinstance(block.self_attn, TritonMultiHeadAttention)
+    assert block.self_attn.sdpa_backend is sdpa_backend
 
 
 def test_wan_patchify_unpatchify_round_trip_without_cp() -> None:

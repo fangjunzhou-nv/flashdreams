@@ -22,7 +22,10 @@ from omnidreams.transformer.impl.modules import AttentionBackend, Block
 from omnidreams.transformer.impl.network import CosmosDiTNetwork, CosmosDiTNetworkConfig
 
 from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
-from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_triton import (
+    SDPABackend,
+    TritonMultiHeadAttention,
+)
 
 pytestmark = pytest.mark.ci_cpu
 
@@ -36,8 +39,13 @@ def test_dit_attention_backend_defaults_to_omnidreams() -> None:
     assert isinstance(default_block.cross_attn, transformer_modules.CrossAttention)
 
 
-def test_network_config_selects_triton_attention() -> None:
-    """Select FP8 Triton self-, text cross-, and cross-view attention."""
+@pytest.mark.parametrize(
+    "sdpa_backend", tuple(SDPABackend), ids=lambda backend: backend.value
+)
+def test_network_config_selects_triton_attention(
+    sdpa_backend: SDPABackend,
+) -> None:
+    """Propagate the configured self-attention SDPA implementation."""
     config = CosmosDiTNetworkConfig(
         model_channels=16,
         num_blocks=1,
@@ -46,14 +54,19 @@ def test_network_config_selects_triton_attention() -> None:
         use_crossattn_projection=False,
         enable_cross_view_attn=True,
         attention_backend=AttentionBackend.TRITON,
+        sdpa_backend=sdpa_backend,
     )
 
     network = CosmosDiTNetwork(config)
     block = network.blocks[0]
 
+    assert config.sdpa_backend is sdpa_backend
+    assert network.sdpa_backend is sdpa_backend
+    assert block.sdpa_backend is sdpa_backend
     self_attention = block.self_attn
     assert isinstance(self_attention, TritonMultiHeadAttention)
     assert self_attention.use_fp8 is True
+    assert self_attention.sdpa_backend is sdpa_backend
     assert self_attention._fused_qkv_weight is not None
     assert self_attention._fused_qkv_weight.dtype == torch.float8_e4m3fn
     assert self_attention._output_weight_fp8 is not None
@@ -66,8 +79,10 @@ def test_network_config_selects_triton_attention() -> None:
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
     )
-    assert cache.dtype == torch.float8_e4m3fn
-    with pytest.raises(TypeError, match="FP8 attention requires"):
+    assert cache.dtype is (
+        torch.float8_e4m3fn if sdpa_backend is SDPABackend.TRITON else torch.bfloat16
+    )
+    with pytest.raises(TypeError, match="FP8 projections require"):
         self_attention.initialize_cache(
             batch_size=1,
             chunk_size=2,

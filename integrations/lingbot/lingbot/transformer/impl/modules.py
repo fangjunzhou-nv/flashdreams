@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from flashdreams.accelerated.multi_head_attention_triton import SDPABackend
 from flashdreams.recipes.wan.transformer.impl.modules import (
     AttentionBackend,
     Block,
@@ -42,6 +43,7 @@ class CamCtrlBlock(Block):
         eps: float = 1e-6,
         cp_method: Literal["ring", "ulysses"] = "ring",
         attention_backend: AttentionBackend = AttentionBackend.TRITON,
+        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
     ) -> None:
         super().__init__(
             dim=dim,
@@ -51,6 +53,7 @@ class CamCtrlBlock(Block):
             eps=eps,
             cp_method=cp_method,
             attention_backend=attention_backend,
+            sdpa_backend=sdpa_backend,
         )
         self.cam_injector_layer1 = nn.Linear(dim, dim)
         self.cam_injector_layer2 = nn.Linear(dim, dim)

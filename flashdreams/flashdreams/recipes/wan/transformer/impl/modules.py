@@ -28,7 +28,10 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 
 from flashdreams.accelerated.multi_head_attention import QKNormScope
-from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_triton import (
+    SDPABackend,
+    TritonMultiHeadAttention,
+)
 from flashdreams.core.attention import (
     BlockKVCache,
     ContextParallelAttention,
@@ -44,7 +47,7 @@ class AttentionBackend(str, Enum):
     """Use Wan's context-parallel attention implementation."""
 
     TRITON = "triton"
-    """Use FP8 Triton streaming self-attention."""
+    """Use FP8-projected Triton preprocessing with configurable SDPA."""
 
 
 def sinusoidal_embedding_1d(dim: int, position: Tensor) -> Tensor:
@@ -400,7 +403,7 @@ class SelfAttention(MultiHeadAttention):
 
 
 class _TritonSelfAttention(TritonMultiHeadAttention):
-    """FP8 Triton self-attention adapted to Wan's checkpoint contract."""
+    """Accelerated self-attention adapted to Wan's checkpoint contract."""
 
     _TRITON_TO_WAN_MODULE = {
         "q_proj": "q",
@@ -421,8 +424,9 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
         eps: float = 1e-6,
         apply_rope_before_kvcache: bool = True,
         cp_method: Literal["ring", "ulysses"] = "ring",
+        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
     ) -> None:
-        """Initialize Triton attention with Wan projection and RoPE policies.
+        """Initialize accelerated attention with Wan projection and RoPE policies.
 
         Args:
             query_dim: Feature dimension of input and output tokens.
@@ -434,6 +438,7 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
             apply_rope_before_kvcache: Whether keys receive RoPE before cache writes.
                 Triton requires ``True``.
             cp_method: Context-parallel method retained for constructor compatibility.
+            sdpa_backend: Scaled-dot-product attention implementation.
 
         Raises:
             ValueError: ``context_dim`` differs from ``query_dim`` or cache-relative
@@ -462,6 +467,7 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
             qk_norm_scope=QKNormScope.INNER,
             rope_interleaved=True,
             use_fp8=True,
+            sdpa_backend=sdpa_backend,
         )
 
         # Register only Wan's checkpoint names; inherited Triton methods keep
@@ -623,6 +629,7 @@ class Block(nn.Module):
         apply_rope_before_kvcache: bool = True,
         cp_method: Literal["ring", "ulysses"] = "ring",
         attention_backend: AttentionBackend = AttentionBackend.WAN,
+        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -631,6 +638,7 @@ class Block(nn.Module):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
         self.attention_backend = AttentionBackend(attention_backend)
+        self.sdpa_backend = SDPABackend(sdpa_backend)
 
         # Core submodules
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -651,6 +659,7 @@ class Block(nn.Module):
                 eps=eps,
                 apply_rope_before_kvcache=apply_rope_before_kvcache,
                 cp_method=cp_method,
+                sdpa_backend=self.sdpa_backend,
             )
         self.norm3 = (
             nn.LayerNorm(dim, eps, elementwise_affine=True)
