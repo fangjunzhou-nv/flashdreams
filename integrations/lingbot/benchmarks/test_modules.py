@@ -13,7 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Microbenchmark for the LingBot-owned camera-control DiT block."""
+"""Microbenchmark for the LingBot-owned camera-control DiT block.
+
+Run both attention backends with ``uv run --package flashdreams-lingbot
+--group test pytest integrations/lingbot/benchmarks/test_modules.py
+-p no:manual_marker -m manual --benchmark-only``.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ from pytest_benchmark.fixture import BenchmarkFixture
 
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from flashdreams.core.distributed import init as init_distributed
+from flashdreams.recipes.wan.transformer.impl.modules import AttentionBackend
 
 pytestmark = pytest.mark.manual
 
@@ -65,22 +71,50 @@ def _synchronize_ranks() -> None:
         dist.barrier()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-@torch.inference_mode()
-def test_camctrl_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
-    """Benchmark the CLI-resolution LingBot camera-control DiT block."""
-    device = _benchmark_device()
-    if not torch.cuda.is_bf16_supported():
-        pytest.skip("LingBot DiT block benchmark requires bfloat16 support")
+def _skip_unsupported_backend(
+    backend: AttentionBackend,
+    device: torch.device,
+    context_parallel_size: int,
+) -> None:
+    """Skip backend and hardware combinations unsupported by production code."""
+    if backend is not AttentionBackend.TRITON:
+        return
+    if torch.cuda.get_device_capability(device) < (9, 0):
+        pytest.skip("Triton attention requires compute capability 9.0 or newer")
+    if context_parallel_size > 1:
+        pytest.skip("Triton attention does not support context parallelism")
 
-    dtype = torch.bfloat16
-    torch.manual_seed(_SEED)
-    config = LingbotWorldDiTNetwork14BConfig(
-        in_dim=16 + 4 + 16,
-        patch_embedding_type="conv3d",
-        control_type="cam",
-        cp_method="ulysses",
-    )
+
+def _implementation(backend: AttentionBackend) -> str:
+    """Return the stable benchmark implementation name for a backend."""
+    return "wan_torch" if backend is AttentionBackend.WAN else "triton"
+
+
+def _self_attention_operator(backend: AttentionBackend) -> str:
+    """Return the concrete self-attention operator name for a backend."""
+    if backend is AttentionBackend.WAN:
+        return "cudnn"
+    return "triton_tma_flash_attention_2_fp8"
+
+
+def _make_block(
+    config: LingbotWorldDiTNetwork14BConfig,
+    backend: AttentionBackend,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> CamCtrlBlock:
+    """Build a backend-selected block with shared random weights."""
+
+    def make(selected_backend: AttentionBackend) -> CamCtrlBlock:
+        return CamCtrlBlock(
+            dim=config.dim,
+            ffn_dim=config.ffn_dim,
+            num_heads=config.num_heads,
+            cross_attn_norm=config.cross_attn_norm,
+            eps=config.eps,
+            cp_method=config.cp_method,
+            attention_backend=selected_backend,
+        )
 
     # Allocate this 14B-sized block directly in BF16 on the target GPU. This
     # changes setup memory only; initialization and checkpoint loading remain
@@ -89,25 +123,56 @@ def test_camctrl_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
     try:
         torch.set_default_dtype(dtype)
         with torch.device(device):
-            block = CamCtrlBlock(
-                dim=config.dim,
-                ffn_dim=config.ffn_dim,
-                num_heads=config.num_heads,
-                cross_attn_norm=config.cross_attn_norm,
-                eps=config.eps,
-                cp_method=config.cp_method,
-            )
+            torch.manual_seed(_SEED)
+            reference = make(AttentionBackend.WAN)
+            if backend is AttentionBackend.WAN:
+                return reference
+            block = make(backend)
+            block.load_state_dict(reference.state_dict(), strict=True)
+            return block
     finally:
         torch.set_default_dtype(previous_dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
+@pytest.mark.parametrize(
+    "backend",
+    tuple(AttentionBackend),
+    ids=lambda backend: _implementation(backend).replace("_", "-"),
+)
+@torch.inference_mode()
+def test_camctrl_dit_block_benchmark(
+    benchmark: BenchmarkFixture,
+    backend: AttentionBackend,
+) -> None:
+    """Benchmark the CLI-resolution LingBot camera-control DiT block."""
+    device = _benchmark_device()
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("LingBot DiT block benchmark requires bfloat16 support")
+
+    dtype = torch.bfloat16
+    config = LingbotWorldDiTNetwork14BConfig(
+        in_dim=16 + 4 + 16,
+        patch_embedding_type="conv3d",
+        control_type="cam",
+        cp_method="ulysses",
+        attention_backend=backend,
+    )
+    cp_size = dist.get_world_size() if dist.is_initialized() else 1
+    _skip_unsupported_backend(backend, device, cp_size)
+    block = _make_block(config, backend, device, dtype)
     block.eval()
     block.update_parameters_after_loading_checkpoint()
+    assert block.attention_backend is backend
+    generator = torch.Generator(device=device).manual_seed(_SEED)
 
-    cp_size = dist.get_world_size() if dist.is_initialized() else 1
     cp_group = dist.group.WORLD if cp_size > 1 else None
     block.set_context_parallel_group(cp_group)
     self_attention_cp_enabled = block.self_attn.is_context_parallel_enabled()
     cross_attention_cp_enabled = block.cross_attn.attn_op.is_context_parallel_enabled()
-    assert self_attention_cp_enabled == (cp_size > 1)
+    assert self_attention_cp_enabled == (
+        backend is AttentionBackend.WAN and cp_size > 1
+    )
     assert not cross_attention_cp_enabled
 
     patch_t = _CHUNK_SIZE_T // config.patch_size[0]
@@ -125,11 +190,27 @@ def test_camctrl_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
     sink_tokens = global_sink_tokens // cp_size
     head_dim = config.dim // config.num_heads
 
-    x = torch.randn((chunk_tokens, config.dim), device=device, dtype=dtype)
-    modulation = torch.randn((6, config.dim), device=device, dtype=dtype)
-    plucker_embedding = torch.randn_like(x)
+    x = torch.randn(
+        (chunk_tokens, config.dim),
+        generator=generator,
+        device=device,
+        dtype=dtype,
+    )
+    modulation = torch.randn(
+        (6, config.dim),
+        generator=generator,
+        device=device,
+        dtype=dtype,
+    )
+    plucker_embedding = torch.randn(
+        x.shape,
+        generator=generator,
+        device=device,
+        dtype=dtype,
+    )
     context = torch.randn(
         (1, _TEXT_TOKENS, config.dim),
+        generator=generator,
         device=device,
         dtype=dtype,
     )
@@ -161,23 +242,21 @@ def test_camctrl_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
         cache.after_update(chunk_idx)
         return result
 
-    # Fill the fixed sink and rolling window before timing. Repeating that
-    # final index mirrors multiple denoising evaluations at one autoregressive
-    # position while keeping the complete production cache visible.
-    steady_ar_index = ((_SINK_SIZE_T + _WINDOW_SIZE_T) // _CHUNK_SIZE_T) - 1
-    rope_freqs = [rope.shift_t(idx) for idx in range(steady_ar_index + 1)]
-    for chunk_idx, chunk_rope_freqs in enumerate(rope_freqs):
-        output = forward(chunk_idx, chunk_rope_freqs)
+    # Fill the fixed sink and rolling window before timing. Prepare the next
+    # rolling slot once, then repeatedly overwrite it to mirror denoising at
+    # one autoregressive position without timing cache bookkeeping.
+    cache_prefill_chunks = (_SINK_SIZE_T + _WINDOW_SIZE_T) // _CHUNK_SIZE_T
+    benchmark_ar_index = cache_prefill_chunks
+    rope_freqs = [rope.shift_t(idx) for idx in range(benchmark_ar_index + 1)]
+    for chunk_idx in range(cache_prefill_chunks):
+        output = forward(chunk_idx, rope_freqs[chunk_idx])
     torch.cuda.synchronize(device)
 
-    attention_backends = {
-        block.self_attn.attn_op.backend,
-        block.cross_attn.attn_op.backend,
-    }
-    self_attention_cp_method = block.self_attn.attn_op.method
+    self_attention_cp_method = (
+        config.cp_method if backend is AttentionBackend.WAN else None
+    )
     cross_attention_method = block.cross_attn.attn_op.method
-    assert attention_backends == {"cudnn"}
-    assert self_attention_cp_method == config.cp_method
+    assert block.cross_attn.attn_op.backend == "cudnn"
     camera_parameter_count = sum(
         parameter.numel()
         for name, parameter in block.named_parameters()
@@ -189,7 +268,10 @@ def test_camctrl_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
         {
             "module": "CamCtrlBlock",
             "module_owner": "lingbot",
+            "model_family": "lingbot-world",
+            "model_variant": "lingbot-world-14b",
             "benchmark_scope": "whole_block_including_inherited_wan_branches",
+            "implementation": _implementation(backend),
             "batch_shape": [],
             "pixel_resolution": [_PIXEL_HEIGHT, _PIXEL_WIDTH],
             "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
@@ -207,9 +289,18 @@ def test_camctrl_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
                 parameter.numel() for parameter in block.parameters()
             ),
             "lingbot_camera_parameter_count": camera_parameter_count,
-            "checkpoint": "random_init",
+            "checkpoint": "random_init_shared_weights",
             "dtype": str(dtype),
-            "attention_backend": attention_backends.pop(),
+            "attention_backend": backend.value,
+            "self_attention_operator": _self_attention_operator(backend),
+            "cross_attention_operator": "cudnn",
+            "projection_backend": (
+                "separate_qkv"
+                if backend is AttentionBackend.WAN
+                else "row_scaled_fp8_fused_qkv_output"
+            ),
+            "self_attention_cache_dtype": str(cache.self_attn.dtype),
+            "cross_attention_cache_dtype": str(cache.cross_attn.text.dtype),
             "self_attention_context_parallel_method": self_attention_cp_method,
             "cross_attention_method": cross_attention_method,
             "context_parallel_size": cp_size,
@@ -217,10 +308,12 @@ def test_camctrl_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
             "cross_attention_context_parallel_enabled": (cross_attention_cp_enabled),
             "distributed_sample_alignment": "barrier_before_each_round",
             "cache_state": "full_sink_and_window",
-            "cache_prefill_chunks": steady_ar_index + 1,
-            "benchmark_ar_index": steady_ar_index,
+            "cache_prefill_chunks": cache_prefill_chunks,
+            "benchmark_ar_index": benchmark_ar_index,
+            "cache_update_bookkeeping": "excluded_from_timing",
             "global_rank": dist.get_rank() if dist.is_initialized() else 0,
             "gpu": torch.cuda.get_device_name(device),
+            "compute_capability": list(torch.cuda.get_device_capability(device)),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
             "cudnn": torch.backends.cudnn.version(),
@@ -230,10 +323,18 @@ def test_camctrl_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
         }
     )
 
+    cache.before_update(benchmark_ar_index)
+    torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
 
     def synchronized_forward() -> torch.Tensor:
-        result = forward(steady_ar_index, rope_freqs[steady_ar_index])
+        result = block(
+            x=x,
+            e=modulation,
+            cache=cache,
+            rope_freqs=rope_freqs[benchmark_ar_index],
+            plucker_embedding=plucker_embedding,
+        )
         torch.cuda.synchronize(device)
         return result
 
@@ -244,6 +345,7 @@ def test_camctrl_dit_block_benchmark(benchmark: BenchmarkFixture) -> None:
         rounds=_BENCHMARK_ROUNDS,
         warmup_rounds=_WARMUP_ROUNDS,
     )
+    cache.after_update(benchmark_ar_index)
     benchmark.extra_info["peak_cuda_memory_bytes"] = torch.cuda.max_memory_allocated(
         device
     )

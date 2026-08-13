@@ -23,10 +23,12 @@ from lingbot.transformer import (
     LingbotWorldTransformerConfig,
 )
 from lingbot.transformer.impl.network import (
+    LingbotWorldDiTNetwork,
     LingbotWorldDiTNetworkConfig,
 )
 
 from flashdreams.recipes.wan.autoencoder.i2v import I2VCtrl
+from flashdreams.recipes.wan.transformer.impl.modules import AttentionBackend
 
 pytestmark = pytest.mark.ci_cpu
 
@@ -49,6 +51,7 @@ def test_lingbot_patchify_marks_i2v_and_plucker_as_patchified() -> None:
             compile_network=False,
         )
     )
+    assert transformer.network.attention_backend is AttentionBackend.WAN
 
     camctrl_embeddings = I2VCamCtrlEmbeddings(
         i2v=I2VCtrl(
@@ -68,3 +71,25 @@ def test_lingbot_patchify_marks_i2v_and_plucker_as_patchified() -> None:
 
     # Idempotent once marked patchified.
     assert transformer.patchify_and_maybe_split_cp(patched) is patched
+
+
+@pytest.mark.parametrize("backend", tuple(AttentionBackend))
+def test_lingbot_network_propagates_attention_backend(
+    backend: AttentionBackend,
+) -> None:
+    """Propagate the configured attention backend into camera-control blocks."""
+    network = LingbotWorldDiTNetwork(
+        LingbotWorldDiTNetworkConfig(
+            dim=64,
+            ffn_dim=128,
+            num_heads=4,
+            num_layers=1,
+            patch_embedding_type="linear",
+            control_type="cam",
+            attention_backend=backend,
+        )
+    )
+
+    assert network.attention_backend is backend
+    assert len(network.blocks) == 1
+    assert network.blocks[0].attention_backend is backend

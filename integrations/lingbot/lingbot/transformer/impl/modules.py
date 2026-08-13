@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from flashdreams.recipes.wan.transformer.impl.modules import (
+    AttentionBackend,
     Block,
     BlockCache,
 )
@@ -40,6 +41,7 @@ class CamCtrlBlock(Block):
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
         cp_method: Literal["ring", "ulysses"] = "ring",
+        attention_backend: AttentionBackend = AttentionBackend.TRITON,
     ) -> None:
         super().__init__(
             dim=dim,
@@ -48,6 +50,7 @@ class CamCtrlBlock(Block):
             cross_attn_norm=cross_attn_norm,
             eps=eps,
             cp_method=cp_method,
+            attention_backend=attention_backend,
         )
         self.cam_injector_layer1 = nn.Linear(dim, dim)
         self.cam_injector_layer2 = nn.Linear(dim, dim)

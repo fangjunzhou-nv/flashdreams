@@ -26,6 +26,11 @@ activations, and compiler workspaces. The full-pipeline cases also require the
 Hugging Face access and cache space documented in
 [`integrations/lingbot/README.md`](../README.md).
 
+Each benchmark layer compares the default WAN/cuDNN self-attention with the
+Triton FP8 backend. Triton requires compute capability 9.0 or newer and runs
+only on a single GPU because it does not support context parallelism;
+cross-attention remains cuDNN in both cases.
+
 First sync the LingBot package and the workspace `test` dependency group,
 which provides both `pytest` and `pytest-benchmark`:
 
@@ -51,14 +56,16 @@ uv run --package flashdreams-lingbot --group test \
   -p no:manual_marker -m manual --benchmark-only -v
 ```
 
-All four workers execute every test because the DiT uses context-parallel
-collectives. The tests align workers before every sample. Once the command is
-known to work, add `--local-ranks-filter=0` before `--no-python` to show only
-rank 0's report; omit it while debugging because it also hides tracebacks from
-failing nonzero ranks. If `torchrun` reports `invalid device ordinal`, reduce
-`--nproc_per_node` or scope `CUDA_VISIBLE_DEVICES` to GPUs that are usable
-together. Do not point multiple workers at one shared `--benchmark-json` path;
-use a rank-specific path when retaining every rank's raw report.
+All four workers execute every WAN test because the DiT uses context-parallel
+collectives. The tests align workers before every sample. Triton cases skip in
+this distributed mode because that backend is single-GPU only. Once the command
+is known to work, add `--local-ranks-filter=0` before `--no-python` to show
+only rank 0's report; omit it while debugging because it also hides tracebacks
+from failing nonzero ranks. If `torchrun` reports `invalid device ordinal`,
+reduce `--nproc_per_node` or scope `CUDA_VISIBLE_DEVICES` to GPUs that are
+usable together. Do not point multiple workers at one shared
+`--benchmark-json` path; use a rank-specific path when retaining every rank's
+raw report.
 
 The block microbenchmark also fits on one large GPU:
 
@@ -77,8 +84,8 @@ To select another benchmark layer, use one of these files:
   the LingBot subclass executes.
 - `test_network.py` benchmarks one steady-state evaluation of the complete
   random-initialized LingBot 14B camera-control DiT. It uses the CLI replay's
-  352x640 geometry, compiled cuDNN attention, CUDA graph replay, and the shipped
-  window15/sink3 cache layout; checkpoint loading and startup are excluded.
+  352x640 geometry, compiled WAN or Triton self-attention, CUDA graph replay,
+  and the shipped window15/sink3 cache layout; startup is excluded.
 - `test_pipeline.py` separately benchmarks steady-state `generate` and
   `finalize` for
   `lingbot-world-v2-14b-causal-fast-taehv-window15-sink3` at the CLI replay's

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark for the complete LingBot camera-control DiT network."""
+"""Benchmark the complete LingBot camera-control DiT network by backend."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from flashdreams.infra.acceleration import (
     cuda_graph_capture_ar_index,
 )
 from flashdreams.infra.compile import compile_module
+from flashdreams.recipes.wan.transformer.impl.modules import AttentionBackend
 
 pytestmark = pytest.mark.manual
 
@@ -75,9 +76,42 @@ def _synchronize_ranks() -> None:
         dist.barrier()
 
 
+def _skip_unsupported_backend(
+    backend: AttentionBackend,
+    device: torch.device,
+) -> None:
+    """Skip Triton where its hardware or execution mode is unsupported."""
+    if backend is not AttentionBackend.TRITON:
+        return
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        pytest.skip("Triton attention does not support context parallelism")
+    if torch.cuda.get_device_capability(device) < (9, 0):
+        pytest.skip("Triton attention requires compute capability 9.0 or newer")
+
+
+def _implementation(backend: AttentionBackend) -> str:
+    """Return the stable benchmark implementation name for a backend."""
+    return "wan_torch" if backend is AttentionBackend.WAN else "triton"
+
+
+def _self_attention_operator(backend: AttentionBackend) -> str:
+    """Return the concrete self-attention operator name for a backend."""
+    if backend is AttentionBackend.WAN:
+        return "cudnn"
+    return "triton_tma_flash_attention_2_fp8"
+
+
+@pytest.mark.parametrize(
+    "backend",
+    tuple(AttentionBackend),
+    ids=lambda backend: _implementation(backend).replace("_", "-"),
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @torch.inference_mode()
-def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
+def test_dit_network_benchmark(
+    benchmark: BenchmarkFixture,
+    backend: AttentionBackend,
+) -> None:
     """Benchmark the compiled 14B LingBot DiT at steady state."""
     device = _benchmark_device()
     if not torch.cuda.is_bf16_supported():
@@ -85,6 +119,7 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
 
     dtype = torch.bfloat16
     torch.manual_seed(_SEED)
+    _skip_unsupported_backend(backend, device)
     config = LingbotWorldDiTNetwork14BConfig(
         # 16 noise channels + 4 mask channels + 16 first-frame latent
         # channels before the DiT's 1x2x2 patch embedding.
@@ -92,6 +127,7 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
         patch_embedding_type="conv3d",
         control_type="cam",
         cp_method="ulysses",
+        attention_backend=backend,
     )
 
     # Avoid materializing the 14B random initialization as fp32 CPU weights.
@@ -109,14 +145,15 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
     cp_size = dist.get_world_size() if dist.is_initialized() else 1
     cp_group = dist.group.WORLD if cp_size > 1 else None
     network.set_context_parallel_group(cp_group)
+    assert all(block.attention_backend is backend for block in network.blocks)
     attention_modules = [
         module
         for module in network.modules()
         if isinstance(module, ContextParallelAttention)
     ]
     assert attention_modules
-    attention_backends = {attention.backend for attention in attention_modules}
-    assert attention_backends == {"cudnn"}
+    cudnn_attention_backends = {attention.backend for attention in attention_modules}
+    assert cudnn_attention_backends == {"cudnn"}
     cp_enabled_attention_modules = [
         attention
         for attention in attention_modules
@@ -152,21 +189,25 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
     window_tokens = global_window_tokens // cp_size
     sink_tokens = global_sink_tokens // cp_size
     head_dim = config.dim // config.num_heads
+    generator = torch.Generator(device=device).manual_seed(_SEED)
 
     x = torch.randn(
         (chunk_tokens, config.in_dim * patch_volume),
+        generator=generator,
         device=device,
         dtype=dtype,
     )
     control_channels = 6 if config.control_type == "cam" else 7
     plucker = torch.randn(
         (chunk_tokens, control_channels * 64 * patch_volume),
+        generator=generator,
         device=device,
         dtype=dtype,
     )
     timestep = torch.tensor(_DIFFUSION_TIMESTEP, device=device, dtype=dtype)
     text_embeddings = torch.randn(
         (1, _TEXT_TOKENS, config.text_dim),
+        generator=generator,
         device=device,
         dtype=dtype,
     )
@@ -243,6 +284,7 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
             "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
             "global_chunk_tokens": global_chunk_tokens,
             "local_chunk_tokens": chunk_tokens,
+            "implementation": _implementation(backend),
             "global_window_tokens": global_window_tokens,
             "local_window_tokens": window_tokens,
             "global_sink_tokens": global_sink_tokens,
@@ -259,8 +301,19 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
             "checkpoint": "random_init",
             "dtype": str(dtype),
             "execution_backend": "pytorch",
-            "attention_backend": attention_backends.pop(),
-            "self_attention_context_parallel_method": config.cp_method,
+            "attention_backend": backend.value,
+            "self_attention_operator": _self_attention_operator(backend),
+            "cross_attention_operator": "cudnn",
+            "projection_backend": (
+                "separate_qkv"
+                if backend is AttentionBackend.WAN
+                else "row_scaled_fp8_fused_qkv_output"
+            ),
+            "self_attention_cache_dtype": str(cache[0].self_attn.dtype),
+            "cross_attention_cache_dtype": str(cache[0].cross_attn.text.dtype),
+            "self_attention_context_parallel_method": (
+                config.cp_method if backend is AttentionBackend.WAN else None
+            ),
             "local_attention_methods": sorted(local_attention_methods),
             "context_parallel_size": cp_size,
             "context_parallel_attention_modules": len(cp_enabled_attention_modules),
@@ -278,6 +331,7 @@ def test_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
             "diffusion_timestep": _DIFFUSION_TIMESTEP,
             "global_rank": dist.get_rank() if dist.is_initialized() else 0,
             "gpu": torch.cuda.get_device_name(device),
+            "compute_capability": list(torch.cuda.get_device_capability(device)),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
             "cudnn": torch.backends.cudnn.version(),
