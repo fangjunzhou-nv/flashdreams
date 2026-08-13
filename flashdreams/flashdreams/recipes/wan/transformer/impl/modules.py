@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Literal
 
 import torch
@@ -26,12 +27,24 @@ import torch.nn as nn
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
+from flashdreams.accelerated.multi_head_attention import QKNormScope
+from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
 from flashdreams.core.attention import (
     BlockKVCache,
     ContextParallelAttention,
     NativeAttention,
 )
 from flashdreams.core.attention.rope import apply_rope_freqs
+
+
+class AttentionBackend(str, Enum):
+    """Self-attention implementation used by a Wan DiT block."""
+
+    WAN = "wan"
+    """Use Wan's context-parallel attention implementation."""
+
+    TRITON = "triton"
+    """Use FP8 Triton streaming self-attention."""
 
 
 def sinusoidal_embedding_1d(dim: int, position: Tensor) -> Tensor:
@@ -386,6 +399,102 @@ class SelfAttention(MultiHeadAttention):
         return super().forward(x, kv_cache, rope_freqs=rope_freqs, update_kv_cache=True)
 
 
+class _TritonSelfAttention(TritonMultiHeadAttention):
+    """FP8 Triton self-attention adapted to Wan's checkpoint contract."""
+
+    _TRITON_TO_WAN_MODULE = {
+        "q_proj": "q",
+        "k_proj": "k",
+        "v_proj": "v",
+        "output_proj": "o",
+        "q_norm": "norm_q",
+        "k_norm": "norm_k",
+    }
+    """Shared Triton module names mapped to Wan checkpoint names."""
+
+    def __init__(
+        self,
+        query_dim: int,
+        context_dim: int | None = None,
+        n_heads: int = 8,
+        head_dim: int = 64,
+        eps: float = 1e-6,
+        apply_rope_before_kvcache: bool = True,
+        cp_method: Literal["ring", "ulysses"] = "ring",
+    ) -> None:
+        """Initialize Triton attention with Wan projection and RoPE policies.
+
+        Args:
+            query_dim: Feature dimension of input and output tokens.
+            context_dim: Self-attention context dimension; ``None`` uses
+                ``query_dim``.
+            n_heads: Number of attention heads.
+            head_dim: Per-head feature dimension.
+            eps: Epsilon used by Q/K RMS normalization.
+            apply_rope_before_kvcache: Whether keys receive RoPE before cache writes.
+                Triton requires ``True``.
+            cp_method: Context-parallel method retained for constructor compatibility.
+
+        Raises:
+            ValueError: ``context_dim`` differs from ``query_dim`` or cache-relative
+                RoPE is requested.
+        """
+        del cp_method
+        context_dim = query_dim if context_dim is None else context_dim
+        if context_dim != query_dim:
+            raise ValueError(
+                "Triton self-attention requires context_dim to equal query_dim; "
+                f"got {context_dim} and {query_dim}"
+            )
+        if not apply_rope_before_kvcache:
+            raise ValueError(
+                "Triton self-attention requires apply_rope_before_kvcache=True"
+            )
+
+        super().__init__(
+            query_dim=query_dim,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            qkv_bias=True,
+            output_bias=True,
+            qk_norm=True,
+            qk_norm_eps=eps,
+            qk_norm_scope=QKNormScope.INNER,
+            rope_interleaved=True,
+            use_fp8=True,
+        )
+
+        # Register only Wan's checkpoint names; inherited Triton methods keep
+        # non-registered aliases to those same modules.
+        for triton_name, wan_name in self._TRITON_TO_WAN_MODULE.items():
+            module = getattr(self, triton_name)
+            delattr(self, triton_name)
+            setattr(self, wan_name, module)
+            object.__setattr__(self, triton_name, module)
+
+    def set_context_parallel_group(self, cp_group: ProcessGroup | None) -> None:
+        """Reject context parallelism unsupported by Triton attention.
+
+        Args:
+            cp_group: Context-parallel process group; ``None`` is a no-op.
+
+        Raises:
+            NotImplementedError: ``cp_group`` is not ``None``.
+        """
+        if cp_group is not None:
+            raise NotImplementedError(
+                "The Triton attention backend does not support context parallelism"
+            )
+
+    def is_context_parallel_enabled(self) -> bool:
+        """Return whether context parallelism is enabled."""
+        return False
+
+    def context_parallel_size(self) -> int:
+        """Return the singleton context-parallel world size."""
+        return 1
+
+
 @dataclass
 class CrossAttnCache:
     """Cache container for cross-attention."""
@@ -513,6 +622,7 @@ class Block(nn.Module):
         i2v: bool = False,
         apply_rope_before_kvcache: bool = True,
         cp_method: Literal["ring", "ulysses"] = "ring",
+        attention_backend: AttentionBackend = AttentionBackend.WAN,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -520,17 +630,28 @@ class Block(nn.Module):
         self.num_heads = num_heads
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.attention_backend = AttentionBackend(attention_backend)
 
         # Core submodules
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.self_attn = SelfAttention(
-            query_dim=dim,
-            n_heads=num_heads,
-            head_dim=dim // num_heads,
-            eps=eps,
-            apply_rope_before_kvcache=apply_rope_before_kvcache,
-            cp_method=cp_method,
-        )
+        if self.attention_backend is AttentionBackend.WAN:
+            self.self_attn = SelfAttention(
+                query_dim=dim,
+                n_heads=num_heads,
+                head_dim=dim // num_heads,
+                eps=eps,
+                apply_rope_before_kvcache=apply_rope_before_kvcache,
+                cp_method=cp_method,
+            )
+        else:
+            self.self_attn = _TritonSelfAttention(
+                query_dim=dim,
+                n_heads=num_heads,
+                head_dim=dim // num_heads,
+                eps=eps,
+                apply_rope_before_kvcache=apply_rope_before_kvcache,
+                cp_method=cp_method,
+            )
         self.norm3 = (
             nn.LayerNorm(dim, eps, elementwise_affine=True)
             if cross_attn_norm
@@ -597,15 +718,17 @@ class Block(nn.Module):
         self.self_attn.set_context_parallel_group(cp_group)
 
     def update_parameters_after_loading_checkpoint(self) -> None:
-        """Squeeze the loaded ``[1, 6, D]`` modulation to ``[6, D]``.
+        """Finalize parameters that depend on loaded checkpoint weights.
 
-        Idempotent. Call once after ``load_state_dict`` so the broadcast
-        in ``forward`` works for any batch shape rather than just the
-        leading-1 layout the checkpoint was saved in.
+        Idempotent. Call once after checkpoint tensors are loaded so the broadcast
+        in ``forward`` works for any batch shape and fused attention weights
+        reflect the checkpoint.
         """
         if self._parameters_updated_after_loading_checkpoint:
             return
 
+        if isinstance(self.self_attn, _TritonSelfAttention):
+            self.self_attn._refresh_derived_weights()
         self.modulation.data = self.modulation.data.squeeze(0)
         self._parameters_updated_after_loading_checkpoint = True
 

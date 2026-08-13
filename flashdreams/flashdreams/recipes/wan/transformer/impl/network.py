@@ -32,6 +32,7 @@ from flashdreams.core.distributed.context_parallel import (
 )
 from flashdreams.infra.config import InstantiateConfig
 from flashdreams.recipes.wan.transformer.impl.modules import (
+    AttentionBackend,
     Block,
     BlockCache,
     Head,
@@ -108,6 +109,8 @@ class WanDiTNetworkConfig(InstantiateConfig):
     """If True, apply RoPE to keys before storing them in the KV cache."""
     cp_method: Literal["ring", "ulysses"] = "ring"
     """Context-parallel attention method for transformer attention ops."""
+    attention_backend: AttentionBackend = AttentionBackend.WAN
+    """Self-attention implementation used by every transformer block."""
 
 
 @dataclass
@@ -175,6 +178,7 @@ class WanDiTNetwork(nn.Module):
         self.patch_embedding_type = config.patch_embedding_type
         self.apply_rope_before_kvcache = config.apply_rope_before_kvcache
         self.cp_method = config.cp_method
+        self.attention_backend = AttentionBackend(config.attention_backend)
 
         # Embedding layers
         in_dim = config.in_dim + 1 if self.concat_padding_mask else config.in_dim
@@ -230,6 +234,7 @@ class WanDiTNetwork(nn.Module):
             i2v=self.cross_attn_enable_img,
             apply_rope_before_kvcache=self.apply_rope_before_kvcache,
             cp_method=self.cp_method,
+            attention_backend=self.attention_backend,
         )
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None = None) -> None:
