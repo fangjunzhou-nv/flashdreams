@@ -27,7 +27,6 @@ from flashdreams.accelerated.multi_head_attention import QKNormScope
 from flashdreams.accelerated.reference import TorchMultiHeadAttention
 from flashdreams.core.attention import (
     BlockKVCache,
-    FP8BlockKVCache,
     RotaryPositionEmbedding3D,
 )
 
@@ -228,7 +227,9 @@ def test_fp8_triton_attention_matches_bf16_reference_through_window_roll(
         device=tma_device,
         dtype=torch.bfloat16,
     )
-    assert isinstance(triton_cache, FP8BlockKVCache)
+    assert type(triton_cache) is BlockKVCache
+    assert triton_cache._k.dtype is torch.float8_e4m3fn
+    assert triton_cache._v.dtype is torch.float8_e4m3fn
     rope = RotaryPositionEmbedding3D(
         head_dim=64,
         len_t=1,

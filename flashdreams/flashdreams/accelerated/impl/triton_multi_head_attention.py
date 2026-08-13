@@ -40,7 +40,7 @@ from flashdreams.accelerated.multi_head_attention import (
     MultiHeadAttention,
     QKNormScope,
 )
-from flashdreams.core.attention import BlockKVCache, FP8BlockKVCache
+from flashdreams.core.attention import BlockKVCache
 
 
 def _cache_write_slice(kv_cache: BlockKVCache) -> tuple[int, int, int]:
@@ -69,7 +69,7 @@ def _cache_write_slice(kv_cache: BlockKVCache) -> tuple[int, int, int]:
     return int(read_start), int(write_start), int(write_end - write_start)
 
 
-class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache | FP8BlockKVCache]):
+class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
     """Inference-only streaming self-attention backed by Triton kernels.
 
     Parameter names and shapes match :class:`TorchMultiHeadAttention`, so a
@@ -140,8 +140,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache | FP8BlockKVCache
             qk_norm_eps: Epsilon used by Q/K RMS normalization.
             qk_norm_scope: Feature scope used by Q/K RMS normalization.
             rope_interleaved: Rotate adjacent feature pairs instead of half splits.
-            use_fp8: Use row-scaled E4M3 projection/output GEMMs and an
-                :class:`FP8BlockKVCache` for attention storage.
+            use_fp8: Use row-scaled E4M3 projection/output GEMMs and E4M3
+                attention/cache storage.
 
         Raises:
             ValueError: ``head_dim`` is unsupported by the TMA attention kernel.
@@ -234,7 +234,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache | FP8BlockKVCache
         sink_size: int,
         device: torch.device | str,
         dtype: torch.dtype,
-    ) -> BlockKVCache | FP8BlockKVCache:
+    ) -> BlockKVCache:
         """Allocate a rolling cache matching the configured precision policy."""
         cache_shape = (
             batch_size,
@@ -242,18 +242,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache | FP8BlockKVCache
             self.n_heads,
             self.head_dim,
         )
-        if self.use_fp8:
-            if dtype not in (torch.float16, torch.bfloat16):
-                raise TypeError("FP8 attention requires FP16 or BF16 activations")
-            return FP8BlockKVCache(
-                k_shape=cache_shape,
-                v_shape=cache_shape,
-                seq_dim=1,
-                chunk_size=chunk_size,
-                window_size=window_size,
-                sink_size=sink_size,
-                device=device,
-            )
+        if self.use_fp8 and dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError("FP8 attention requires FP16 or BF16 activations")
         return BlockKVCache(
             k_shape=cache_shape,
             v_shape=cache_shape,
@@ -262,7 +252,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache | FP8BlockKVCache
             window_size=window_size,
             sink_size=sink_size,
             device=device,
-            dtype=dtype,
+            dtype=torch.float8_e4m3fn if self.use_fp8 else dtype,
         )
 
     def _project_qkv(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -308,7 +298,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache | FP8BlockKVCache
     def _validate_forward_inputs(
         self,
         x: Tensor,
-        kv_cache: BlockKVCache | FP8BlockKVCache,
+        kv_cache: BlockKVCache,
         rope_freqs: Tensor | None,
     ) -> None:
         """Validate module inputs before projection or cache mutation."""
@@ -330,10 +320,6 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache | FP8BlockKVCache
             )
         if kv_cache._curr_chunk_idx is None:
             raise RuntimeError("call kv_cache.before_update() before attention")
-        if self.use_fp8 and not isinstance(kv_cache, FP8BlockKVCache):
-            raise TypeError("use_fp8=True requires an FP8BlockKVCache")
-        if not self.use_fp8 and isinstance(kv_cache, FP8BlockKVCache):
-            raise TypeError("FP8BlockKVCache requires use_fp8=True")
         if kv_cache.seq_dim != 1 or kv_cache._k.ndim != 4:
             raise ValueError(
                 "TritonMultiHeadAttention requires a [B, S, H, D] cache with seq_dim=1"
@@ -383,7 +369,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache | FP8BlockKVCache
     def forward(
         self,
         x: Tensor,
-        kv_cache: BlockKVCache | FP8BlockKVCache,
+        kv_cache: BlockKVCache,
         rope_freqs: Tensor | None = None,
     ) -> Tensor:
         """Project a token chunk, update its cache, and apply TMA attention.

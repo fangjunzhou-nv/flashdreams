@@ -39,11 +39,7 @@ from torch import Tensor
 from flashdreams.accelerated.impl import TritonMultiHeadAttention
 from flashdreams.accelerated.multi_head_attention import QKNormScope
 from flashdreams.accelerated.reference import TorchMultiHeadAttention
-from flashdreams.core.attention import (
-    BlockKVCache,
-    FP8BlockKVCache,
-    RotaryPositionEmbedding3D,
-)
+from flashdreams.core.attention import BlockKVCache, RotaryPositionEmbedding3D
 from flashdreams.recipes.cosmos.transformer.impl import modules as cosmos_modules
 from flashdreams.recipes.wan.transformer.impl import modules as wan_modules
 
@@ -161,26 +157,6 @@ def _make_cache(
     use_fp8: bool = False,
 ) -> BlockKVCache:
     """Build a rolling cache for one benchmark case."""
-    if use_fp8:
-        return FP8BlockKVCache(
-            k_shape=(
-                _BATCH_SIZE,
-                config.window_size,
-                config.n_heads,
-                config.head_dim,
-            ),
-            v_shape=(
-                _BATCH_SIZE,
-                config.window_size,
-                config.n_heads,
-                config.head_dim,
-            ),
-            seq_dim=1,
-            chunk_size=config.chunk_size,
-            window_size=config.window_size,
-            sink_size=_SINK_SIZE,
-            device=device,
-        )
     return BlockKVCache(
         k_shape=(
             _BATCH_SIZE,
@@ -199,7 +175,7 @@ def _make_cache(
         window_size=config.window_size,
         sink_size=_SINK_SIZE,
         device=device,
-        dtype=_DTYPE,
+        dtype=torch.float8_e4m3fn if use_fp8 else _DTYPE,
     )
 
 

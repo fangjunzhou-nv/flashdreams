@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flashdreams.core.attention import FP8BlockKVCache
+from flashdreams.core.attention import BlockKVCache
 
 pytestmark = pytest.mark.ci_cpu
 
@@ -30,23 +30,35 @@ def test_fp8_block_kv_cache_converts_native_inputs() -> None:
     key = torch.tensor([[[[1.0, -2.0]], [[3.0, -4.0]]]])
     value = torch.tensor([[[[5.0, -6.0]], [[7.0, -8.0]]]])
 
-    cache = FP8BlockKVCache.from_tensor(key, value, seq_dim=1)
+    cache = BlockKVCache(
+        k_shape=tuple(key.shape),
+        v_shape=tuple(value.shape),
+        seq_dim=1,
+        chunk_size=key.shape[1],
+        window_size=key.shape[1],
+        device="cpu",
+        dtype=torch.float8_e4m3fn,
+    )
+    cache.before_update(0)
+    cache.update(key, value)
 
     assert cache._k.dtype is torch.float8_e4m3fn
     assert cache._v.dtype is torch.float8_e4m3fn
     torch.testing.assert_close(cache.cached_k().float(), key)
     torch.testing.assert_close(cache.cached_v().float(), value)
+    cache.after_update(0)
 
 
 def test_fp8_block_kv_cache_preserves_rolling_lifecycle() -> None:
     """Preserve filling, rolling, overwrite, and reset behavior in FP8."""
-    cache = FP8BlockKVCache(
+    cache = BlockKVCache(
         k_shape=(1, 4, 1, 1),
         v_shape=(1, 4, 1, 1),
         seq_dim=1,
         chunk_size=2,
         window_size=4,
         device="cpu",
+        dtype=torch.float8_e4m3fn,
     )
 
     for chunk_idx in range(3):
