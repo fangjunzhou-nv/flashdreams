@@ -70,8 +70,10 @@ _TMA_ATTENTION_CONFIGS = [
         (64, 64, 4, 3),
         (64, 64, 8, 3),
         (128, 32, 4, 3),
+        (128, 64, 4, 2),
         (128, 64, 4, 3),
         (128, 64, 8, 3),
+        (128, 128, 8, 3),
     )
 ]
 """Candidate query/key tile geometries for FlashAttention autotuning."""
@@ -94,27 +96,47 @@ def _prune_tma_attention_configs(
     """
     query_length = named_args["query_length"]
     key_length = named_args["key_length"]
+    element_size = named_args["element_size"]
     head_dim = meta["HEAD_DIM"]
     assert isinstance(query_length, int)
     assert isinstance(key_length, int)
+    assert isinstance(element_size, int)
     assert isinstance(head_dim, int)
     # Bound each tile by its sequence axis. Wide ``[D]`` accumulators use at
-    # most 64 query rows to limit SRAM consumption.
+    # most 64 query rows to limit SRAM consumption. Larger K/V tiles and the
+    # 128x64 two-stage pipeline help 16-bit layouts but waste FP8 resources.
     maximum_block_m = min(128, max(16, int(triton.next_power_of_2(query_length))))
     if head_dim > 128:
         maximum_block_m = min(maximum_block_m, 64)
-    maximum_block_n = min(64, max(32, int(triton.next_power_of_2(key_length))))
+    maximum_block_n = min(
+        128 if element_size == 2 else 64,
+        max(32, int(triton.next_power_of_2(key_length))),
+    )
     return [
         config
         for config in configs
         if config.kwargs["BLOCK_M"] <= maximum_block_m
         and config.kwargs["BLOCK_N"] <= maximum_block_n
+        and not (
+            element_size == 1
+            and config.kwargs == {"BLOCK_M": 128, "BLOCK_N": 64}
+            and config.num_stages == 2
+        )
     ]
 
 
 @triton.autotune(
     configs=_TMA_ATTENTION_CONFIGS,
-    key=["num_heads", "query_length", "key_length", "element_size", "HEAD_DIM"],
+    key=[
+        "num_heads",
+        "query_length",
+        "key_length",
+        "query_stride_l",
+        "key_stride_s",
+        "value_stride_s",
+        "element_size",
+        "HEAD_DIM",
+    ],
     prune_configs_by={"early_config_prune": _prune_tma_attention_configs},
     cache_results=True,
 )
@@ -309,7 +331,7 @@ def flash_attention_2_tma(
     *,
     scale: float | None = None,
 ) -> Tensor:
-    """Apply non-causal TMA FlashAttention2 to token-major Q/K/V tensors.
+    """Apply non-causal TMA FlashAttention2 to logical Q/K/V tensors.
 
     Args:
         query: Query tensor with shape ``[B, L, H, D]``.

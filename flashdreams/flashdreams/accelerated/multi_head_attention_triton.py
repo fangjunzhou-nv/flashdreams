@@ -288,8 +288,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             TypeError: FP8 is enabled with an activation dtype other than FP16 or
                 BF16.
         """
-        # Cache K/V in token-major ``[B, S, H, D]`` layout expected by both
-        # the fused update kernel and TMA FlashAttention2.
+        # Preserve logical ``[B, S, H, D]`` axes. Head-scoped attention stores
+        # each ``[S, D]`` plane contiguously so TMA streams K/V without gathers.
         cache_shape = (
             batch_size,
             sink_size + window_size,
@@ -298,7 +298,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         )
         if self.use_fp8 and dtype not in (torch.float16, torch.bfloat16):
             raise TypeError("FP8 attention requires FP16 or BF16 activations")
-        return BlockKVCache(
+        cache = BlockKVCache(
             k_shape=cache_shape,
             v_shape=cache_shape,
             seq_dim=1,
@@ -308,6 +308,16 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             device=device,
             dtype=torch.float8_e4m3fn if self.use_fp8 else dtype,
         )
+        if self.qk_norm_scope is QKNormScope.HEAD:
+            storage_shape = (
+                batch_size,
+                self.n_heads,
+                sink_size + window_size,
+                self.head_dim,
+            )
+            cache._k = cache._k.view(storage_shape).transpose(1, 2)
+            cache._v = cache._v.view(storage_shape).transpose(1, 2)
+        return cache
 
     def _project_qkv(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Project Q/K/V with one fused native or row-scaled FP8 GEMM.
@@ -417,8 +427,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 "9.0 or newer"
             )
 
-        # The caller prepares cache write bounds before attention. Physical K/V
-        # storage must remain contiguous ``[B, S, H, D]`` with sequence axis 1.
+        # The caller prepares cache write bounds before attention. K/V storage
+        # keeps logical ``[B, S, H, D]`` axes in one of two supported dense layouts.
         if kv_cache._curr_chunk_idx is None:
             raise RuntimeError("call kv_cache.before_update() before attention")
         if kv_cache.seq_dim != 1 or kv_cache._k.ndim != 4:
@@ -446,8 +456,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 f"{expected_cache_shape}; got {cache_shape}"
             )
 
-        # K/V share shape, device, storage precision, and contiguous layout so
-        # one fused kernel can write them and TMA attention can read them directly.
+        # K/V share shape, device, storage precision, and dense layout so one
+        # fused kernel can write them and TMA can read them directly.
         if kv_cache._v.shape != kv_cache._k.shape:
             raise ValueError("Triton attention requires identical K/V cache shapes")
         if kv_cache._k.device != x.device or kv_cache._v.device != x.device:
@@ -458,8 +468,17 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             or kv_cache._v.dtype != expected_cache_dtype
         ):
             raise RuntimeError(f"K/V cache tensors must use {expected_cache_dtype}")
-        if not kv_cache._k.is_contiguous() or not kv_cache._v.is_contiguous():
-            raise RuntimeError("K/V cache tensors must be contiguous")
+        token_major = kv_cache._k.is_contiguous() and kv_cache._v.is_contiguous()
+        head_major = (
+            self.qk_norm_scope is QKNormScope.HEAD
+            and kv_cache._k.transpose(1, 2).is_contiguous()
+            and kv_cache._v.transpose(1, 2).is_contiguous()
+        )
+        if not token_major and not head_major:
+            raise RuntimeError(
+                "K/V cache storage must be dense token-major, or head-major for "
+                "head-scoped RMSNorm"
+            )
 
         if rope_freqs is not None:
             # RoPE coefficients cover this ``L``-token chunk and broadcast across

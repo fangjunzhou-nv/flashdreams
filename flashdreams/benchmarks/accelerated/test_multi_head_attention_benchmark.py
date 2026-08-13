@@ -154,7 +154,6 @@ _WAN_CONFIG = _AttentionBenchmarkConfig(
 def _make_cache(
     config: _AttentionBenchmarkConfig,
     device: torch.device,
-    use_fp8: bool = False,
 ) -> BlockKVCache:
     """Build a rolling cache for one benchmark case."""
     return BlockKVCache(
@@ -175,7 +174,7 @@ def _make_cache(
         window_size=config.window_size,
         sink_size=_SINK_SIZE,
         device=device,
-        dtype=torch.float8_e4m3fn if use_fp8 else _DTYPE,
+        dtype=_DTYPE,
     )
 
 
@@ -283,6 +282,15 @@ def _benchmark_multi_head_attention(
         pytest.skip("Multi-head attention benchmark requires bfloat16 support.")
 
     device = torch.device("cuda")
+    if (
+        implementation
+        in (
+            "accelerated_triton",
+            "accelerated_triton_fp8",
+        )
+        and torch.cuda.get_device_capability(device)[0] < 9
+    ):
+        pytest.skip("Triton TMA attention requires compute capability 9.0 or newer.")
     model_family = config.model_family
     benchmark_chunk_idx = config.window_chunks
     torch.manual_seed(_SEED)
@@ -314,10 +322,17 @@ def _benchmark_multi_head_attention(
     rope_freqs = [
         rope.shift_t(chunk_idx) for chunk_idx in range(benchmark_chunk_idx + 1)
     ]
-    cache = _make_cache(
-        config,
-        device,
-        use_fp8=implementation == "accelerated_triton_fp8",
+    cache = (
+        attention.initialize_cache(
+            batch_size=_BATCH_SIZE,
+            chunk_size=config.chunk_size,
+            window_size=config.window_size,
+            sink_size=_SINK_SIZE,
+            device=device,
+            dtype=_DTYPE,
+        )
+        if isinstance(attention, TritonMultiHeadAttention)
+        else _make_cache(config, device)
     )
 
     # Fill the local window before timing so every measured call uses the same

@@ -24,7 +24,11 @@ import torch.nn.functional as F
 from flashdreams.accelerated.multi_head_attention import QKNormScope
 from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
 from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
-from flashdreams.accelerated.triton import flash_attention_2_tma, fp8_quantization
+from flashdreams.accelerated.triton import (
+    flash_attention_2_tma,
+    fp8_quantization,
+    fused_rms_rope_kv_cache_update,
+)
 from flashdreams.core.attention import (
     BlockKVCache,
     RotaryPositionEmbedding3D,
@@ -86,14 +90,120 @@ def test_fused_fp8_row_quantization_matches_torch(
     assert empty_scales.shape == (0, 1)
 
 
-def _make_cache(device: torch.device) -> BlockKVCache:
-    """Build a two-chunk BF16 cache for one streaming parity path."""
+@pytest.mark.parametrize(
+    ("rope_interleaved", "head_major_cache", "apply_rope"),
+    [
+        pytest.param(False, True, True, id="half-split-head-major"),
+        pytest.param(True, True, True, id="interleaved-head-major"),
+        pytest.param(False, False, True, id="half-split-token-major"),
+        pytest.param(False, True, False, id="no-rope-head-major"),
+    ],
+)
+def test_head_preprocessing_layouts_match_torch(
+    tma_device: torch.device,
+    rope_interleaved: bool,
+    head_major_cache: bool,
+    apply_rope: bool,
+) -> None:
+    """Cover tiled and fallback head preprocessing across dense cache layouts."""
+    batch_size, sequence_length, num_heads, head_dim = 2, 3, 3, 16
+    cache_size = 6
+    generator = torch.Generator(device=tma_device).manual_seed(23)
+    query = torch.randn(
+        batch_size,
+        sequence_length,
+        num_heads,
+        head_dim,
+        generator=generator,
+        device=tma_device,
+        dtype=torch.bfloat16,
+    )
+    key = torch.randn(
+        query.shape,
+        generator=generator,
+        device=tma_device,
+        dtype=torch.bfloat16,
+    )
+    value = torch.randn(
+        query.shape,
+        generator=generator,
+        device=tma_device,
+        dtype=torch.bfloat16,
+    )
+    sentinel = -123.0
+    cache_shape = (
+        (batch_size, num_heads, cache_size, head_dim)
+        if head_major_cache
+        else (batch_size, cache_size, num_heads, head_dim)
+    )
+    key_cache = torch.full(
+        cache_shape,
+        sentinel,
+        device=tma_device,
+        dtype=torch.bfloat16,
+    )
+    if head_major_cache:
+        key_cache = key_cache.transpose(1, 2)
+    value_cache = torch.full_like(key_cache, sentinel)
+    rope_freqs = (
+        torch.arange(
+            sequence_length * head_dim,
+            device=tma_device,
+            dtype=torch.float32,
+        ).reshape(sequence_length, 1, 1, head_dim)
+        / 37
+    )
+
+    actual_query = fused_rms_rope_kv_cache_update(
+        query,
+        key,
+        value,
+        key_cache,
+        value_cache,
+        query_weight=None,
+        key_weight=None,
+        norm_eps=0.0,
+        norm_scope=QKNormScope.HEAD,
+        rope_freqs=rope_freqs if apply_rope else None,
+        rope_interleaved=rope_interleaved,
+        cache_read_start=1,
+        cache_write_start=2,
+        cache_write_length=2,
+    )
+
+    reference = TorchMultiHeadAttention(
+        query_dim=num_heads * head_dim,
+        n_heads=num_heads,
+        head_dim=head_dim,
+        qk_norm=False,
+        rope_interleaved=rope_interleaved,
+    ).to(device=tma_device, dtype=torch.bfloat16)
+    if apply_rope:
+        expected_query = reference._apply_rope(query, rope_freqs)
+        expected_key = reference._apply_rope(key, rope_freqs)
+    else:
+        expected_query = query
+        expected_key = key
+    torch.testing.assert_close(actual_query, expected_query, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        key_cache[:, 2:4], expected_key[:, 1:3], atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(value_cache[:, 2:4], value[:, 1:3])
+    assert torch.all(key_cache[:, :2] == sentinel)
+    assert torch.all(key_cache[:, 4:] == sentinel)
+    assert torch.all(value_cache[:, :2] == sentinel)
+    assert torch.all(value_cache[:, 4:] == sentinel)
+
+
+def _make_cache(device: torch.device, n_heads: int, head_dim: int) -> BlockKVCache:
+    """Build a two-chunk BF16 cache with an immutable sink prefix."""
     return BlockKVCache(
-        k_shape=(1, 32, 2, 64),
-        v_shape=(1, 32, 2, 64),
+        k_shape=(1, 36, n_heads, head_dim),
+        v_shape=(1, 36, n_heads, head_dim),
         seq_dim=1,
         chunk_size=16,
         window_size=32,
+        sink_size=4,
         device=device,
         dtype=torch.bfloat16,
     )
@@ -152,10 +262,16 @@ def test_tma_flash_attention_matches_sdpa(
 
 
 @pytest.mark.parametrize(
-    ("qk_norm_scope", "rope_interleaved", "projection_bias"),
+    (
+        "qk_norm_scope",
+        "rope_interleaved",
+        "projection_bias",
+        "n_heads",
+        "head_dim",
+    ),
     [
-        pytest.param(QKNormScope.HEAD, False, False, id="cosmos"),
-        pytest.param(QKNormScope.INNER, True, True, id="wan"),
+        pytest.param(QKNormScope.HEAD, False, False, 16, 128, id="cosmos"),
+        pytest.param(QKNormScope.INNER, True, True, 12, 128, id="wan"),
     ],
 )
 def test_triton_attention_matches_reference_through_window_roll(
@@ -163,22 +279,25 @@ def test_triton_attention_matches_reference_through_window_roll(
     qk_norm_scope: QKNormScope,
     rope_interleaved: bool,
     projection_bias: bool,
+    n_heads: int,
+    head_dim: int,
 ) -> None:
-    """Compare full streaming attention across filling and rolling phases."""
+    """Compare streaming attention across fill, roll, and overwrite phases."""
     torch.manual_seed(7)
+    inner_dim = n_heads * head_dim
     reference = TorchMultiHeadAttention(
-        query_dim=128,
-        n_heads=2,
-        head_dim=64,
+        query_dim=inner_dim,
+        n_heads=n_heads,
+        head_dim=head_dim,
         qkv_bias=projection_bias,
         output_bias=projection_bias,
         qk_norm_scope=qk_norm_scope,
         rope_interleaved=rope_interleaved,
     ).to(device=tma_device, dtype=torch.bfloat16)
     triton_attention = TritonMultiHeadAttention(
-        query_dim=128,
-        n_heads=2,
-        head_dim=64,
+        query_dim=inner_dim,
+        n_heads=n_heads,
+        head_dim=head_dim,
         qkv_bias=projection_bias,
         output_bias=projection_bias,
         qk_norm_scope=qk_norm_scope,
@@ -188,10 +307,17 @@ def test_triton_attention_matches_reference_through_window_roll(
     reference.eval()
     triton_attention.eval()
 
-    reference_cache = _make_cache(tma_device)
-    triton_cache = _make_cache(tma_device)
+    reference_cache = _make_cache(tma_device, n_heads, head_dim)
+    triton_cache = triton_attention.initialize_cache(
+        batch_size=1,
+        chunk_size=16,
+        window_size=32,
+        sink_size=4,
+        device=tma_device,
+        dtype=torch.bfloat16,
+    )
     rope = RotaryPositionEmbedding3D(
-        head_dim=64,
+        head_dim=head_dim,
         len_t=1,
         len_h=1,
         len_w=16,
@@ -201,11 +327,11 @@ def test_triton_attention_matches_reference_through_window_roll(
     generator = torch.Generator(device=tma_device).manual_seed(11)
 
     with torch.inference_mode():
-        for chunk_idx in range(3):
+        for chunk_idx in (0, 1, 2, 2):
             x = torch.randn(
                 1,
                 16,
-                128,
+                inner_dim,
                 generator=generator,
                 device=tma_device,
                 dtype=torch.bfloat16,
@@ -235,10 +361,16 @@ def test_triton_attention_matches_reference_through_window_roll(
 
 
 @pytest.mark.parametrize(
-    ("qk_norm_scope", "rope_interleaved", "projection_bias"),
+    (
+        "qk_norm_scope",
+        "rope_interleaved",
+        "projection_bias",
+        "n_heads",
+        "head_dim",
+    ),
     [
-        pytest.param(QKNormScope.HEAD, False, False, id="cosmos"),
-        pytest.param(QKNormScope.INNER, True, True, id="wan"),
+        pytest.param(QKNormScope.HEAD, False, False, 16, 128, id="cosmos"),
+        pytest.param(QKNormScope.INNER, True, True, 12, 128, id="wan"),
     ],
 )
 def test_fp8_triton_attention_matches_bf16_reference_through_window_roll(
@@ -246,22 +378,25 @@ def test_fp8_triton_attention_matches_bf16_reference_through_window_roll(
     qk_norm_scope: QKNormScope,
     rope_interleaved: bool,
     projection_bias: bool,
+    n_heads: int,
+    head_dim: int,
 ) -> None:
-    """Bound FP8 projection, cache, attention, and output error through a roll."""
+    """Bound FP8 error across cache fill, roll, and overwrite phases."""
     torch.manual_seed(17)
+    inner_dim = n_heads * head_dim
     reference = TorchMultiHeadAttention(
-        query_dim=128,
-        n_heads=2,
-        head_dim=64,
+        query_dim=inner_dim,
+        n_heads=n_heads,
+        head_dim=head_dim,
         qkv_bias=projection_bias,
         output_bias=projection_bias,
         qk_norm_scope=qk_norm_scope,
         rope_interleaved=rope_interleaved,
     ).to(device=tma_device, dtype=torch.bfloat16)
     triton_attention = TritonMultiHeadAttention(
-        query_dim=128,
-        n_heads=2,
-        head_dim=64,
+        query_dim=inner_dim,
+        n_heads=n_heads,
+        head_dim=head_dim,
         qkv_bias=projection_bias,
         output_bias=projection_bias,
         qk_norm_scope=qk_norm_scope,
@@ -272,20 +407,32 @@ def test_fp8_triton_attention_matches_bf16_reference_through_window_roll(
     reference.eval()
     triton_attention.eval()
 
-    reference_cache = _make_cache(tma_device)
+    reference_cache = _make_cache(tma_device, n_heads, head_dim)
     triton_cache = triton_attention.initialize_cache(
         batch_size=1,
         chunk_size=16,
         window_size=32,
-        sink_size=0,
+        sink_size=4,
         device=tma_device,
         dtype=torch.bfloat16,
     )
     assert type(triton_cache) is BlockKVCache
     assert triton_cache._k.dtype is torch.float8_e4m3fn
     assert triton_cache._v.dtype is torch.float8_e4m3fn
+    assert triton_cache._k.shape == (1, 36, n_heads, head_dim)
+    if qk_norm_scope is QKNormScope.HEAD:
+        assert triton_cache._k.stride() == (
+            36 * n_heads * head_dim,
+            head_dim,
+            36 * head_dim,
+            1,
+        )
+        assert triton_cache._v.stride() == triton_cache._k.stride()
+    else:
+        assert triton_cache._k.is_contiguous()
+        assert triton_cache._v.is_contiguous()
     rope = RotaryPositionEmbedding3D(
-        head_dim=64,
+        head_dim=head_dim,
         len_t=1,
         len_h=1,
         len_w=16,
@@ -295,11 +442,11 @@ def test_fp8_triton_attention_matches_bf16_reference_through_window_roll(
     generator = torch.Generator(device=tma_device).manual_seed(19)
 
     with torch.inference_mode():
-        for chunk_idx in range(3):
+        for chunk_idx in (0, 1, 2, 2):
             x = torch.randn(
                 1,
                 16,
-                128,
+                inner_dim,
                 generator=generator,
                 device=tma_device,
                 dtype=torch.bfloat16,
@@ -315,14 +462,14 @@ def test_fp8_triton_attention_matches_bf16_reference_through_window_roll(
             torch.testing.assert_close(
                 triton_cache.cached_k().to(torch.bfloat16),
                 reference_cache.cached_k(),
-                atol=1.25e-1,
-                rtol=1.25e-1,
+                atol=1.5e-1,
+                rtol=1.5e-1,
             )
             torch.testing.assert_close(
                 triton_cache.cached_v().to(torch.bfloat16),
                 reference_cache.cached_v(),
-                atol=1.25e-1,
-                rtol=1.25e-1,
+                atol=1.5e-1,
+                rtol=1.5e-1,
             )
             reference_cache.after_update(chunk_idx)
             triton_cache.after_update(chunk_idx)

@@ -15,12 +15,13 @@
 
 """Fused Q/K RMS normalization, RoPE, and K/V-cache updates.
 
-Two kernels reflect the normalization domains. ``QKNormScope.HEAD`` assigns a
-program to each ``[D]`` head; ``QKNormScope.INNER`` assigns one to the complete
-``[H * D]`` token width. Both optionally normalize and rotate Q/K, return
-processed Q, cache processed K, and cache unnormalized, unrotated V. Shape
-comments use ``B`` for batch, ``L`` for current tokens, ``S`` for cache
-capacity, ``H`` for heads, and ``D`` for the head dimension.
+Three launch topologies reflect the normalization domains. Head scope uses one
+program per ``[D]`` head without RoPE and tiles heads when RoPE can share its
+trigonometry. Inner scope assigns one program to the complete ``[H * D]`` token
+width. All paths optionally normalize and rotate Q/K, return processed Q, cache
+processed K, and cache unnormalized, unrotated V. Shape comments use ``B`` for
+batch, ``L`` for current tokens, ``S`` for cache capacity, ``H`` for heads, and
+``D`` for the head dimension.
 """
 
 from __future__ import annotations
@@ -256,6 +257,209 @@ def _fused_head_rms_rope_kv_cache_kernel(
 
 
 @triton.jit
+def _fused_tiled_head_rms_rope_kv_cache_kernel(
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    query_output_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    query_weight_ptr,
+    key_weight_ptr,
+    rope_freqs_ptr,
+    query_stride_b,
+    query_stride_l,
+    query_stride_h,
+    query_stride_d,
+    key_stride_b,
+    key_stride_l,
+    key_stride_h,
+    key_stride_d,
+    value_stride_b,
+    value_stride_l,
+    value_stride_h,
+    value_stride_d,
+    query_output_stride_b,
+    query_output_stride_l,
+    query_output_stride_h,
+    query_output_stride_d,
+    key_cache_stride_b,
+    key_cache_stride_l,
+    key_cache_stride_h,
+    key_cache_stride_d,
+    value_cache_stride_b,
+    value_cache_stride_l,
+    value_cache_stride_h,
+    value_cache_stride_d,
+    rope_stride_l,
+    rope_stride_d,
+    sequence_length,
+    num_heads,
+    cache_read_start,
+    cache_write_start,
+    cache_write_length,
+    EPS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    APPLY_NORM: tl.constexpr,
+    INTERLEAVED: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Process a head tile while sharing RoPE coefficients across its heads.
+
+    The three-dimensional grid is ``[B, L, ceil_div(H, BLOCK_H)]``. Each
+    program normalizes ``BLOCK_H`` heads independently, rotates Q/K from
+    registers, and writes the selected K/V cache interval.
+    """
+    batch = tl.program_id(0)
+    token = tl.program_id(1)
+    head_tile = tl.program_id(2)
+
+    head_offsets = head_tile * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_offsets < num_heads
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    tensor_mask = head_mask[:, None]
+
+    query_base = query_ptr + batch * query_stride_b + token * query_stride_l
+    key_base = key_ptr + batch * key_stride_b + token * key_stride_l
+    value_base = value_ptr + batch * value_stride_b + token * value_stride_l
+    query_offsets = (
+        head_offsets[:, None] * query_stride_h + dim_offsets[None, :] * query_stride_d
+    )
+    key_offsets = (
+        head_offsets[:, None] * key_stride_h + dim_offsets[None, :] * key_stride_d
+    )
+    value_offsets = (
+        head_offsets[:, None] * value_stride_h + dim_offsets[None, :] * value_stride_d
+    )
+    query = tl.load(query_base + query_offsets, mask=tensor_mask, other=0.0)
+    key = tl.load(key_base + key_offsets, mask=tensor_mask, other=0.0)
+
+    if APPLY_NORM:
+        query_float = query.to(tl.float32)
+        key_float = key.to(tl.float32)
+        query_scale = tl.rsqrt(
+            tl.sum(query_float * query_float, axis=1) / HEAD_DIM + EPS
+        )
+        key_scale = tl.rsqrt(tl.sum(key_float * key_float, axis=1) / HEAD_DIM + EPS)
+        query_weight = tl.load(query_weight_ptr + dim_offsets)
+        key_weight = tl.load(key_weight_ptr + dim_offsets)
+        query = (query * query_scale[:, None] * query_weight[None, :]).to(query.dtype)
+        key = (key * key_scale[:, None] * key_weight[None, :]).to(key.dtype)
+
+    # RoPE accepts one independent angle per feature lane. Materialize its
+    # trigonometry once per token and share it across every head in this tile.
+    frequencies = tl.load(
+        rope_freqs_ptr + token * rope_stride_l + dim_offsets * rope_stride_d
+    ).to(tl.float32)
+    if INTERLEAVED:
+        frequency_pairs = tl.reshape(frequencies, (HEAD_DIM // 2, 2))
+    else:
+        frequency_pairs = tl.reshape(
+            frequencies,
+            (2, HEAD_DIM // 2),
+        ).permute(1, 0)
+    frequencies_a, frequencies_b = tl.split(frequency_pairs)
+    cos_a = tl.cos(frequencies_a).to(query.dtype)[None, :]
+    sin_a = tl.sin(frequencies_a).to(query.dtype)[None, :]
+    cos_b = tl.cos(frequencies_b).to(query.dtype)[None, :]
+    sin_b = tl.sin(frequencies_b).to(query.dtype)[None, :]
+
+    if INTERLEAVED:
+        query_pairs = tl.reshape(query, (BLOCK_H, HEAD_DIM // 2, 2))
+        key_pairs = tl.reshape(key, (BLOCK_H, HEAD_DIM // 2, 2))
+        query_a, query_b = tl.split(query_pairs)
+        key_a, key_b = tl.split(key_pairs)
+        query = tl.reshape(
+            tl.join(
+                query_a * cos_a - query_b * sin_a,
+                query_b * cos_b + query_a * sin_b,
+            ),
+            (BLOCK_H, HEAD_DIM),
+        )
+        key = tl.reshape(
+            tl.join(
+                key_a * cos_a - key_b * sin_a,
+                key_b * cos_b + key_a * sin_b,
+            ),
+            (BLOCK_H, HEAD_DIM),
+        )
+    else:
+        query_pairs = tl.reshape(
+            query,
+            (BLOCK_H, 2, HEAD_DIM // 2),
+        ).permute(0, 2, 1)
+        key_pairs = tl.reshape(
+            key,
+            (BLOCK_H, 2, HEAD_DIM // 2),
+        ).permute(0, 2, 1)
+        query_a, query_b = tl.split(query_pairs)
+        key_a, key_b = tl.split(key_pairs)
+        query = tl.reshape(
+            tl.join(
+                query_a * cos_a - query_b * sin_a,
+                query_b * cos_b + query_a * sin_b,
+            ).permute(0, 2, 1),
+            (BLOCK_H, HEAD_DIM),
+        )
+        key = tl.reshape(
+            tl.join(
+                key_a * cos_a - key_b * sin_a,
+                key_b * cos_b + key_a * sin_b,
+            ).permute(0, 2, 1),
+            (BLOCK_H, HEAD_DIM),
+        )
+
+    query_output_base = (
+        query_output_ptr + batch * query_output_stride_b + token * query_output_stride_l
+    )
+    query_output_offsets = (
+        head_offsets[:, None] * query_output_stride_h
+        + dim_offsets[None, :] * query_output_stride_d
+    )
+    tl.store(
+        query_output_base + query_output_offsets,
+        query,
+        mask=tensor_mask,
+    )
+
+    cache_offset = token - cache_read_start
+    cache_token = cache_write_start + cache_offset
+    cache_token_mask = (cache_offset >= 0) & (cache_offset < cache_write_length)
+    cache_mask = tensor_mask & cache_token_mask
+    key_cache_base = (
+        key_cache_ptr + batch * key_cache_stride_b + cache_token * key_cache_stride_l
+    )
+    value_cache_base = (
+        value_cache_ptr
+        + batch * value_cache_stride_b
+        + cache_token * value_cache_stride_l
+    )
+    key_cache_offsets = (
+        head_offsets[:, None] * key_cache_stride_h
+        + dim_offsets[None, :] * key_cache_stride_d
+    )
+    value_cache_offsets = (
+        head_offsets[:, None] * value_cache_stride_h
+        + dim_offsets[None, :] * value_cache_stride_d
+    )
+    value = tl.load(
+        value_base + value_offsets,
+        mask=cache_mask,
+        other=0.0,
+    )
+    tl.store(
+        key_cache_base + key_cache_offsets,
+        key,
+        mask=cache_mask,
+    )
+    tl.store(
+        value_cache_base + value_cache_offsets,
+        value,
+        mask=cache_mask,
+    )
+
+
+@triton.jit
 def _fused_inner_rms_rope_kv_cache_kernel(
     query_ptr,
     key_ptr,
@@ -450,8 +654,10 @@ def fused_rms_rope_kv_cache_update(
         query: Projected queries with shape ``[B, L, H, D]``.
         key: Projected keys with shape ``[B, L, H, D]``.
         value: Projected values with shape ``[B, L, H, D]``.
-        key_cache: Contiguous key storage with shape ``[B, S, H, D]``.
-        value_cache: Contiguous value storage with shape ``[B, S, H, D]``.
+        key_cache: Dense token-major storage, or head-major storage for head
+            scope, with logical shape ``[B, S, H, D]``.
+        value_cache: Dense storage matching the supported ``key_cache`` layouts
+            and logical shape ``[B, S, H, D]``.
         query_weight: RMSNorm query weight with shape ``[D]`` for head scope or
             ``[H * D]`` for inner scope; ``None`` skips normalization.
         key_weight: RMSNorm key weight with the same shape as ``query_weight``;
@@ -504,12 +710,25 @@ def fused_rms_rope_kv_cache_update(
         raise RuntimeError(
             "K/V cache storage must match Q/K/V or use torch.float8_e4m3fn"
         )
-    if not key_cache.is_contiguous() or not value_cache.is_contiguous():
-        raise RuntimeError("K/V cache storage must be contiguous")
-    if query.stride(-1) != 1 or key.stride(-1) != 1 or value.stride(-1) != 1:
-        raise RuntimeError("Q/K/V feature dimensions must be contiguous")
     if not isinstance(norm_scope, QKNormScope):
         raise TypeError(f"norm_scope must be a QKNormScope; got {norm_scope!r}")
+
+    # Accept dense token-major storage plus its metadata-only head-major view for
+    # per-head processing. Both are non-overlapping and TMA-compatible.
+    cache_size = key_cache.shape[1]
+    token_major = key_cache.is_contiguous() and value_cache.is_contiguous()
+    head_major = (
+        norm_scope is QKNormScope.HEAD
+        and key_cache.transpose(1, 2).is_contiguous()
+        and value_cache.transpose(1, 2).is_contiguous()
+    )
+    if not token_major and not head_major:
+        raise RuntimeError(
+            "K/V cache storage must be dense token-major, or head-major for "
+            "head-scoped RMSNorm"
+        )
+    if query.stride(-1) != 1 or key.stride(-1) != 1 or value.stride(-1) != 1:
+        raise RuntimeError("Q/K/V feature dimensions must be contiguous")
 
     # Both normalization branches require a matched Q/K weight pair whose
     # width is determined by the selected reduction scope.
@@ -550,7 +769,6 @@ def fused_rms_rope_kv_cache_update(
 
     # The source ``L`` interval and destination ``S`` interval must each fit;
     # they may begin at different offsets when a rolling cache preserves sinks.
-    cache_size = key_cache.shape[1]
     if not (0 <= cache_read_start <= sequence_length):
         raise ValueError("cache_read_start is outside the current sequence")
     if not (0 <= cache_write_start <= cache_size):
@@ -584,40 +802,76 @@ def fused_rms_rope_kv_cache_update(
         "INTERLEAVED": rope_interleaved,
     }
     if norm_scope is QKNormScope.HEAD:
-        # The enum selects a distinct launch topology rather than a runtime
-        # string branch inside one oversized kernel.
-        # One program per ``(batch, token, head)`` and one power-of-two block
-        # covering the ``D``-wide normalization/rotation domain.
-        block_d = max(16, int(triton.next_power_of_2(head_dim)))
-        grid = (batch_size * sequence_length * num_heads,)
-        _fused_head_rms_rope_kv_cache_kernel[grid](
-            query,
-            key,
-            value,
-            query_output,
-            key_cache,
-            value_cache,
-            query_weight_ptr,
-            key_weight_ptr,
-            rope_pointer,
-            *query.stride(),
-            *key.stride(),
-            *value.stride(),
-            *query_output.stride(),
-            *key_cache.stride(),
-            *value_cache.stride(),
-            rope_pointer.stride(0),
-            rope_pointer.stride(-1),
-            sequence_length,
-            num_heads,
-            cache_read_start,
-            cache_write_start,
-            cache_write_length,
-            BLOCK_D=block_d,
-            **common_meta,
-            num_warps=4,
-            num_stages=1,
-        )
+        if rope_freqs is not None and head_dim & (head_dim - 1) == 0:
+            # Tile heads together so one full-width trigonometry pass broadcasts
+            # across multiple independent RMSNorm domains.
+            block_h = min(16, int(triton.next_power_of_2(num_heads)))
+            head_tiles = triton.cdiv(num_heads, block_h)
+            grid = (batch_size, sequence_length, head_tiles)
+            _fused_tiled_head_rms_rope_kv_cache_kernel[grid](
+                query,
+                key,
+                value,
+                query_output,
+                key_cache,
+                value_cache,
+                query_weight_ptr,
+                key_weight_ptr,
+                rope_pointer,
+                *query.stride(),
+                *key.stride(),
+                *value.stride(),
+                *query_output.stride(),
+                *key_cache.stride(),
+                *value_cache.stride(),
+                rope_pointer.stride(0),
+                rope_pointer.stride(-1),
+                sequence_length,
+                num_heads,
+                cache_read_start,
+                cache_write_start,
+                cache_write_length,
+                EPS=norm_eps,
+                HEAD_DIM=head_dim,
+                APPLY_NORM=apply_norm,
+                INTERLEAVED=rope_interleaved,
+                BLOCK_H=block_h,
+                num_warps=4,
+                num_stages=1,
+            )
+        else:
+            # Preserve the generic topology when RoPE is disabled or head
+            # features cannot be reshaped into exact rotation pairs.
+            block_d = max(16, int(triton.next_power_of_2(head_dim)))
+            grid = (batch_size * sequence_length * num_heads,)
+            _fused_head_rms_rope_kv_cache_kernel[grid](
+                query,
+                key,
+                value,
+                query_output,
+                key_cache,
+                value_cache,
+                query_weight_ptr,
+                key_weight_ptr,
+                rope_pointer,
+                *query.stride(),
+                *key.stride(),
+                *value.stride(),
+                *query_output.stride(),
+                *key_cache.stride(),
+                *value_cache.stride(),
+                rope_pointer.stride(0),
+                rope_pointer.stride(-1),
+                sequence_length,
+                num_heads,
+                cache_read_start,
+                cache_write_start,
+                cache_write_length,
+                BLOCK_D=block_d,
+                **common_meta,
+                num_warps=4,
+                num_stages=1,
+            )
     else:
         # Flattened inner-width loads require H and D to form one contiguous
         # physical span.
