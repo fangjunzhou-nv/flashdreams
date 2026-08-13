@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import torch
 from torch import Tensor
@@ -26,6 +28,10 @@ from flashdreams.accelerated.multi_head_attention import (
     QKNormScope,
 )
 from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_triton import (
+    SDPABackend,
+    TritonMultiHeadAttention,
+)
 from flashdreams.core.attention import RotaryPositionEmbedding3D
 
 pytestmark = pytest.mark.ci_cpu
@@ -56,6 +62,22 @@ class _Attention(MultiHeadAttention[object]):
         """Return ``x`` unchanged."""
         del kv_cache, rope_freqs
         return x
+
+
+def test_triton_sdpa_backend_constructor_policy() -> None:
+    """Default to cuDNN, retain Triton, and reject every other backend."""
+    assert TritonMultiHeadAttention(128, head_dim=64).sdpa_backend is SDPABackend.CUDNN
+    assert (
+        TritonMultiHeadAttention(
+            128,
+            head_dim=64,
+            sdpa_backend=SDPABackend.TRITON,
+        ).sdpa_backend
+        is SDPABackend.TRITON
+    )
+    string_backend = cast(SDPABackend, "cudnn")
+    with pytest.raises(TypeError, match="SDPABackend"):
+        TritonMultiHeadAttention(128, head_dim=64, sdpa_backend=string_backend)
 
 
 def test_initialize_cache_is_abstract() -> None:

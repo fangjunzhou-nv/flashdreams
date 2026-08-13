@@ -13,19 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Triton implementation of inference-only streaming self-attention.
+"""Triton-accelerated inference-only streaming self-attention.
 
 One GEMM produces Q/K/V, then a Triton kernel fuses Q/K RMSNorm, Q/K RoPE, and
-the K/V-cache write. Processed Q attends through autotuned TMA FlashAttention2
-before the output projection. An opt-in FP8 policy covers both projection
-GEMMs, attention tensors, and cache storage while preserving BF16/FP16 module
-inputs and outputs.
+the K/V-cache write. Processed Q attends through either cuDNN SDPA or autotuned
+TMA FlashAttention2 before the output projection. An opt-in FP8 policy covers
+both projection GEMMs and, for the TMA backend, attention tensors and cache
+storage while preserving BF16/FP16 module inputs and outputs.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from enum import Enum
 
 import torch
 import torch.nn.functional as F
@@ -41,6 +42,16 @@ from flashdreams.accelerated.triton import (
     fused_rms_rope_kv_cache_update,
 )
 from flashdreams.core.attention import BlockKVCache
+
+
+class SDPABackend(str, Enum):
+    """Scaled-dot-product attention implementation."""
+
+    CUDNN = "cudnn"
+    """Use PyTorch SDPA forced to the cuDNN backend."""
+
+    TRITON = "triton"
+    """Use Triton TMA FlashAttention2."""
 
 
 def _cache_write_slice(kv_cache: BlockKVCache) -> tuple[int, int, int]:
@@ -105,7 +116,10 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
     """Key RMSNorm over ``[D]`` or ``[H * D]``, or identity."""
 
     use_fp8: bool
-    """Whether projection, attention, output, and cache storage use FP8."""
+    """Whether projection/output GEMMs and supported attention storage use FP8."""
+
+    sdpa_backend: SDPABackend
+    """Scaled-dot-product attention implementation selected at construction."""
 
     _fused_qkv_weight: Tensor | None
     """Non-persistent native or E4M3 QKV weight, shape ``[3 * H * D, Q]``."""
@@ -135,6 +149,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         qk_norm_scope: QKNormScope = QKNormScope.HEAD,
         rope_interleaved: bool = False,
         use_fp8: bool = False,
+        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
     ) -> None:
         """Initialize projections and fused attention policies.
 
@@ -149,10 +164,13 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             qk_norm_scope: Feature scope used by Q/K RMS normalization.
             rope_interleaved: Rotate adjacent feature pairs instead of half splits.
             use_fp8: Use row-scaled E4M3 projection/output GEMMs and E4M3
-                attention/cache storage.
+                attention/cache storage with the Triton backend. cuDNN uses the
+                native activation dtype for attention and cache storage.
+            sdpa_backend: Scaled-dot-product attention implementation.
 
         Raises:
-            ValueError: ``head_dim`` is unsupported by the TMA attention kernel.
+            TypeError: ``sdpa_backend`` is not an :class:`SDPABackend`.
+            ValueError: ``head_dim`` is unsupported.
         """
         super().__init__(
             query_dim=query_dim,
@@ -161,15 +179,20 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             qk_norm_scope=qk_norm_scope,
             rope_interleaved=rope_interleaved,
         )
+        if not isinstance(sdpa_backend, SDPABackend):
+            raise TypeError(
+                f"sdpa_backend must be an SDPABackend; got {sdpa_backend!r}"
+            )
         if not (16 <= head_dim <= 256 and head_dim & (head_dim - 1) == 0):
             raise ValueError(
-                "TMA FlashAttention2 requires a power-of-two head_dim in [16, 256]; "
+                "accelerated attention requires a power-of-two head_dim in [16, 256]; "
                 f"got {head_dim}"
             )
         if use_fp8 and query_dim % 16 != 0:
             raise ValueError("FP8 projections require query_dim to be a multiple of 16")
 
         self.use_fp8 = use_fp8
+        self.sdpa_backend = sdpa_backend
 
         # Keep separate ``[H * D, Q]`` parameters for state-dict compatibility;
         # inference reads the derived fused ``[3 * H * D, Q]`` weight below.
@@ -278,7 +301,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             window_size: Number of rolling context tokens retained after the sink.
             sink_size: Number of initial context tokens that are never evicted.
             device: Device on which to allocate K/V storage.
-            dtype: Native activation dtype; the cache uses E4M3 when FP8 is enabled.
+            dtype: Native activation dtype. The TMA backend uses E4M3 cache
+                storage when FP8 is enabled; cuDNN retains this dtype.
 
         Returns:
             Block cache with K/V storage shaped
@@ -289,7 +313,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 BF16.
         """
         # Preserve logical ``[B, S, H, D]`` axes. Head-scoped attention stores
-        # each ``[S, D]`` plane contiguously so TMA streams K/V without gathers.
+        # each ``[S, D]`` plane contiguously for direct SDPA reads without gathers.
         cache_shape = (
             batch_size,
             sink_size + window_size,
@@ -297,7 +321,12 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             self.head_dim,
         )
         if self.use_fp8 and dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError("FP8 attention requires FP16 or BF16 activations")
+            raise TypeError("FP8 projections require FP16 or BF16 activations")
+        cache_dtype = (
+            torch.float8_e4m3fn
+            if self.use_fp8 and self.sdpa_backend is SDPABackend.TRITON
+            else dtype
+        )
         cache = BlockKVCache(
             k_shape=cache_shape,
             v_shape=cache_shape,
@@ -306,7 +335,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             window_size=window_size,
             sink_size=sink_size,
             device=device,
-            dtype=torch.float8_e4m3fn if self.use_fp8 else dtype,
+            dtype=cache_dtype,
         )
         if self.qk_norm_scope is QKNormScope.HEAD:
             storage_shape = (
@@ -388,6 +417,28 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             output_dtype,
         )
 
+    def _attention(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        """Apply the configured non-causal scaled-dot-product attention backend.
+
+        Args:
+            query: Processed queries with shape ``[B, L, H, D]``.
+            key: Cached keys with shape ``[B, S, H, D]``.
+            value: Cached values with shape ``[B, S, H, D]``.
+
+        Returns:
+            Attention output with shape ``[B, L, H, D]``.
+        """
+        if self.sdpa_backend is SDPABackend.CUDNN:
+            query = query.transpose(1, 2)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+            with torch.nn.attention.sdpa_kernel(
+                torch.nn.attention.SDPBackend.CUDNN_ATTENTION
+            ):
+                output = F.scaled_dot_product_attention(query, key, value)
+            return output.transpose(1, 2)
+        return flash_attention_2_tma(query, key, value)
+
     def _validate_forward_inputs(
         self,
         x: Tensor,
@@ -415,16 +466,15 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 f"got {x.shape[-1]}"
             )
 
-        # The Triton path accepts native FP16/BF16 CUDA inputs; FP8 is an
-        # internal attention and cache-storage policy.
+        # The accelerated path accepts native FP16/BF16 CUDA inputs; FP8 is
+        # an internal projection and TMA attention/cache-storage policy.
         if not x.is_cuda or x.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
                 "TritonMultiHeadAttention requires CUDA FP16 or BF16 inputs"
             )
         if torch.cuda.get_device_capability(x.device)[0] < 9:
             raise RuntimeError(
-                "TritonMultiHeadAttention TMA kernels require compute capability "
-                "9.0 or newer"
+                "TritonMultiHeadAttention requires compute capability 9.0 or newer"
             )
 
         # The caller prepares cache write bounds before attention. K/V storage
@@ -457,12 +507,16 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             )
 
         # K/V share shape, device, storage precision, and dense layout so one
-        # fused kernel can write them and TMA can read them directly.
+        # fused kernel can write them for the configured attention backend.
         if kv_cache._v.shape != kv_cache._k.shape:
             raise ValueError("Triton attention requires identical K/V cache shapes")
         if kv_cache._k.device != x.device or kv_cache._v.device != x.device:
             raise RuntimeError("K/V cache tensors must match the input device")
-        expected_cache_dtype = torch.float8_e4m3fn if self.use_fp8 else x.dtype
+        expected_cache_dtype = (
+            torch.float8_e4m3fn
+            if self.use_fp8 and self.sdpa_backend is SDPABackend.TRITON
+            else x.dtype
+        )
         if (
             kv_cache._k.dtype != expected_cache_dtype
             or kv_cache._v.dtype != expected_cache_dtype
@@ -499,12 +553,12 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         kv_cache: BlockKVCache,
         rope_freqs: Tensor | None = None,
     ) -> Tensor:
-        """Project a token chunk, update its cache, and apply TMA attention.
+        """Project a token chunk, update its cache, and apply attention.
 
         The fused preprocessing kernel applies Q/K RMSNorm and optional RoPE,
         returns processed Q, and writes processed K plus V directly into cache
-        storage. TMA FlashAttention2 then reads that updated cache without
-        materializing separate visible K/V tensors.
+        storage. The configured SDPA backend then reads that updated cache
+        without materializing separate visible K/V tensors.
 
         Args:
             x: Current query tokens with shape ``[..., L, query_dim]``.
@@ -554,7 +608,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
 
         # Kernel boundary: consume Q/K/V ``[B, L, H, D]``, return processed Q
         # with the same shape, and write processed K plus unmodified V into cache
-        # ``[B, S, H, D]``. FP8 mode stores both returned Q and cached K/V as E4M3.
+        # ``[B, S, H, D]``. TMA FP8 mode stores returned Q and cached K/V as
+        # E4M3; cuDNN keeps them in the native activation dtype it supports.
         query = fused_rms_rope_kv_cache_update(
             query,
             key,
@@ -575,7 +630,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         # The visible cache already includes this chunk. Attention is non-causal
         # within a chunk because video-model recipes expose whole chunks at once:
         # Q ``[B, L, H, D]`` x K/V ``[B, S, H, D]`` -> ``[B, L, H, D]``.
-        output = flash_attention_2_tma(
+        output = self._attention(
             query,
             kv_cache.cached_k(),
             kv_cache.cached_v(),
@@ -588,4 +643,4 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         return output.reshape(batch_shape + (sequence_length, self.query_dim))
 
 
-__all__ = ["TritonMultiHeadAttention"]
+__all__ = ["SDPABackend", "TritonMultiHeadAttention"]

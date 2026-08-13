@@ -17,13 +17,19 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 import torch.nn.functional as F
 
+import flashdreams.accelerated.multi_head_attention_triton as triton_mha
 from flashdreams.accelerated.multi_head_attention import QKNormScope
 from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
-from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_triton import (
+    SDPABackend,
+    TritonMultiHeadAttention,
+)
 from flashdreams.accelerated.triton import (
     flash_attention_2_tma,
     fp8_quantization,
@@ -46,6 +52,61 @@ def tma_device() -> torch.device:
     if torch.cuda.get_device_capability(device)[0] < 9:
         pytest.skip("TMA attention requires compute capability 9.0 or newer.")
     return device
+
+
+@pytest.mark.parametrize(
+    "sdpa_backend", tuple(SDPABackend), ids=lambda backend: backend.value
+)
+def test_attention_dispatches_configured_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tma_device: torch.device,
+    sdpa_backend: SDPABackend,
+) -> None:
+    """Call exactly the selected cuDNN or Triton SDPA implementation."""
+    attention = TritonMultiHeadAttention(
+        128,
+        n_heads=2,
+        head_dim=64,
+        sdpa_backend=sdpa_backend,
+    )
+    query = torch.empty((1, 2, 2, 64), device=tma_device, dtype=torch.bfloat16)
+    calls: list[SDPABackend] = []
+
+    def record_cudnn(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        del key, value
+        calls.append(SDPABackend.CUDNN)
+        return query
+
+    def record_triton(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        del key, value
+        calls.append(SDPABackend.TRITON)
+        return query
+
+    cudnn_kernel = MagicMock()
+    monkeypatch.setattr(triton_mha.F, "scaled_dot_product_attention", record_cudnn)
+    monkeypatch.setattr(
+        triton_mha.torch.nn.attention,
+        "sdpa_kernel",
+        cudnn_kernel,
+    )
+    monkeypatch.setattr(triton_mha, "flash_attention_2_tma", record_triton)
+
+    assert torch.equal(attention._attention(query, query, query), query)
+    assert calls == [sdpa_backend]
+    if sdpa_backend is SDPABackend.CUDNN:
+        cudnn_kernel.assert_called_once_with(
+            torch.nn.attention.SDPBackend.CUDNN_ATTENTION
+        )
+    else:
+        cudnn_kernel.assert_not_called()
 
 
 def test_fused_fp8_row_quantization_matches_torch(
@@ -262,6 +323,9 @@ def test_tma_flash_attention_matches_sdpa(
 
 
 @pytest.mark.parametrize(
+    "sdpa_backend", tuple(SDPABackend), ids=lambda backend: backend.value
+)
+@pytest.mark.parametrize(
     (
         "qk_norm_scope",
         "rope_interleaved",
@@ -281,6 +345,7 @@ def test_triton_attention_matches_reference_through_window_roll(
     projection_bias: bool,
     n_heads: int,
     head_dim: int,
+    sdpa_backend: SDPABackend,
 ) -> None:
     """Compare streaming attention across fill, roll, and overwrite phases."""
     torch.manual_seed(7)
@@ -302,6 +367,7 @@ def test_triton_attention_matches_reference_through_window_roll(
         output_bias=projection_bias,
         qk_norm_scope=qk_norm_scope,
         rope_interleaved=rope_interleaved,
+        sdpa_backend=sdpa_backend,
     ).to(device=tma_device, dtype=torch.bfloat16)
     triton_attention.load_state_dict(reference.state_dict())
     reference.eval()
@@ -361,6 +427,9 @@ def test_triton_attention_matches_reference_through_window_roll(
 
 
 @pytest.mark.parametrize(
+    "sdpa_backend", tuple(SDPABackend), ids=lambda backend: backend.value
+)
+@pytest.mark.parametrize(
     (
         "qk_norm_scope",
         "rope_interleaved",
@@ -380,6 +449,7 @@ def test_fp8_triton_attention_matches_bf16_reference_through_window_roll(
     projection_bias: bool,
     n_heads: int,
     head_dim: int,
+    sdpa_backend: SDPABackend,
 ) -> None:
     """Bound FP8 error across cache fill, roll, and overwrite phases."""
     torch.manual_seed(17)
@@ -402,6 +472,7 @@ def test_fp8_triton_attention_matches_bf16_reference_through_window_roll(
         qk_norm_scope=qk_norm_scope,
         rope_interleaved=rope_interleaved,
         use_fp8=True,
+        sdpa_backend=sdpa_backend,
     ).to(device=tma_device, dtype=torch.bfloat16)
     triton_attention.load_state_dict(reference.state_dict())
     reference.eval()
@@ -417,8 +488,11 @@ def test_fp8_triton_attention_matches_bf16_reference_through_window_roll(
         dtype=torch.bfloat16,
     )
     assert type(triton_cache) is BlockKVCache
-    assert triton_cache._k.dtype is torch.float8_e4m3fn
-    assert triton_cache._v.dtype is torch.float8_e4m3fn
+    expected_cache_dtype = (
+        torch.float8_e4m3fn if sdpa_backend is SDPABackend.TRITON else torch.bfloat16
+    )
+    assert triton_cache._k.dtype is expected_cache_dtype
+    assert triton_cache._v.dtype is expected_cache_dtype
     assert triton_cache._k.shape == (1, 36, n_heads, head_dim)
     if qk_norm_scope is QKNormScope.HEAD:
         assert triton_cache._k.stride() == (
