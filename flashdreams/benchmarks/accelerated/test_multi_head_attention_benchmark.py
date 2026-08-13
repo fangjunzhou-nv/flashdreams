@@ -75,8 +75,8 @@ class _Implementation(str, Enum):
     REFERENCE_TORCH = "reference_torch"
     TRITON_CUDNN = "accelerated_triton_cudnn"
     TRITON_CUDNN_FP8 = "accelerated_triton_cudnn_fp8"
-    TRITON_TMA = "accelerated_triton_tma"
-    TRITON_TMA_FP8 = "accelerated_triton_tma_fp8"
+    TRITON_FA2 = "accelerated_triton_fa2"
+    TRITON_FA2_FP8 = "accelerated_triton_fa2_fp8"
 
     @property
     def is_triton(self) -> bool:
@@ -86,14 +86,14 @@ class _Implementation(str, Enum):
     @property
     def use_fp8(self) -> bool:
         """Whether this implementation uses FP8 projections and caches."""
-        return self in (self.TRITON_CUDNN_FP8, self.TRITON_TMA_FP8)
+        return self in (self.TRITON_CUDNN_FP8, self.TRITON_FA2_FP8)
 
     @property
     def sdpa_backend(self) -> SDPABackend:
         """Return the explicit SDPA backend for a Triton implementation."""
         if self in (self.TRITON_CUDNN, self.TRITON_CUDNN_FP8):
             return SDPABackend.CUDNN
-        if self in (self.TRITON_TMA, self.TRITON_TMA_FP8):
+        if self in (self.TRITON_FA2, self.TRITON_FA2_FP8):
             return SDPABackend.TRITON
         raise ValueError(f"{self.value} does not use Triton multi-head attention")
 
@@ -399,8 +399,8 @@ def _benchmark_multi_head_attention(
                 _Implementation.REFERENCE_TORCH: "auto_sdpa",
                 _Implementation.TRITON_CUDNN: "torch_cudnn_sdpa",
                 _Implementation.TRITON_CUDNN_FP8: "torch_cudnn_sdpa",
-                _Implementation.TRITON_TMA: "triton_tma_flash_attention_2",
-                _Implementation.TRITON_TMA_FP8: "triton_tma_flash_attention_2_fp8",
+                _Implementation.TRITON_FA2: "triton_fa2",
+                _Implementation.TRITON_FA2_FP8: "triton_fa2_fp8",
             }[implementation],
             "projection_backend": (
                 "row_scaled_fp8_fused_qkv_output"
@@ -543,45 +543,45 @@ def test_wan_accelerated_triton_cudnn_fp8_multi_head_attention_benchmark(
     )
 
 
-def test_cosmos_accelerated_triton_tma_multi_head_attention_benchmark(
+def test_cosmos_accelerated_triton_fa2_multi_head_attention_benchmark(
     benchmark: BenchmarkFixture,
 ) -> None:
-    """Benchmark Triton TMA attention configured for Cosmos."""
+    """Benchmark Triton FA2 attention configured for Cosmos."""
     _benchmark_multi_head_attention(
         benchmark,
         config=_COSMOS_CONFIG,
-        implementation=_Implementation.TRITON_TMA,
+        implementation=_Implementation.TRITON_FA2,
     )
 
 
-def test_wan_accelerated_triton_tma_multi_head_attention_benchmark(
+def test_wan_accelerated_triton_fa2_multi_head_attention_benchmark(
     benchmark: BenchmarkFixture,
 ) -> None:
-    """Benchmark Triton TMA attention configured for Wan."""
+    """Benchmark Triton FA2 attention configured for Wan."""
     _benchmark_multi_head_attention(
         benchmark,
         config=_WAN_CONFIG,
-        implementation=_Implementation.TRITON_TMA,
+        implementation=_Implementation.TRITON_FA2,
     )
 
 
-def test_cosmos_accelerated_triton_tma_fp8_multi_head_attention_benchmark(
+def test_cosmos_accelerated_triton_fa2_fp8_multi_head_attention_benchmark(
     benchmark: BenchmarkFixture,
 ) -> None:
-    """Benchmark end-to-end FP8 Triton TMA attention configured for Cosmos."""
+    """Benchmark end-to-end FP8 Triton FA2 attention configured for Cosmos."""
     _benchmark_multi_head_attention(
         benchmark,
         config=_COSMOS_CONFIG,
-        implementation=_Implementation.TRITON_TMA_FP8,
+        implementation=_Implementation.TRITON_FA2_FP8,
     )
 
 
-def test_wan_accelerated_triton_tma_fp8_multi_head_attention_benchmark(
+def test_wan_accelerated_triton_fa2_fp8_multi_head_attention_benchmark(
     benchmark: BenchmarkFixture,
 ) -> None:
-    """Benchmark end-to-end FP8 Triton TMA attention configured for Wan."""
+    """Benchmark end-to-end FP8 Triton FA2 attention configured for Wan."""
     _benchmark_multi_head_attention(
         benchmark,
         config=_WAN_CONFIG,
-        implementation=_Implementation.TRITON_TMA_FP8,
+        implementation=_Implementation.TRITON_FA2_FP8,
     )

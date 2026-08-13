@@ -82,7 +82,7 @@ def test_lingbot_patchify_marks_i2v_and_plucker_as_patchified() -> None:
     [
         pytest.param(AttentionBackend.WAN, SDPABackend.CUDNN, id="wan"),
         pytest.param(AttentionBackend.TRITON, SDPABackend.CUDNN, id="triton-cudnn"),
-        pytest.param(AttentionBackend.TRITON, SDPABackend.TRITON, id="triton-tma"),
+        pytest.param(AttentionBackend.TRITON, SDPABackend.TRITON, id="triton-fa2"),
     ],
 )
 def test_lingbot_network_propagates_attention_backend(

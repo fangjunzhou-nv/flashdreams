@@ -94,7 +94,7 @@ def _self_attention_operator(backend: AttentionBackend) -> str:
     """Return the concrete self-attention operator name for a backend."""
     if backend is AttentionBackend.WAN:
         return "cudnn"
-    return "triton_tma_flash_attention_2_fp8"
+    return "triton_fa2_fp8"
 
 
 def _skip_unsupported_backend(

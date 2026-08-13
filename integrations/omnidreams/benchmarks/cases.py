@@ -70,16 +70,16 @@ TRITON_CUDNN_CASE = AttentionBenchmarkCase(
     attention_backend=AttentionBackend.TRITON,
     sdpa_backend=SDPABackend.CUDNN,
     self_attention_operator="torch_cudnn_sdpa",
-    cross_attention_operator="triton_tma_flash_attention_2",
+    cross_attention_operator="triton_fa2",
     minimum_compute_capability=(9, 0),
 )
 
-TRITON_TMA_CASE = AttentionBenchmarkCase(
-    implementation="triton_tma",
+TRITON_FA2_CASE = AttentionBenchmarkCase(
+    implementation="triton_fa2",
     attention_backend=AttentionBackend.TRITON,
     sdpa_backend=SDPABackend.TRITON,
-    self_attention_operator="triton_tma_flash_attention_2",
-    cross_attention_operator="triton_tma_flash_attention_2",
+    self_attention_operator="triton_fa2",
+    cross_attention_operator="triton_fa2",
     minimum_compute_capability=(9, 0),
 )
 
@@ -95,7 +95,7 @@ NATIVE_CUDA_CASE = AttentionBenchmarkCase(
 PYTORCH_ATTENTION_CASES = (
     OMNIDREAMS_TORCH_CASE,
     TRITON_CUDNN_CASE,
-    TRITON_TMA_CASE,
+    TRITON_FA2_CASE,
 )
 """Attention cases that execute the PyTorch DiT network."""
 

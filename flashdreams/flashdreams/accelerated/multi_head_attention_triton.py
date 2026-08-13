@@ -17,8 +17,8 @@
 
 One GEMM produces Q/K/V, then a Triton kernel fuses Q/K RMSNorm, Q/K RoPE, and
 the K/V-cache write. Processed Q attends through either cuDNN SDPA or autotuned
-TMA FlashAttention2 before the output projection. An opt-in FP8 policy covers
-both projection GEMMs and, for the TMA backend, attention tensors and cache
+Triton FlashAttention2 (FA2) before the output projection. An opt-in FP8 policy covers
+both projection GEMMs and, for the Triton FA2 backend, attention tensors and cache
 storage while preserving BF16/FP16 module inputs and outputs.
 """
 
@@ -51,7 +51,7 @@ class SDPABackend(str, Enum):
     """Use PyTorch SDPA forced to the cuDNN backend."""
 
     TRITON = "triton"
-    """Use Triton TMA FlashAttention2."""
+    """Use Triton FlashAttention2 (FA2)."""
 
 
 def _cache_write_slice(kv_cache: BlockKVCache) -> tuple[int, int, int]:
@@ -301,7 +301,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             window_size: Number of rolling context tokens retained after the sink.
             sink_size: Number of initial context tokens that are never evicted.
             device: Device on which to allocate K/V storage.
-            dtype: Native activation dtype. The TMA backend uses E4M3 cache
+            dtype: Native activation dtype. The Triton FA2 backend uses E4M3 cache
                 storage when FP8 is enabled; cuDNN retains this dtype.
 
         Returns:
@@ -467,7 +467,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             )
 
         # The accelerated path accepts native FP16/BF16 CUDA inputs; FP8 is
-        # an internal projection and TMA attention/cache-storage policy.
+        # an internal projection and FA2 attention/cache-storage policy.
         if not x.is_cuda or x.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
                 "TritonMultiHeadAttention requires CUDA FP16 or BF16 inputs"
@@ -608,7 +608,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
 
         # Kernel boundary: consume Q/K/V ``[B, L, H, D]``, return processed Q
         # with the same shape, and write processed K plus unmodified V into cache
-        # ``[B, S, H, D]``. TMA FP8 mode stores returned Q and cached K/V as
+        # ``[B, S, H, D]``. Triton FA2 FP8 mode stores returned Q and cached K/V as
         # E4M3; cuDNN keeps them in the native activation dtype it supports.
         query = fused_rms_rope_kv_cache_update(
             query,

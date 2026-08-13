@@ -263,21 +263,21 @@ To run a narrower benchmark, replace the benchmark directory in that command
 with one of these files:
 
 - `test_modules.py` benchmarks the DiT block and self-attention with the
-  `omnidreams_torch`, `triton_cudnn`, and `triton_tma` implementations.
+  `omnidreams_torch`, `triton_cudnn`, and `triton_fa2` implementations.
   Cross-attention is unaffected by the SDPA selector and is benchmarked once
   per projection backend. The backend-independent MLP is benchmarked once.
 - `test_network.py` benchmarks one steady-state DiT evaluation with the
-  `omnidreams_torch`, `triton_cudnn`, `triton_tma`, and native `cuda`
+  `omnidreams_torch`, `triton_cudnn`, `triton_fa2`, and native `cuda`
   implementations. It uses production tensor geometry with random weights, so
   checkpoint loading and startup are excluded.
 - `test_pipeline.py` benchmarks steady-state generation and finalization with
-  the `omnidreams_torch`, `triton_cudnn`, `triton_tma`, and native `cuda`
+  the `omnidreams_torch`, `triton_cudnn`, `triton_fa2`, and native `cuda`
   implementations at the runner's production 704x1280 resolution and scheduler
   configuration.
 
 Both Triton implementations use row-scaled FP8 projections. `triton_cudnn`
 uses PyTorch's cuDNN SDPA backend with a BF16 self-attention cache, while
-`triton_tma` uses Triton TMA FlashAttention2 with an E4M3 cache. Text and
+`triton_fa2` uses Triton FlashAttention2 (FA2) with an E4M3 cache. Text and
 cross-view attention remain BF16.
 
 The Triton cases require an NVIDIA GPU with compute capability 9.0 or newer;

@@ -72,7 +72,7 @@ class _Implementation(str, Enum):
 
     WAN_TORCH = "wan_torch"
     TRITON_CUDNN = "triton_cudnn"
-    TRITON_TMA = "triton_tma"
+    TRITON_FA2 = "triton_fa2"
 
     @property
     def attention_backend(self) -> AttentionBackend:
@@ -84,7 +84,7 @@ class _Implementation(str, Enum):
     @property
     def sdpa_backend(self) -> SDPABackend:
         """Return the configured self-attention SDPA implementation."""
-        if self is self.TRITON_TMA:
+        if self is self.TRITON_FA2:
             return SDPABackend.TRITON
         return SDPABackend.CUDNN
 
@@ -95,7 +95,7 @@ class _Implementation(str, Enum):
             return "cudnn"
         if self is self.TRITON_CUDNN:
             return "torch_cudnn_sdpa"
-        return "triton_tma_flash_attention_2"
+        return "triton_fa2"
 
 
 assert {case.attention_backend for case in _Implementation} == set(AttentionBackend)
