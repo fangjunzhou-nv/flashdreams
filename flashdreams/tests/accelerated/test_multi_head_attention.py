@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-
 import pytest
 import torch
 from torch import Tensor
@@ -26,14 +25,27 @@ from flashdreams.accelerated.multi_head_attention import (
     MultiHeadAttention,
     QKNormScope,
 )
-from flashdreams.accelerated.reference import TorchMultiHeadAttention
-from flashdreams.core.attention import BlockKVCache, RotaryPositionEmbedding3D
+from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
+from flashdreams.core.attention import RotaryPositionEmbedding3D
 
 pytestmark = pytest.mark.ci_cpu
 
 
 class _Attention(MultiHeadAttention[object]):
     """Minimal concrete attention used to test base initialization."""
+
+    def initialize_cache(
+        self,
+        batch_size: int,
+        chunk_size: int,
+        window_size: int,
+        sink_size: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> object:
+        """Return a placeholder cache for interface tests."""
+        del batch_size, chunk_size, window_size, sink_size, device, dtype
+        return object()
 
     def forward(
         self,
@@ -44,6 +56,11 @@ class _Attention(MultiHeadAttention[object]):
         """Return ``x`` unchanged."""
         del kv_cache, rope_freqs
         return x
+
+
+def test_initialize_cache_is_abstract() -> None:
+    """Require every accelerated attention implementation to create its cache."""
+    assert "initialize_cache" in MultiHeadAttention.__abstractmethods__
 
 
 def test_attention_geometry_and_policies_are_stored() -> None:
@@ -106,12 +123,11 @@ def test_torch_attention_runs_complete_streaming_forward_on_cpu() -> None:
         n_heads=n_heads,
         head_dim=head_dim,
     )
-    kv_cache = BlockKVCache(
-        k_shape=(batch_size, chunk_size, n_heads, head_dim),
-        v_shape=(batch_size, chunk_size, n_heads, head_dim),
-        seq_dim=1,
+    kv_cache = attention.initialize_cache(
+        batch_size=batch_size,
         chunk_size=chunk_size,
         window_size=chunk_size,
+        sink_size=0,
         device=torch.device("cpu"),
         dtype=x.dtype,
     )

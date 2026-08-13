@@ -21,10 +21,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashdreams.accelerated.impl import TritonMultiHeadAttention
-from flashdreams.accelerated.impl.triton import flash_attention_2_tma
 from flashdreams.accelerated.multi_head_attention import QKNormScope
-from flashdreams.accelerated.reference import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
+from flashdreams.accelerated.triton import flash_attention_2_tma, fp8_quantization
 from flashdreams.core.attention import (
     BlockKVCache,
     RotaryPositionEmbedding3D,
@@ -44,6 +44,48 @@ def tma_device() -> torch.device:
     return device
 
 
+def test_fused_fp8_row_quantization_matches_torch(
+    tma_device: torch.device,
+) -> None:
+    """Match fused row quantization with the original PyTorch operations."""
+    generator = torch.Generator(device=tma_device).manual_seed(5)
+    x = torch.randn(
+        (1536, 7),
+        generator=generator,
+        device=tma_device,
+        dtype=torch.bfloat16,
+    ).T
+    x[0].zero_()
+    actual, actual_scales = fp8_quantization._quantize_fp8_rows(x)
+
+    x_float = x.to(torch.float32)
+    expected_scales = (
+        (x_float.abs().amax(dim=1, keepdim=True) / fp8_quantization._FP8_MAX)
+        .clamp_min(1e-12)
+        .contiguous()
+    )
+    expected = (
+        (x_float / expected_scales)
+        .clamp(-fp8_quantization._FP8_MAX, fp8_quantization._FP8_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+    assert actual.is_contiguous()
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_scales, expected_scales)
+    assert torch.count_nonzero(actual[0]) == 0
+    assert actual_scales[0, 0] == 1e-12
+
+    nan_input = x.clone()
+    nan_input[0, 0] = float("nan")
+    nan_output, _ = fp8_quantization._quantize_fp8_rows(nan_input)
+    assert torch.isnan(nan_output[0, 0].to(torch.float32))
+
+    empty_output, empty_scales = fp8_quantization._quantize_fp8_rows(x[:0])
+    assert empty_output.shape == x[:0].shape
+    assert empty_scales.shape == (0, 1)
+
+
 def _make_cache(device: torch.device) -> BlockKVCache:
     """Build a two-chunk BF16 cache for one streaming parity path."""
     return BlockKVCache(
@@ -57,23 +99,35 @@ def _make_cache(device: torch.device) -> BlockKVCache:
     )
 
 
-def test_tma_flash_attention_matches_sdpa(tma_device: torch.device) -> None:
-    """Compare a partial-tile TMA attention launch with PyTorch SDPA."""
+@pytest.mark.parametrize(
+    ("query_length", "key_length", "head_dim"),
+    [
+        pytest.param(37, 53, 64, id="partial-tiles"),
+        pytest.param(129, 128, 128, id="production-head-divisible-key"),
+    ],
+)
+def test_tma_flash_attention_matches_sdpa(
+    tma_device: torch.device,
+    query_length: int,
+    key_length: int,
+    head_dim: int,
+) -> None:
+    """Compare partial and production-head TMA launches with PyTorch SDPA."""
     generator = torch.Generator(device=tma_device).manual_seed(123)
     query = torch.randn(
         1,
-        37,
+        query_length,
         2,
-        64,
+        head_dim,
         generator=generator,
         device=tma_device,
         dtype=torch.bfloat16,
     )
     key = torch.randn(
         1,
-        53,
+        key_length,
         2,
-        64,
+        head_dim,
         generator=generator,
         device=tma_device,
         dtype=torch.bfloat16,

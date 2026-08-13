@@ -20,22 +20,32 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-_FP8_MAX = 448.0
-"""Largest finite magnitude represented by ``torch.float8_e4m3fn``."""
+from flashdreams.accelerated.triton.fp8_quantization import (
+    _FP8_MAX,
+    _quantize_fp8_rows,
+)
 
 
 @torch.no_grad()
 def quantize_fp8_weight(weight: Tensor) -> tuple[Tensor, Tensor]:
     """Quantize a linear weight with one FP32 scale per output row.
 
+    A weight row maps every input feature into one output feature. Scaling each
+    row independently therefore produces one dequantization factor per output
+    feature while preserving the linear layer's ``[O, I]`` layout.
+
     Args:
-        weight: Linear weight with shape ``[out_features, in_features]``.
+        weight: Linear weight with shape ``[O, I]``.
 
     Returns:
-        Contiguous E4M3 weight and its per-output-row FP32 scales.
+        Contiguous E4M3 weight with shape ``[O, I]`` and its FP32 scales with
+        shape ``[O]``.
     """
+    # Compute one scale per output feature: ``[O, I] -> [O]``.
     weight_float = weight.detach().to(torch.float32)
     scale = (weight_float.abs().amax(dim=1) / _FP8_MAX).clamp_min(1e-12)
+
+    # Broadcast ``[O] -> [O, 1]`` to normalize each row before E4M3 conversion.
     weight_fp8 = (
         (weight_float / scale[:, None])
         .clamp(-_FP8_MAX, _FP8_MAX)
@@ -54,18 +64,30 @@ def fp8_linear(
 ) -> Tensor:
     """Apply a row-scaled FP8 GEMM and restore the requested activation dtype.
 
+    Leading activation dimensions are flattened into ``R`` rows for the GEMM.
+    Native-precision inputs are dynamically quantized with one scale per row;
+    E4M3 inputs are interpreted as already quantized with unit row scales.
+    Weight scales broadcast over rows, so each output feature is independently
+    dequantized before the optional bias is applied.
+
     Args:
-        x: Native-precision or E4M3 input activations.
-        weight: E4M3 weight produced by ``quantize_fp8_weight``.
-        weight_scale: Per-output-row FP32 weight scales.
-        bias: Optional native-precision output bias.
+        x: Native-precision or E4M3 activations with shape ``[..., I]``.
+        weight: E4M3 weight with shape ``[O, I]`` produced by
+            :func:`quantize_fp8_weight`.
+        weight_scale: Per-output-feature FP32 scales with shape ``[O]``.
+        bias: Optional output bias with shape ``[O]``.
         out_dtype: Activation dtype returned to the caller.
 
     Returns:
-        Projected activations with the leading shape of ``x``.
+        Projected activations with shape ``[..., O]``.
     """
+    # Collapse arbitrary leading dimensions for GEMM:
+    # ``[..., I] -> [R, I]``, where ``R = prod(x.shape[:-1])``.
     input_shape = x.shape
     x_2d = x.reshape(-1, input_shape[-1])
+
+    # Supply activation scales as ``[R, 1]``. Native inputs are dynamically
+    # quantized per row; pre-quantized E4M3 inputs use an identity scale.
     if x_2d.dtype == torch.float8_e4m3fn:
         x_fp8 = x_2d
         input_scale = torch.ones(
@@ -74,15 +96,10 @@ def fp8_linear(
             dtype=torch.float32,
         )
     else:
-        x_float = x_2d.to(torch.float32)
-        input_scale = (
-            (x_float.abs().amax(dim=1, keepdim=True) / _FP8_MAX)
-            .clamp_min(1e-12)
-            .contiguous()
-        )
-        x_fp8 = (
-            (x_float / input_scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
-        )
+        x_fp8, input_scale = _quantize_fp8_rows(x_2d)
+
+    # Multiply ``[R, I] @ [I, O] -> [R, O]``. The row scales ``[R, 1]``
+    # and transposed-weight scales ``[1, O]`` broadcast over that output.
     scaled_bias = bias.to(torch.bfloat16) if bias is not None else None
     output = torch._scaled_mm(
         x_fp8,
@@ -95,6 +112,8 @@ def fp8_linear(
     )
     if out_dtype != torch.bfloat16:
         output = output.to(out_dtype)
+
+    # Restore the original leading dimensions: ``[R, O] -> [..., O]``.
     return output.reshape(input_shape[:-1] + (weight.shape[0],))
 
 

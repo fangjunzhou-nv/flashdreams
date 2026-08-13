@@ -21,8 +21,8 @@ from omnidreams.transformer.impl import modules as transformer_modules
 from omnidreams.transformer.impl.modules import AttentionBackend, Block
 from omnidreams.transformer.impl.network import CosmosDiTNetwork, CosmosDiTNetworkConfig
 
-from flashdreams.accelerated.impl import TritonMultiHeadAttention
-from flashdreams.accelerated.reference import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
 
 pytestmark = pytest.mark.ci_cpu
 

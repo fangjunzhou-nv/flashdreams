@@ -15,11 +15,11 @@
 
 """Triton kernels used by accelerated module implementations."""
 
-from flashdreams.accelerated.impl.triton.flash_attention import (
+from flashdreams.accelerated.triton.flash_attention import (
     flash_attention_2_tma,
     is_tma_flash_attention_supported,
 )
-from flashdreams.accelerated.impl.triton.rms_rope_kv_cache import (
+from flashdreams.accelerated.triton.rms_rope_kv_cache import (
     fused_rms_rope_kv_cache_update,
 )
 

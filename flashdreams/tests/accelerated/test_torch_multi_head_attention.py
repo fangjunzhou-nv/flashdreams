@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from flashdreams.accelerated.multi_head_attention import QKNormScope
-from flashdreams.accelerated.reference import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
 from flashdreams.core.attention import BlockKVCache, RotaryPositionEmbedding3D
 from flashdreams.recipes.cosmos.transformer.impl import modules as cosmos_modules
 from flashdreams.recipes.wan.transformer.impl import modules as wan_modules

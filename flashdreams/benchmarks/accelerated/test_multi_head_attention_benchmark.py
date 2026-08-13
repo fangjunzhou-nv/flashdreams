@@ -36,9 +36,9 @@ import torch
 from pytest_benchmark.fixture import BenchmarkFixture
 from torch import Tensor
 
-from flashdreams.accelerated.impl import TritonMultiHeadAttention
 from flashdreams.accelerated.multi_head_attention import QKNormScope
-from flashdreams.accelerated.reference import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
 from flashdreams.core.attention import BlockKVCache, RotaryPositionEmbedding3D
 from flashdreams.recipes.cosmos.transformer.impl import modules as cosmos_modules
 from flashdreams.recipes.wan.transformer.impl import modules as wan_modules

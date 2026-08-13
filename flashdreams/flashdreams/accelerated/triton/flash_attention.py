@@ -18,7 +18,9 @@
 Each program owns one query tile in one batch/head plane. Q is loaded once,
 K/V tiles stream through two-dimensional tensor descriptors, and the kernel
 retains only the online-softmax state and output accumulator in SRAM. No score
-matrix is materialized in global memory.
+matrix is materialized in global memory. Shape comments use ``B`` for batch,
+``L`` for query tokens, ``S`` for cached key/value tokens, ``H`` for heads, and
+``D`` for the head dimension.
 """
 
 from __future__ import annotations
@@ -26,9 +28,10 @@ from __future__ import annotations
 import math
 
 import torch
+from torch import Tensor
+
 import triton
 import triton.language as tl
-from torch import Tensor
 
 
 def _allocate_tma_workspace(
@@ -36,7 +39,16 @@ def _allocate_tma_workspace(
     alignment: int,
     stream: int | None,
 ) -> Tensor:
-    """Allocate descriptor workspace on the active CUDA device."""
+    """Allocate Triton tensor-descriptor workspace on the active CUDA device.
+
+    Args:
+        size: Required workspace size in bytes.
+        alignment: Requested alignment; Triton manages the allocation layout.
+        stream: CUDA stream handle; ``None`` denotes the current stream.
+
+    Returns:
+        Byte tensor with shape ``[size]`` on the active CUDA device.
+    """
     del alignment, stream
     return torch.empty(size, device="cuda", dtype=torch.int8)
 
@@ -58,9 +70,11 @@ _TMA_ATTENTION_CONFIGS = [
         (64, 64, 4, 3),
         (64, 64, 8, 3),
         (128, 32, 4, 3),
+        (128, 64, 4, 3),
         (128, 64, 8, 3),
     )
 ]
+"""Candidate query/key tile geometries for FlashAttention autotuning."""
 
 
 def _prune_tma_attention_configs(
@@ -68,13 +82,24 @@ def _prune_tma_attention_configs(
     named_args: dict[str, object],
     **meta: object,
 ) -> list[triton.Config]:
-    """Drop tiles that waste work or exceed wide-head shared memory."""
+    """Drop tiles that waste work or exceed wide-head shared memory.
+
+    Args:
+        configs: Candidate autotuning configurations.
+        named_args: Runtime arguments containing the query and key lengths.
+        **meta: Compile-time metadata containing ``HEAD_DIM``.
+
+    Returns:
+        Configurations whose query and key tiles fit the input geometry.
+    """
     query_length = named_args["query_length"]
     key_length = named_args["key_length"]
     head_dim = meta["HEAD_DIM"]
     assert isinstance(query_length, int)
     assert isinstance(key_length, int)
     assert isinstance(head_dim, int)
+    # Bound each tile by its sequence axis. Wide ``[D]`` accumulators use at
+    # most 64 query rows to limit SRAM consumption.
     maximum_block_m = min(128, max(16, int(triton.next_power_of_2(query_length))))
     if head_dim > 128:
         maximum_block_m = min(maximum_block_m, 64)
@@ -115,25 +140,31 @@ def _flash_attention_2_tma_kernel(
     output_stride_h,
     output_stride_l,
     output_stride_d: tl.constexpr,
-    num_heads,
-    query_length,
-    key_length,
+    num_heads: tl.constexpr,
+    query_length: tl.constexpr,
+    key_length: tl.constexpr,
     element_size,
     scale,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Apply non-causal FlashAttention2 with TMA loads and stores."""
-    # The launch grid independently parallelizes query tiles and flattened
-    # batch/head planes.
+    """Apply tiled non-causal FlashAttention2 with TMA loads and stores.
+
+    Inputs are Q ``[B, L, H, D]`` and K/V ``[B, S, H, D]``. Element strides
+    describe metadata-only ``[B, H, L|S, D]`` views. The launch grid is
+    ``[ceil_div(L, BLOCK_M), B * H]``; each program produces
+    ``[BLOCK_M, D]`` while streaming K/V tiles shaped ``[BLOCK_N, D]``.
+    """
+    # Decode grid axis 1 into one ``(batch, head)`` plane. Grid axis 0 selects
+    # the ``[BLOCK_M, D]`` query/output tile within that plane.
     query_block = tl.program_id(0)
     batch_head = tl.program_id(1)
     batch = batch_head // num_heads
     head = batch_head % num_heads
 
-    # Offset each descriptor to one batch/head plane. Two-dimensional
-    # descriptors match the physical token/feature traversal issued by TMA.
+    # Offset each base pointer to one batch/head plane. The two-dimensional
+    # descriptors then traverse only token and feature axes, ``[L|S, D]``.
     query_base = query_ptr + batch * query_stride_b + head * query_stride_h
     key_base = key_ptr + batch * key_stride_b + head * key_stride_h
     value_base = value_ptr + batch * value_stride_b + head * value_stride_h
@@ -163,6 +194,7 @@ def _flash_attention_2_tma_kernel(
         block_shape=[BLOCK_M, HEAD_DIM],
     )
 
+    # Descriptor boundary handling masks the final partial query tile.
     query_start = query_block * BLOCK_M
     query = query_desc.load([query_start, 0])
 
@@ -171,16 +203,21 @@ def _flash_attention_2_tma_kernel(
     row_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     denominator = tl.zeros((BLOCK_M,), tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), tl.float32)
-    key_offsets = tl.arange(0, BLOCK_N)
     # exp2 is cheaper than exp. log2(e) preserves the requested softmax scale
     # while expressing the online recurrence in base two.
     qk_scale = scale.to(tl.float32) * 1.4426950408889634
 
     for key_start in tl.range(0, key_length, BLOCK_N):
+        # ``[BLOCK_M, D] @ [D, BLOCK_N] -> [BLOCK_M, BLOCK_N]``.
         key = key_desc.load([key_start, 0])
         scores = tl.dot(query, tl.trans(key)) * qk_scale
-        key_mask = key_start + key_offsets < key_length
-        scores = tl.where(key_mask[None, :], scores, -float("inf"))
+        # Mask descriptor padding so zero-valued phantom keys cannot enter the
+        # softmax denominator on the final partial K/V tile.
+        if key_length % BLOCK_N != 0:
+            key_offsets = tl.arange(0, BLOCK_N)
+            scores = tl.where(
+                key_start + key_offsets[None, :] < key_length, scores, -float("inf")
+            )
 
         # Rebase the previous numerator and denominator whenever a new row
         # maximum appears. FP32 state keeps long cache windows stable.
@@ -190,19 +227,32 @@ def _flash_attention_2_tma_kernel(
         probabilities = tl.exp2(scores - next_row_max[:, None])
         denominator = denominator * correction + tl.sum(probabilities, axis=1)
 
+        # Accumulate ``P @ V`` into ``[BLOCK_M, D]`` after rebasing the prior
+        # numerator to the updated per-row exponent origin.
         value = value_desc.load([key_start, 0])
-        accumulator = accumulator * correction[:, None] + tl.dot(
+        accumulator *= correction[:, None]
+        accumulator = tl.dot(
             probabilities.to(value.dtype),
             value,
+            accumulator,
         )
         row_max = next_row_max
 
+    # Normalize each query row and store into logical output ``[B, L, H, D]``.
     output = accumulator / denominator[:, None]
     output_desc.store([query_start, 0], output)
 
 
 def _descriptor_layout_supported(x: Tensor) -> bool:
-    """Return whether ``x`` satisfies TMA tensor-descriptor stride rules."""
+    """Return whether ``x`` satisfies TMA tensor-descriptor stride rules.
+
+    Args:
+        x: Projected tensor with shape ``[B, L|S, H, D]``.
+
+    Returns:
+        Whether its ``[B, H, L|S, D]`` element strides are positive,
+        feature-contiguous, and 16-byte aligned on every outer axis.
+    """
     element_size = x.element_size()
     # Public tensors are [B, L, H, D], but each descriptor traverses an [L, D]
     # plane selected by its B/H base pointer. TMA requires contiguous features
@@ -218,7 +268,17 @@ def is_tma_flash_attention_supported(
     key: Tensor,
     value: Tensor,
 ) -> bool:
-    """Return whether projected tensors can use the TMA attention kernel."""
+    """Return whether projected tensors can use the TMA attention kernel.
+
+    Args:
+        query: Query tensor with shape ``[B, L, H, D]``.
+        key: Key tensor with shape ``[B, S, H, D]``.
+        value: Value tensor with shape ``[B, S, H, D]``.
+
+    Returns:
+        Whether Q/K/V have compatible shapes, devices, dtypes, head geometry,
+        and descriptor strides on a TMA-capable GPU.
+    """
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         return False
     if not query.is_cuda or not key.is_cuda or not value.is_cuda:
@@ -281,6 +341,7 @@ def flash_attention_2_tma(
             "[16, 256], and tensor-descriptor-compatible strides"
         )
 
+    # Allocate output ``[B, L, H, D]``; empty outer axes require no launch.
     output = torch.empty(
         query.shape,
         device=query.device,
@@ -312,13 +373,15 @@ def flash_attention_2_tma(
     )
 
     # Autotuning selects the launch shape once per geometry and storage width,
-    # then reuses the cached result for steady-state calls.
+    # then reuses it. Grid axes cover query tiles and ``B * H`` planes.
     def grid(meta: dict[str, int]) -> tuple[int, int]:
         return (
             triton.cdiv(query_length, meta["BLOCK_M"]),
             batch_size * num_heads,
         )
 
+    # All strides are in elements; ``element_size`` distinguishes storage
+    # widths in the autotuning cache key.
     _flash_attention_2_tma_kernel[grid](
         query,
         key,

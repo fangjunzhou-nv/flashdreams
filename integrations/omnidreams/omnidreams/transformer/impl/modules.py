@@ -27,10 +27,10 @@ from einops import rearrange, repeat
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from flashdreams.accelerated.impl import TritonMultiHeadAttention
-from flashdreams.accelerated.impl.triton import flash_attention_2_tma
 from flashdreams.accelerated.multi_head_attention import QKNormScope
-from flashdreams.accelerated.reference import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention_triton import TritonMultiHeadAttention
+from flashdreams.accelerated.triton import flash_attention_2_tma
 from flashdreams.core.attention import BlockKVCache, ContextParallelAttention
 from flashdreams.core.attention.rope import apply_rope_freqs
 

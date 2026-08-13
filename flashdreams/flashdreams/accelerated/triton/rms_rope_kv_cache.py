@@ -17,17 +17,19 @@
 
 Two kernels reflect the normalization domains. ``QKNormScope.HEAD`` assigns a
 program to each ``[D]`` head; ``QKNormScope.INNER`` assigns one to the complete
-``[H * D]`` token width. Both rotate Q/K, return processed Q, cache processed K,
-and cache V without modification.
+``[H * D]`` token width. Both optionally normalize and rotate Q/K, return
+processed Q, cache processed K, and cache unnormalized, unrotated V. Shape
+comments use ``B`` for batch, ``L`` for current tokens, ``S`` for cache
+capacity, ``H`` for heads, and ``D`` for the head dimension.
 """
 
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
 from torch import Tensor
 
+import triton
+import triton.language as tl
 from flashdreams.accelerated.multi_head_attention import QKNormScope
 
 
@@ -80,7 +82,13 @@ def _fused_head_rms_rope_kv_cache_kernel(
     INTERLEAVED: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Process one query/key head and write its current cache slice."""
+    """Process one query/key head and write its current cache slice.
+
+    Q/K/V and processed Q use logical shape ``[B, L, H, D]``; caches use
+    ``[B, S, H, D]``. The one-dimensional grid has ``B * L * H`` programs,
+    each reducing and rotating one ``[D]`` vector. Strides are in elements,
+    and ``BLOCK_D`` is the power-of-two lane count covering ``D``.
+    """
     # One program owns a (batch, token, head) vector: exactly the reduction
     # domain for head-scoped RMSNorm.
     program = tl.program_id(0)
@@ -89,6 +97,8 @@ def _fused_head_rms_rope_kv_cache_kernel(
     token = token_program % sequence_length
     batch = token_program // sequence_length
 
+    # Mask padded lanes in ``[BLOCK_D]`` while loading one physical ``[D]``
+    # head from token-major Q/K/V storage.
     dim_offsets = tl.arange(0, BLOCK_D)
     dim_mask = dim_offsets < HEAD_DIM
     query_base = (
@@ -119,7 +129,7 @@ def _fused_head_rms_rope_kv_cache_kernel(
 
     if APPLY_NORM:
         # Reduce RMS statistics in FP32, then cast back after applying the
-        # learned weight so the result matches the projection/cache dtype.
+        # learned ``[D]`` weight so the result matches the projection dtype.
         query_scale = tl.rsqrt(
             tl.sum(query.to(tl.float32) * query.to(tl.float32), axis=0) / HEAD_DIM + EPS
         )
@@ -140,6 +150,8 @@ def _fused_head_rms_rope_kv_cache_kernel(
         key = (key * key_scale * key_weight).to(key.dtype)
 
     if APPLY_ROPE:
+        # Map every feature lane to its rotation partner within the same head:
+        # adjacent pairs for interleaved RoPE, otherwise matching half splits.
         if INTERLEAVED:
             partner_offsets = tl.where(
                 dim_offsets % 2 == 0,
@@ -185,6 +197,7 @@ def _fused_head_rms_rope_kv_cache_kernel(
                 key_partner.dtype
             )
 
+        # RoPE angles ``[L, D]`` are shared across batch and head axes.
         frequencies = tl.load(
             rope_freqs_ptr + token * rope_stride_l + dim_offsets * rope_stride_d,
             mask=dim_mask,
@@ -195,6 +208,7 @@ def _fused_head_rms_rope_kv_cache_kernel(
         query = query * cos_freqs + query_partner * sin_freqs * rotation_sign
         key = key * cos_freqs + key_partner * sin_freqs * rotation_sign
 
+    # Store processed Q ``[D]`` for this ``(batch, token, head)`` program.
     query_output_base = (
         query_output_ptr
         + batch * query_output_stride_b
@@ -278,13 +292,20 @@ def _fused_inner_rms_rope_kv_cache_kernel(
     INTERLEAVED: tl.constexpr,
     BLOCK_INNER: tl.constexpr,
 ):
-    """Process one full-inner-width query/key token and update its cache."""
+    """Process one full-inner-width query/key token and update its cache.
+
+    Q/K/V and processed Q use logical shape ``[B, L, H, D]`` but are traversed
+    as contiguous ``[B, L, H * D]`` tensors. Caches use ``[B, S, H, D]``. The
+    grid has ``B * L`` programs, each reducing one ``[H * D]`` vector;
+    ``BLOCK_INNER`` is the power-of-two lane count covering that width.
+    """
     # Inner-scoped RMSNorm couples all heads, so one program owns the complete
     # projected width for one (batch, token) pair.
     program = tl.program_id(0)
     token = program % sequence_length
     batch = program // sequence_length
 
+    # Load flattened Q/K ``[H * D]``; padded ``BLOCK_INNER`` lanes are masked.
     inner_offsets = tl.arange(0, BLOCK_INNER)
     inner_mask = inner_offsets < INNER_DIM
     query_base = query_ptr + batch * query_stride_b + token * query_stride_l
@@ -294,6 +315,8 @@ def _fused_inner_rms_rope_kv_cache_kernel(
     key = tl.load(key_base + inner_offsets, mask=inner_mask, other=0.0)
 
     if APPLY_NORM:
+        # One FP32 RMS reduction spans all heads, followed by learned
+        # ``[H * D]`` weights for Q and K.
         query_scale = tl.rsqrt(
             tl.sum(query.to(tl.float32) * query.to(tl.float32), axis=0) / INNER_DIM
             + EPS
@@ -363,6 +386,8 @@ def _fused_inner_rms_rope_kv_cache_kernel(
                 key_partner.dtype
             )
 
+        # Convert flattened lanes back to feature indices so ``[L, D]`` RoPE
+        # angles broadcast identically across every head.
         frequencies = tl.load(
             rope_freqs_ptr + token * rope_stride_l + dim_offsets * rope_stride_d,
             mask=inner_mask,
@@ -373,11 +398,14 @@ def _fused_inner_rms_rope_kv_cache_kernel(
         query = query * cos_freqs + query_partner * sin_freqs * rotation_sign
         key = key * cos_freqs + key_partner * sin_freqs * rotation_sign
 
+    # Store the processed contiguous ``[H * D]`` query vector.
     query_output_base = (
         query_output_ptr + batch * query_output_stride_b + token * query_output_stride_l
     )
     tl.store(query_output_base + inner_offsets, query, mask=inner_mask)
 
+    # Map the selected source interval ``[cache_read_start, ...]`` to the
+    # physical cache interval beginning at ``cache_write_start``.
     cache_offset = token - cache_read_start
     cache_token = cache_write_start + cache_offset
     cache_mask = inner_mask & (cache_offset >= 0) & (cache_offset < cache_write_length)
@@ -413,31 +441,40 @@ def fused_rms_rope_kv_cache_update(
 ) -> Tensor:
     """Normalize and rotate Q/K while writing the current K/V cache slice.
 
+    Normalization precedes RoPE. Processed K and unchanged V from source slice
+    ``[cache_read_start:cache_read_start + cache_write_length]`` are cast to the
+    cache dtype and written at ``cache_write_start``. Tokens outside that slice
+    still produce processed queries but do not modify cache storage.
+
     Args:
         query: Projected queries with shape ``[B, L, H, D]``.
         key: Projected keys with shape ``[B, L, H, D]``.
         value: Projected values with shape ``[B, L, H, D]``.
         key_cache: Contiguous key storage with shape ``[B, S, H, D]``.
         value_cache: Contiguous value storage with shape ``[B, S, H, D]``.
-        query_weight: RMSNorm query weight, or ``None`` to skip normalization.
-        key_weight: RMSNorm key weight, or ``None`` to skip normalization.
+        query_weight: RMSNorm query weight with shape ``[D]`` for head scope or
+            ``[H * D]`` for inner scope; ``None`` skips normalization.
+        key_weight: RMSNorm key weight with the same shape as ``query_weight``;
+            ``None`` skips normalization.
         norm_eps: Epsilon used by Q/K RMS normalization.
         norm_scope: Normalize each head or the complete projected inner width.
         rope_freqs: Optional full-width RoPE angles with shape ``[L, 1, 1, D]``.
         rope_interleaved: Rotate adjacent pairs instead of half-split pairs.
-        cache_read_start: First source token copied into the cache.
-        cache_write_start: First physical cache token written by this update.
-        cache_write_length: Number of source tokens written into the cache.
+        cache_read_start: First token on the ``L`` axis copied into the cache.
+        cache_write_start: First token on the cache ``S`` axis written.
+        cache_write_length: Number of consecutive source tokens written.
 
     Returns:
-        Processed queries with shape ``[B, L, H, D]`` and the cache storage
-        dtype. An FP8 cache therefore feeds FP8 attention without another cast.
+        Processed queries with shape ``[B, L, H, D]`` and the cache dtype.
+        Processed K and unchanged V are written in place to their caches.
 
     Raises:
         ValueError: Tensor shapes, cache bounds, or normalization inputs differ.
         TypeError: ``norm_scope`` is not a :class:`QKNormScope`.
         RuntimeError: Tensors are not compatible CUDA inputs.
     """
+    # Validate logical Q/K/V ``[B, L, H, D]`` and cache ``[B, S, H, D]``
+    # geometry before checking storage properties used by the kernels.
     if query.ndim != 4 or key.shape != query.shape or value.shape != query.shape:
         raise ValueError(
             "query, key, and value must have identical [B, L, H, D] shapes"
@@ -474,6 +511,8 @@ def fused_rms_rope_kv_cache_update(
     if not isinstance(norm_scope, QKNormScope):
         raise TypeError(f"norm_scope must be a QKNormScope; got {norm_scope!r}")
 
+    # Both normalization branches require a matched Q/K weight pair whose
+    # width is determined by the selected reduction scope.
     apply_norm = query_weight is not None or key_weight is not None
     if (query_weight is None) != (key_weight is None):
         raise ValueError("query_weight and key_weight must both be present or absent")
@@ -495,6 +534,8 @@ def fused_rms_rope_kv_cache_update(
         ):
             raise RuntimeError("RMSNorm weights must match the Q/K device and dtype")
 
+    # RoPE stores one full-width ``[D]`` angle vector per current token; batch
+    # and head axes broadcast inside both kernels.
     if rope_freqs is not None:
         expected_rope_shape = (sequence_length, 1, 1, head_dim)
         if tuple(rope_freqs.shape) != expected_rope_shape:
@@ -507,6 +548,8 @@ def fused_rms_rope_kv_cache_update(
         if head_dim % 2 != 0:
             raise ValueError("RoPE requires an even head_dim")
 
+    # The source ``L`` interval and destination ``S`` interval must each fit;
+    # they may begin at different offsets when a rolling cache preserves sinks.
     cache_size = key_cache.shape[1]
     if not (0 <= cache_read_start <= sequence_length):
         raise ValueError("cache_read_start is outside the current sequence")
@@ -519,6 +562,7 @@ def fused_rms_rope_kv_cache_update(
     if cache_write_start + cache_write_length > cache_size:
         raise ValueError("cache destination slice exceeds cache storage")
 
+    # Match processed Q to cache storage so FP8 attention consumes it directly.
     query_output = torch.empty(
         query.shape,
         device=query.device,
@@ -542,6 +586,8 @@ def fused_rms_rope_kv_cache_update(
     if norm_scope is QKNormScope.HEAD:
         # The enum selects a distinct launch topology rather than a runtime
         # string branch inside one oversized kernel.
+        # One program per ``(batch, token, head)`` and one power-of-two block
+        # covering the ``D``-wide normalization/rotation domain.
         block_d = max(16, int(triton.next_power_of_2(head_dim)))
         grid = (batch_size * sequence_length * num_heads,)
         _fused_head_rms_rope_kv_cache_kernel[grid](
@@ -581,6 +627,8 @@ def fused_rms_rope_kv_cache_update(
             raise RuntimeError(
                 "inner-scope RMSNorm requires contiguous head and feature dimensions"
             )
+        # One program per ``(batch, token)`` and one power-of-two block covering
+        # the complete contiguous ``H * D`` normalization domain.
         block_inner = max(16, int(triton.next_power_of_2(inner_dim)))
         grid = (batch_size * sequence_length,)
         _fused_inner_rms_rope_kv_cache_kernel[grid](

@@ -32,27 +32,30 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from flashdreams.accelerated.fp8_quantization import fp8_linear, quantize_fp8_weight
-from flashdreams.accelerated.impl.triton import (
-    flash_attention_2_tma,
-    fused_rms_rope_kv_cache_update,
-)
 from flashdreams.accelerated.multi_head_attention import (
     MultiHeadAttention,
     QKNormScope,
+)
+from flashdreams.accelerated.triton import (
+    flash_attention_2_tma,
+    fused_rms_rope_kv_cache_update,
 )
 from flashdreams.core.attention import BlockKVCache
 
 
 def _cache_write_slice(kv_cache: BlockKVCache) -> tuple[int, int, int]:
-    """Map the current input chunk onto the physical cache write interval.
+    """Map the current token chunk onto its physical cache write interval.
+
+    The cache normally consumes the complete ``[B, L, H, D]`` K/V chunk. When a
+    rolling write would overlap an immutable sink prefix, only the trailing
+    source tokens that fit after the sink are copied.
+
+    Args:
+        kv_cache: Block cache prepared for the current chunk.
 
     Returns:
-        The source-token offset, destination-cache offset, and token count for
-        the fused cache write.
-
-    The cache normally consumes the complete current chunk. When a rolling
-    write would overlap an immutable sink prefix, only the trailing source
-    tokens that fit after the sink are copied.
+        Source-token offset, destination-cache offset, and token count for the
+        fused K/V write.
     """
     write_start, write_end = kv_cache._current_write_bounds()
     read_start = 0
@@ -72,6 +75,11 @@ def _cache_write_slice(kv_cache: BlockKVCache) -> tuple[int, int, int]:
 class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
     """Inference-only streaming self-attention backed by Triton kernels.
 
+    Shape comments use ``B`` for the product of all leading batch dimensions,
+    ``L`` for the current chunk length, ``S`` for visible cached context,
+    ``H`` for the number of heads, ``D`` for the head dimension, and ``Q`` for
+    ``query_dim``.
+
     Parameter names and shapes match :class:`TorchMultiHeadAttention`, so a
     reference module's state dict loads directly. Callers own the
     :class:`BlockKVCache` lifecycle and call ``before_update`` before this
@@ -79,40 +87,40 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
     """
 
     q_proj: nn.Linear
-    """Query projection."""
+    """Query projection with weight shape ``[H * D, Q]``."""
 
     k_proj: nn.Linear
-    """Key projection."""
+    """Key projection with weight shape ``[H * D, Q]``."""
 
     v_proj: nn.Linear
-    """Value projection."""
+    """Value projection with weight shape ``[H * D, Q]``."""
 
     output_proj: nn.Linear
-    """Output projection."""
+    """Output projection with weight shape ``[Q, H * D]``."""
 
     q_norm: nn.Module
-    """Per-head or inner-width query RMS normalization."""
+    """Query RMSNorm over ``[D]`` or ``[H * D]``, or identity."""
 
     k_norm: nn.Module
-    """Per-head or inner-width key RMS normalization."""
+    """Key RMSNorm over ``[D]`` or ``[H * D]``, or identity."""
 
     use_fp8: bool
     """Whether projection, attention, output, and cache storage use FP8."""
 
     _fused_qkv_weight: Tensor | None
-    """Non-persistent native or packed fused QKV weight."""
+    """Non-persistent native or E4M3 QKV weight, shape ``[3 * H * D, Q]``."""
 
     _fused_qkv_bias: Tensor | None
-    """Non-persistent fused QKV bias."""
+    """Non-persistent fused QKV bias, shape ``[3 * H * D]`` when enabled."""
 
     _fused_qkv_weight_scale: Tensor | None
-    """Non-persistent per-row FP8 QKV weight scales."""
+    """Non-persistent FP32 QKV weight scales, shape ``[3 * H * D]``."""
 
     _output_weight_fp8: Tensor | None
-    """Non-persistent packed output-projection weight."""
+    """Non-persistent E4M3 output-projection weight, shape ``[Q, H * D]``."""
 
     _output_weight_scale: Tensor | None
-    """Non-persistent per-row FP8 output weight scales."""
+    """Non-persistent FP32 output weight scales, shape ``[Q]``."""
 
     def __init__(
         self,
@@ -163,10 +171,15 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
 
         self.use_fp8 = use_fp8
 
+        # Keep separate ``[H * D, Q]`` parameters for state-dict compatibility;
+        # inference reads the derived fused ``[3 * H * D, Q]`` weight below.
         self.q_proj = nn.Linear(self.query_dim, self.inner_dim, bias=qkv_bias)
         self.k_proj = nn.Linear(self.query_dim, self.inner_dim, bias=qkv_bias)
         self.v_proj = nn.Linear(self.query_dim, self.inner_dim, bias=qkv_bias)
         self.output_proj = nn.Linear(self.inner_dim, self.query_dim, bias=output_bias)
+
+        # Derived projection buffers are reconstructed after checkpoint loads and
+        # device/dtype moves instead of becoming duplicate state-dict entries.
         self.register_buffer("_fused_qkv_weight", None, persistent=False)
         self.register_buffer("_fused_qkv_bias", None, persistent=False)
         self.register_buffer("_fused_qkv_weight_scale", None, persistent=False)
@@ -175,6 +188,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         self._refresh_derived_weights()
         self.register_load_state_dict_post_hook(self._refresh_derived_weights)
 
+        # RMSNorm parameters cover one ``[D]`` head or all ``[H * D]`` query/key
+        # features, matching the normalization scope consumed by the fused kernel.
         norm_dim = (
             self.head_dim if qk_norm_scope is QKNormScope.HEAD else self.inner_dim
         )
@@ -187,8 +202,15 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
 
     @torch.no_grad()
     def _refresh_derived_weights(self, *args: object) -> None:
-        """Rebuild fused native or packed FP8 weights from state-dict parameters."""
+        """Rebuild fused native or E4M3 weights from module parameters.
+
+        Args:
+            args: Optional state-dict post-hook arguments; ignored for direct calls.
+        """
         del args
+
+        # Stack Q/K/V output rows:
+        # three ``[H * D, Q]`` weights -> one ``[3 * H * D, Q]`` weight.
         fused_weight = torch.cat(
             (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
             dim=0,
@@ -197,6 +219,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             fused_bias = None
         else:
             assert self.k_proj.bias is not None and self.v_proj.bias is not None
+            # Three ``[H * D]`` biases -> one ``[3 * H * D]`` bias.
             fused_bias = torch.cat(
                 (self.q_proj.bias, self.k_proj.bias, self.v_proj.bias),
                 dim=0,
@@ -204,6 +227,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
 
         self._fused_qkv_bias = fused_bias
         if self.use_fp8:
+            # Quantize each output row independently. Scales have shapes
+            # ``[3 * H * D]`` for QKV and ``[Q]`` for the output projection.
             self._fused_qkv_weight, self._fused_qkv_weight_scale = quantize_fp8_weight(
                 fused_weight
             )
@@ -211,6 +236,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 self.output_proj.weight
             )
         else:
+            # Native precision still uses one fused QKV GEMM, while output
+            # projection reads the original ``[Q, H * D]`` parameter.
             self._fused_qkv_weight = fused_weight.contiguous()
             self._fused_qkv_weight_scale = None
             self._output_weight_fp8 = None
@@ -221,7 +248,15 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         fn: Callable[[Tensor], Tensor],
         recurse: bool = True,
     ) -> TritonMultiHeadAttention:
-        """Move parameters and rebuild derived weights on their final device/dtype."""
+        """Transform parameters and rebuild derived weights on their final device.
+
+        Args:
+            fn: Tensor transformation applied by :class:`torch.nn.Module`.
+            recurse: Apply ``fn`` recursively to child modules.
+
+        Returns:
+            This module with derived projection buffers refreshed.
+        """
         module = super()._apply(fn, recurse=recurse)
         self._refresh_derived_weights()
         return module
@@ -235,7 +270,26 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> BlockKVCache:
-        """Allocate a rolling cache matching the configured precision policy."""
+        """Allocate a rolling cache matching the configured precision policy.
+
+        Args:
+            batch_size: Flattened batch size ``B``.
+            chunk_size: Number of current tokens ``L`` written per update.
+            window_size: Number of rolling context tokens retained after the sink.
+            sink_size: Number of initial context tokens that are never evicted.
+            device: Device on which to allocate K/V storage.
+            dtype: Native activation dtype; the cache uses E4M3 when FP8 is enabled.
+
+        Returns:
+            Block cache with K/V storage shaped
+            ``[B, sink_size + window_size, H, D]``.
+
+        Raises:
+            TypeError: FP8 is enabled with an activation dtype other than FP16 or
+                BF16.
+        """
+        # Cache K/V in token-major ``[B, S, H, D]`` layout expected by both
+        # the fused update kernel and TMA FlashAttention2.
         cache_shape = (
             batch_size,
             sink_size + window_size,
@@ -256,12 +310,24 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         )
 
     def _project_qkv(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Project Q/K/V with one fused native or row-scaled FP8 GEMM."""
+        """Project Q/K/V with one fused native or row-scaled FP8 GEMM.
+
+        Args:
+            x: Flattened-batch input tokens, shape ``[B, L, Q]``.
+
+        Returns:
+            Query, key, and value tensors, each shaped ``[B, L, H, D]``.
+
+        Raises:
+            RuntimeError: A required derived QKV weight or scale is unavailable.
+        """
         if self._fused_qkv_weight is None:
             raise RuntimeError("fused QKV weight is not initialized")
         if self.use_fp8:
             if self._fused_qkv_weight_scale is None:
                 raise RuntimeError("FP8 QKV weight scales are not initialized")
+            # Quantize ``B * L`` activation rows independently, then multiply
+            # ``[B * L, Q] @ [Q, 3 * H * D]`` and restore ``x.dtype``.
             qkv = fp8_linear(
                 x,
                 self._fused_qkv_weight,
@@ -270,7 +336,11 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 x.dtype,
             )
         else:
+            # ``[B, L, Q] @ [Q, 3 * H * D] -> [B, L, 3 * H * D]``.
             qkv = F.linear(x, self._fused_qkv_weight, self._fused_qkv_bias)
+
+        # Split the fused projection axis into Q/K/V, heads, and head features:
+        # ``[B, L, 3 * H * D] -> [B, L, 3, H, D]``.
         qkv = qkv.reshape(
             -1,
             x.shape[-2],
@@ -282,11 +352,24 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         return query, key, value
 
     def _project_output(self, x: Tensor, output_dtype: torch.dtype) -> Tensor:
-        """Apply the native or row-scaled FP8 output projection."""
+        """Apply the native or row-scaled FP8 output projection.
+
+        Args:
+            x: Head-concatenated attention output, shape ``[B, L, H * D]``.
+            output_dtype: Native activation dtype returned to the caller.
+
+        Returns:
+            Projected tokens with shape ``[B, L, Q]``.
+
+        Raises:
+            RuntimeError: FP8 is enabled but its derived output weight is missing.
+        """
         if not self.use_fp8:
+            # ``[B, L, H * D] @ [H * D, Q] -> [B, L, Q]``.
             return self.output_proj(x)
         if self._output_weight_fp8 is None or self._output_weight_scale is None:
             raise RuntimeError("FP8 output weight is not initialized")
+        # Quantize ``B * L`` attention rows independently before the scaled GEMM.
         return fp8_linear(
             x,
             self._output_weight_fp8,
@@ -301,7 +384,19 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         kv_cache: BlockKVCache,
         rope_freqs: Tensor | None,
     ) -> None:
-        """Validate module inputs before projection or cache mutation."""
+        """Validate module inputs before projection or cache mutation.
+
+        Args:
+            x: Current query tokens, shape ``[..., L, Q]``.
+            kv_cache: Prepared cache with K/V shape ``[B, S, H, D]``.
+            rope_freqs: Optional current-chunk angles, shape ``[L, 1, 1, D]``.
+
+        Raises:
+            ValueError: Tensor dimensions or cache layout do not match the module.
+            RuntimeError: Device, dtype, cache lifecycle, or hardware requirements
+                are not satisfied.
+        """
+        # Validate the public token shape before flattening leading dimensions.
         if x.ndim < 2:
             raise ValueError(f"x must have shape [..., L, D]; got {tuple(x.shape)}")
         if x.shape[-1] != self.query_dim:
@@ -309,6 +404,9 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 f"x feature width must equal query_dim={self.query_dim}; "
                 f"got {x.shape[-1]}"
             )
+
+        # The Triton path accepts native FP16/BF16 CUDA inputs; FP8 is an
+        # internal attention and cache-storage policy.
         if not x.is_cuda or x.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
                 "TritonMultiHeadAttention requires CUDA FP16 or BF16 inputs"
@@ -318,6 +416,9 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 "TritonMultiHeadAttention TMA kernels require compute capability "
                 "9.0 or newer"
             )
+
+        # The caller prepares cache write bounds before attention. Physical K/V
+        # storage must remain contiguous ``[B, S, H, D]`` with sequence axis 1.
         if kv_cache._curr_chunk_idx is None:
             raise RuntimeError("call kv_cache.before_update() before attention")
         if kv_cache.seq_dim != 1 or kv_cache._k.ndim != 4:
@@ -330,6 +431,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 f"got {x.shape[-2]}"
             )
 
+        # Leading input dimensions collapse into the cache's single batch axis:
+        # ``[..., L, Q] -> [B, L, Q]`` where ``B = prod(x.shape[:-2])``.
         batch_size = math.prod(x.shape[:-2])
         expected_cache_shape = (batch_size, self.n_heads, self.head_dim)
         cache_shape = (
@@ -342,6 +445,9 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 "cache batch, head, and feature dimensions must equal "
                 f"{expected_cache_shape}; got {cache_shape}"
             )
+
+        # K/V share shape, device, storage precision, and contiguous layout so
+        # one fused kernel can write them and TMA attention can read them directly.
         if kv_cache._v.shape != kv_cache._k.shape:
             raise ValueError("Triton attention requires identical K/V cache shapes")
         if kv_cache._k.device != x.device or kv_cache._v.device != x.device:
@@ -356,6 +462,8 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             raise RuntimeError("K/V cache tensors must be contiguous")
 
         if rope_freqs is not None:
+            # RoPE coefficients cover this ``L``-token chunk and broadcast across
+            # flattened batches and ``H`` heads inside the fused kernel.
             expected_rope_shape = (x.shape[-2], 1, 1, self.head_dim)
             if tuple(rope_freqs.shape) != expected_rope_shape:
                 raise ValueError(
@@ -374,6 +482,11 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
     ) -> Tensor:
         """Project a token chunk, update its cache, and apply TMA attention.
 
+        The fused preprocessing kernel applies Q/K RMSNorm and optional RoPE,
+        returns processed Q, and writes processed K plus V directly into cache
+        storage. TMA FlashAttention2 then reads that updated cache without
+        materializing separate visible K/V tensors.
+
         Args:
             x: Current query tokens with shape ``[..., L, query_dim]``.
             kv_cache: Streaming cache prepared with ``before_update``.
@@ -386,16 +499,23 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         self._validate_forward_inputs(x, kv_cache, rope_freqs)
         batch_shape = x.shape[:-2]
         sequence_length = x.shape[-2]
+
         # Triton uses one physical batch axis. Fold arbitrary leading dimensions
-        # into it, then restore the original shape at the module boundary.
+        # ``[..., L, Q] -> [B, L, Q]``, then restore them at the module boundary.
         x_flat = x.reshape(-1, sequence_length, self.query_dim)
 
-        # One GEMM produces token-major [B, L, H, D] Q/K/V views.
+        # One GEMM produces three token-major ``[B, L, H, D]`` tensors.
         query, key, value = self._project_qkv(x_flat)
 
+        # Select the source ``[read_start:read_start + length]`` and cache
+        # ``[write_start:write_start + length]`` token intervals for direct K/V
+        # storage, preserving any immutable sink prefix.
         cache_read_start, cache_write_start, cache_write_length = _cache_write_slice(
             kv_cache
         )
+
+        # Pass affine weights shaped ``[D]`` for per-head normalization or
+        # ``[H * D]`` for joint normalization; ``None`` disables RMSNorm.
         if isinstance(self.q_norm, nn.RMSNorm):
             if not isinstance(self.k_norm, nn.RMSNorm):
                 raise RuntimeError("Q/K normalization modules must use the same policy")
@@ -412,8 +532,10 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             query_weight = None
             key_weight = None
             norm_eps = 0.0
-        # Return processed Q while writing processed K and unmodified V directly
-        # into the implementation-owned cache storage.
+
+        # Kernel boundary: consume Q/K/V ``[B, L, H, D]``, return processed Q
+        # with the same shape, and write processed K plus unmodified V into cache
+        # ``[B, S, H, D]``. FP8 mode stores both returned Q and cached K/V as E4M3.
         query = fused_rms_rope_kv_cache_update(
             query,
             key,
@@ -432,12 +554,16 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         )
 
         # The visible cache already includes this chunk. Attention is non-causal
-        # within a chunk because video-model recipes expose whole chunks at once.
+        # within a chunk because video-model recipes expose whole chunks at once:
+        # Q ``[B, L, H, D]`` x K/V ``[B, S, H, D]`` -> ``[B, L, H, D]``.
         output = flash_attention_2_tma(
             query,
             kv_cache.cached_k(),
             kv_cache.cached_v(),
         )
+
+        # Concatenate heads, project features, and restore leading dimensions:
+        # ``[B, L, H, D] -> [B, L, H * D] -> [B, L, Q] -> [..., L, Q]``.
         output = output.reshape(-1, sequence_length, self.inner_dim)
         output = self._project_output(output, x.dtype)
         return output.reshape(batch_shape + (sequence_length, self.query_dim))

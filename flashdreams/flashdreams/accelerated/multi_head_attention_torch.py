@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -91,6 +90,46 @@ class TorchMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         )
         self.k_norm: nn.Module = (
             nn.RMSNorm(norm_dim, eps=qk_norm_eps) if qk_norm else nn.Identity()
+        )
+
+    def initialize_cache(
+        self,
+        batch_size: int,
+        chunk_size: int,
+        window_size: int,
+        sink_size: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> BlockKVCache:
+        """Allocate a native-precision rolling K/V cache.
+
+        Args:
+            batch_size: Flattened batch size ``B``.
+            chunk_size: Number of current tokens ``L`` written per update.
+            window_size: Number of rolling context tokens retained after the sink.
+            sink_size: Number of initial context tokens that are never evicted.
+            device: Device on which to allocate K/V storage.
+            dtype: Data type used by K/V storage.
+
+        Returns:
+            Block cache with K/V storage shaped
+            ``[B, sink_size + window_size, H, D]``.
+        """
+        cache_shape = (
+            batch_size,
+            sink_size + window_size,
+            self.n_heads,
+            self.head_dim,
+        )
+        return BlockKVCache(
+            k_shape=cache_shape,
+            v_shape=cache_shape,
+            seq_dim=1,
+            chunk_size=chunk_size,
+            window_size=window_size,
+            sink_size=sink_size,
+            device=device,
+            dtype=dtype,
         )
 
     def forward(

@@ -21,8 +21,8 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Generic, TypeVar
 
+import torch
 from torch import Tensor, nn
-
 
 KVCacheT = TypeVar("KVCacheT")
 
@@ -45,22 +45,27 @@ class MultiHeadAttention(nn.Module, ABC, Generic[KVCacheT]):
     and output projection. Streaming self-attention implementations update a
     caller-prepared cache from ``x``. Cross-attention implementations instead
     read projected K/V from a precomputed static or composite cache.
+
+    Shape descriptions use ``L`` for query tokens, ``S`` for cached context
+    tokens, ``H`` for attention heads, and ``D`` for each head's feature
+    dimension. Leading ``...`` dimensions are implementation-preserved batch or
+    grouping dimensions.
     """
 
     query_dim: int
-    """Feature dimension of input and output tokens."""
+    """Input and output token width in ``[..., L, query_dim]`` tensors."""
 
     context_dim: int
-    """Feature dimension projected into cached keys and values."""
+    """Context token width projected into ``H * D`` key and value features."""
 
     n_heads: int
     """Number of query, key, and value heads."""
 
     head_dim: int
-    """Feature dimension of each attention head."""
+    """Per-head feature dimension ``D``."""
 
     inner_dim: int
-    """Projected feature width, equal to ``n_heads * head_dim``."""
+    """Concatenated head width ``H * D``, equal to ``n_heads * head_dim``."""
 
     qk_norm_scope: QKNormScope
     """Feature scope used by query and key normalization."""
@@ -94,6 +99,7 @@ class MultiHeadAttention(nn.Module, ABC, Generic[KVCacheT]):
             ValueError: Any dimension is not positive.
         """
         super().__init__()
+
         context_dim = query_dim if context_dim is None else context_dim
         if query_dim <= 0:
             raise ValueError(f"query_dim must be positive; got {query_dim}")
@@ -108,6 +114,7 @@ class MultiHeadAttention(nn.Module, ABC, Generic[KVCacheT]):
                 f"qk_norm_scope must be a QKNormScope; got {qk_norm_scope!r}"
             )
 
+        # Store the projection geometry and policies shared by every backend.
         self.query_dim = query_dim
         self.context_dim = context_dim
         self.n_heads = n_heads
@@ -115,6 +122,31 @@ class MultiHeadAttention(nn.Module, ABC, Generic[KVCacheT]):
         self.inner_dim = n_heads * head_dim
         self.qk_norm_scope = qk_norm_scope
         self.rope_interleaved = rope_interleaved
+
+    @abstractmethod
+    def initialize_cache(
+        self,
+        batch_size: int,
+        chunk_size: int,
+        window_size: int,
+        sink_size: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> KVCacheT:
+        """Allocate a fresh streaming K/V cache.
+
+        Args:
+            batch_size: Flattened batch size ``B``.
+            chunk_size: Number of current tokens ``L`` written per update.
+            window_size: Number of rolling context tokens retained after the sink.
+            sink_size: Number of initial context tokens that are never evicted.
+            device: Device on which to allocate the cache.
+            dtype: Native activation dtype used by the implementation's cache policy.
+
+        Returns:
+            Implementation-owned cache with capacity for
+            ``sink_size + window_size`` tokens.
+        """
 
     @abstractmethod
     def forward(
