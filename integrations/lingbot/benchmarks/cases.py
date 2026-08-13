@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared OmniDreams attention benchmark cases."""
+"""Shared Lingbot attention benchmark cases."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from omnidreams.transformer.impl.modules import AttentionBackend
 
 from flashdreams.accelerated.multi_head_attention_triton import SDPABackend
+from flashdreams.recipes.wan.transformer.impl.modules import AttentionBackend
 
 
 @dataclass(frozen=True)
@@ -34,19 +34,13 @@ class AttentionBenchmarkCase:
     """Stable implementation name stored in benchmark metadata."""
 
     attention_backend: AttentionBackend
-    """PyTorch network backend configured for this case."""
+    """DiT block implementation configured for this case."""
 
     sdpa_backend: SDPABackend
-    """SDPA backend configured for accelerated self-attention."""
+    """SDPA implementation configured for Triton multi-head attention."""
 
     self_attention_operator: str
     """Self-attention operator reported in benchmark metadata."""
-
-    cross_attention_operator: str
-    """Cross-attention operator reported in benchmark metadata."""
-
-    native_dit: bool = False
-    """Whether the full-pipeline case bypasses the PyTorch network."""
 
     minimum_compute_capability: tuple[int, int] | None = None
     """Minimum CUDA compute capability; ``None`` accepts any CUDA device."""
@@ -57,12 +51,11 @@ class AttentionBenchmarkCase:
         return self.implementation.replace("_", "-")
 
 
-OMNIDREAMS_TORCH_CASE = AttentionBenchmarkCase(
-    implementation="omnidreams_torch",
-    attention_backend=AttentionBackend.OMNIDREAMS,
+WAN_TORCH_CASE = AttentionBenchmarkCase(
+    implementation="wan_torch",
+    attention_backend=AttentionBackend.WAN,
     sdpa_backend=SDPABackend.CUDNN,
     self_attention_operator="cudnn",
-    cross_attention_operator="cudnn",
 )
 
 TRITON_CUDNN_CASE = AttentionBenchmarkCase(
@@ -70,7 +63,6 @@ TRITON_CUDNN_CASE = AttentionBenchmarkCase(
     attention_backend=AttentionBackend.TRITON,
     sdpa_backend=SDPABackend.CUDNN,
     self_attention_operator="torch_cudnn_sdpa",
-    cross_attention_operator="triton_tma_flash_attention_2",
     minimum_compute_capability=(9, 0),
 )
 
@@ -79,40 +71,18 @@ TRITON_TMA_CASE = AttentionBenchmarkCase(
     attention_backend=AttentionBackend.TRITON,
     sdpa_backend=SDPABackend.TRITON,
     self_attention_operator="triton_tma_flash_attention_2",
-    cross_attention_operator="triton_tma_flash_attention_2",
     minimum_compute_capability=(9, 0),
 )
 
-NATIVE_CUDA_CASE = AttentionBenchmarkCase(
-    implementation="cuda",
-    attention_backend=AttentionBackend.OMNIDREAMS,
-    sdpa_backend=SDPABackend.CUDNN,
-    self_attention_operator="cudnn",
-    cross_attention_operator="cudnn",
-    native_dit=True,
-)
+ATTENTION_CASES = (WAN_TORCH_CASE, TRITON_CUDNN_CASE, TRITON_TMA_CASE)
+"""Attention cases exercised by each Lingbot benchmark layer."""
 
-PYTORCH_ATTENTION_CASES = (
-    OMNIDREAMS_TORCH_CASE,
-    TRITON_CUDNN_CASE,
-    TRITON_TMA_CASE,
-)
-"""Attention cases that execute the PyTorch DiT network."""
-
-CROSS_ATTENTION_CASES = (OMNIDREAMS_TORCH_CASE, TRITON_CUDNN_CASE)
-"""One case per concrete cross-attention implementation."""
-
-PIPELINE_CASES = (*PYTORCH_ATTENTION_CASES, NATIVE_CUDA_CASE)
-"""Attention cases exercised by the full-pipeline benchmark."""
-
-assert {case.attention_backend for case in PYTORCH_ATTENTION_CASES} == set(
-    AttentionBackend
-), "Every AttentionBackend must have a PyTorch benchmark case"
+assert {case.attention_backend for case in ATTENTION_CASES} == set(AttentionBackend)
 assert {
     case.sdpa_backend
-    for case in PYTORCH_ATTENTION_CASES
+    for case in ATTENTION_CASES
     if case.attention_backend is AttentionBackend.TRITON
-} == set(SDPABackend), "Every SDPABackend must have a Triton benchmark case"
+} == set(SDPABackend)
 
 
 def skip_unsupported_device(

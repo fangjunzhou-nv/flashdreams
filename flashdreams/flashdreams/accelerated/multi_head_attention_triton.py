@@ -149,7 +149,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         qk_norm_scope: QKNormScope = QKNormScope.HEAD,
         rope_interleaved: bool = False,
         use_fp8: bool = False,
-        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
+        sdpa_backend: SDPABackend = SDPABackend.TRITON,
     ) -> None:
         """Initialize projections and fused attention policies.
 

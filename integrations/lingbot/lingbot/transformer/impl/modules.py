@@ -43,7 +43,7 @@ class CamCtrlBlock(Block):
         eps: float = 1e-6,
         cp_method: Literal["ring", "ulysses"] = "ring",
         attention_backend: AttentionBackend = AttentionBackend.TRITON,
-        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
+        sdpa_backend: SDPABackend = SDPABackend.TRITON,
     ) -> None:
         super().__init__(
             dim=dim,

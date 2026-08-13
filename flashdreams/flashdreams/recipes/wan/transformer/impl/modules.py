@@ -424,7 +424,7 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
         eps: float = 1e-6,
         apply_rope_before_kvcache: bool = True,
         cp_method: Literal["ring", "ulysses"] = "ring",
-        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
+        sdpa_backend: SDPABackend = SDPABackend.TRITON,
     ) -> None:
         """Initialize accelerated attention with Wan projection and RoPE policies.
 
@@ -629,7 +629,7 @@ class Block(nn.Module):
         apply_rope_before_kvcache: bool = True,
         cp_method: Literal["ring", "ulysses"] = "ring",
         attention_backend: AttentionBackend = AttentionBackend.WAN,
-        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
+        sdpa_backend: SDPABackend = SDPABackend.TRITON,
     ) -> None:
         super().__init__()
         self.dim = dim

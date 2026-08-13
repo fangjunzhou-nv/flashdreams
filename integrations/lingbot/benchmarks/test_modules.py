@@ -15,7 +15,7 @@
 
 """Microbenchmark for the LingBot-owned camera-control DiT block.
 
-Run both attention backends with ``uv run --package flashdreams-lingbot
+Run all attention cases with ``uv run --package flashdreams-lingbot
 --group test pytest integrations/lingbot/benchmarks/test_modules.py
 -p no:manual_marker -m manual --benchmark-only``.
 """
@@ -34,6 +34,11 @@ from pytest_benchmark.fixture import BenchmarkFixture
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from flashdreams.core.distributed import init as init_distributed
 from flashdreams.recipes.wan.transformer.impl.modules import AttentionBackend
+from integrations.lingbot.benchmarks.cases import (
+    ATTENTION_CASES,
+    AttentionBenchmarkCase,
+    skip_unsupported_device,
+)
 
 pytestmark = pytest.mark.manual
 
@@ -71,35 +76,9 @@ def _synchronize_ranks() -> None:
         dist.barrier()
 
 
-def _skip_unsupported_backend(
-    backend: AttentionBackend,
-    device: torch.device,
-    context_parallel_size: int,
-) -> None:
-    """Skip backend and hardware combinations unsupported by production code."""
-    if backend is not AttentionBackend.TRITON:
-        return
-    if torch.cuda.get_device_capability(device) < (9, 0):
-        pytest.skip("Triton attention requires compute capability 9.0 or newer")
-    if context_parallel_size > 1:
-        pytest.skip("Triton attention does not support context parallelism")
-
-
-def _implementation(backend: AttentionBackend) -> str:
-    """Return the stable benchmark implementation name for a backend."""
-    return "wan_torch" if backend is AttentionBackend.WAN else "triton"
-
-
-def _self_attention_operator(backend: AttentionBackend) -> str:
-    """Return the concrete self-attention operator name for a backend."""
-    if backend is AttentionBackend.WAN:
-        return "cudnn"
-    return "torch_cudnn_sdpa"
-
-
 def _make_block(
     config: LingbotWorldDiTNetwork14BConfig,
-    backend: AttentionBackend,
+    case: AttentionBenchmarkCase,
     device: torch.device,
     dtype: torch.dtype,
 ) -> CamCtrlBlock:
@@ -126,9 +105,9 @@ def _make_block(
         with torch.device(device):
             torch.manual_seed(_SEED)
             reference = make(AttentionBackend.WAN)
-            if backend is AttentionBackend.WAN:
+            if case.attention_backend is AttentionBackend.WAN:
                 return reference
-            block = make(backend)
+            block = make(case.attention_backend)
             block.load_state_dict(reference.state_dict(), strict=True)
             return block
     finally:
@@ -137,14 +116,14 @@ def _make_block(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "backend",
-    tuple(AttentionBackend),
-    ids=lambda backend: _implementation(backend).replace("_", "-"),
+    "case",
+    ATTENTION_CASES,
+    ids=lambda case: case.pytest_id,
 )
 @torch.inference_mode()
 def test_camctrl_dit_block_benchmark(
     benchmark: BenchmarkFixture,
-    backend: AttentionBackend,
+    case: AttentionBenchmarkCase,
 ) -> None:
     """Benchmark the CLI-resolution LingBot camera-control DiT block."""
     device = _benchmark_device()
@@ -157,14 +136,18 @@ def test_camctrl_dit_block_benchmark(
         patch_embedding_type="conv3d",
         control_type="cam",
         cp_method="ulysses",
-        attention_backend=backend,
+        attention_backend=case.attention_backend,
+        sdpa_backend=case.sdpa_backend,
     )
     cp_size = dist.get_world_size() if dist.is_initialized() else 1
-    _skip_unsupported_backend(backend, device, cp_size)
-    block = _make_block(config, backend, device, dtype)
+    skip_unsupported_device(case, device)
+    if case.attention_backend is AttentionBackend.TRITON and cp_size > 1:
+        pytest.skip("Triton attention does not support context parallelism")
+    block = _make_block(config, case, device, dtype)
     block.eval()
     block.update_parameters_after_loading_checkpoint()
-    assert block.attention_backend is backend
+    assert block.attention_backend is case.attention_backend
+    assert block.sdpa_backend is case.sdpa_backend
     generator = torch.Generator(device=device).manual_seed(_SEED)
 
     cp_group = dist.group.WORLD if cp_size > 1 else None
@@ -172,7 +155,7 @@ def test_camctrl_dit_block_benchmark(
     self_attention_cp_enabled = block.self_attn.is_context_parallel_enabled()
     cross_attention_cp_enabled = block.cross_attn.attn_op.is_context_parallel_enabled()
     assert self_attention_cp_enabled == (
-        backend is AttentionBackend.WAN and cp_size > 1
+        case.attention_backend is AttentionBackend.WAN and cp_size > 1
     )
     assert not cross_attention_cp_enabled
 
@@ -254,7 +237,7 @@ def test_camctrl_dit_block_benchmark(
     torch.cuda.synchronize(device)
 
     self_attention_cp_method = (
-        config.cp_method if backend is AttentionBackend.WAN else None
+        config.cp_method if case.attention_backend is AttentionBackend.WAN else None
     )
     cross_attention_method = block.cross_attn.attn_op.method
     assert block.cross_attn.attn_op.backend == "cudnn"
@@ -272,7 +255,7 @@ def test_camctrl_dit_block_benchmark(
             "model_family": "lingbot-world",
             "model_variant": "lingbot-world-14b",
             "benchmark_scope": "whole_block_including_inherited_wan_branches",
-            "implementation": _implementation(backend),
+            "implementation": case.implementation,
             "batch_shape": [],
             "pixel_resolution": [_PIXEL_HEIGHT, _PIXEL_WIDTH],
             "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
@@ -292,12 +275,13 @@ def test_camctrl_dit_block_benchmark(
             "lingbot_camera_parameter_count": camera_parameter_count,
             "checkpoint": "random_init_shared_weights",
             "dtype": str(dtype),
-            "attention_backend": backend.value,
-            "self_attention_operator": _self_attention_operator(backend),
+            "attention_backend": case.attention_backend.value,
+            "sdpa_backend": case.sdpa_backend.value,
+            "self_attention_operator": case.self_attention_operator,
             "cross_attention_operator": "cudnn",
             "projection_backend": (
                 "separate_qkv"
-                if backend is AttentionBackend.WAN
+                if case.attention_backend is AttentionBackend.WAN
                 else "row_scaled_fp8_fused_qkv_output"
             ),
             "self_attention_cache_dtype": str(cache.self_attn.dtype),

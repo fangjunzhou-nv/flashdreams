@@ -38,6 +38,7 @@ from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from integrations.omnidreams.benchmarks.cases import (
     PYTORCH_ATTENTION_CASES,
     AttentionBenchmarkCase,
+    CROSS_ATTENTION_CASES,
     skip_unsupported_device,
 )
 
@@ -107,7 +108,7 @@ def test_dit_block_benchmark(
     device = torch.device("cuda")
     skip_unsupported_device(case, device)
     dtype = torch.bfloat16
-    config = CosmosDiTNetworkConfig()
+    config = CosmosDiTNetworkConfig(sdpa_backend=case.sdpa_backend)
     block = _make_block(config, case).to(device=device, dtype=dtype)
     block.eval()
     generator = torch.Generator(device=device).manual_seed(_SEED)
@@ -209,6 +210,7 @@ def test_dit_block_benchmark(
             "checkpoint": "random_init_shared_weights",
             "dtype": str(dtype),
             "implementation": case.implementation,
+            "sdpa_backend": case.sdpa_backend.value,
             "attention_backend": case.self_attention_operator,
             "self_attention_backend": case.self_attention_operator,
             "cross_attention_backend": case.cross_attention_operator,
@@ -259,7 +261,7 @@ def test_self_attention_benchmark(
     device = torch.device("cuda")
     skip_unsupported_device(case, device)
     dtype = torch.bfloat16
-    config = CosmosDiTNetworkConfig()
+    config = CosmosDiTNetworkConfig(sdpa_backend=case.sdpa_backend)
     attention = _make_block(config, case).self_attn.to(device=device, dtype=dtype)
     attention.eval()
     generator = torch.Generator(device=device).manual_seed(_SEED)
@@ -324,6 +326,7 @@ def test_self_attention_benchmark(
             "checkpoint": "random_init_shared_weights",
             "dtype": str(dtype),
             "implementation": case.implementation,
+            "sdpa_backend": case.sdpa_backend.value,
             "attention_backend": case.self_attention_operator,
             "cache_dtype": str(cache.dtype),
             "cache_state": "full_window",
@@ -365,9 +368,7 @@ def test_self_attention_benchmark(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-@pytest.mark.parametrize(
-    "case", PYTORCH_ATTENTION_CASES, ids=lambda case: case.pytest_id
-)
+@pytest.mark.parametrize("case", CROSS_ATTENTION_CASES, ids=lambda case: case.pytest_id)
 @torch.inference_mode()
 def test_cross_attention_benchmark(
     benchmark: BenchmarkFixture,
@@ -380,7 +381,7 @@ def test_cross_attention_benchmark(
     device = torch.device("cuda")
     skip_unsupported_device(case, device)
     dtype = torch.bfloat16
-    config = CosmosDiTNetworkConfig()
+    config = CosmosDiTNetworkConfig(sdpa_backend=case.sdpa_backend)
     attention = _make_block(config, case).cross_attn.to(device=device, dtype=dtype)
     attention.eval()
     generator = torch.Generator(device=device).manual_seed(_SEED)
@@ -432,6 +433,7 @@ def test_cross_attention_benchmark(
             "checkpoint": "random_init_shared_weights",
             "dtype": str(dtype),
             "implementation": case.implementation,
+            "sdpa_backend": case.sdpa_backend.value,
             "attention_backend": case.cross_attention_operator,
             "cache_dtype": str(cache.dtype),
             "cache_state": "static_context",

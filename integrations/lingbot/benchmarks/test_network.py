@@ -37,6 +37,11 @@ from flashdreams.infra.acceleration import (
 )
 from flashdreams.infra.compile import compile_module
 from flashdreams.recipes.wan.transformer.impl.modules import AttentionBackend
+from integrations.lingbot.benchmarks.cases import (
+    ATTENTION_CASES,
+    AttentionBenchmarkCase,
+    skip_unsupported_device,
+)
 
 pytestmark = pytest.mark.manual
 
@@ -76,41 +81,16 @@ def _synchronize_ranks() -> None:
         dist.barrier()
 
 
-def _skip_unsupported_backend(
-    backend: AttentionBackend,
-    device: torch.device,
-) -> None:
-    """Skip Triton where its hardware or execution mode is unsupported."""
-    if backend is not AttentionBackend.TRITON:
-        return
-    if dist.is_initialized() and dist.get_world_size() > 1:
-        pytest.skip("Triton attention does not support context parallelism")
-    if torch.cuda.get_device_capability(device) < (9, 0):
-        pytest.skip("Triton attention requires compute capability 9.0 or newer")
-
-
-def _implementation(backend: AttentionBackend) -> str:
-    """Return the stable benchmark implementation name for a backend."""
-    return "wan_torch" if backend is AttentionBackend.WAN else "triton"
-
-
-def _self_attention_operator(backend: AttentionBackend) -> str:
-    """Return the concrete self-attention operator name for a backend."""
-    if backend is AttentionBackend.WAN:
-        return "cudnn"
-    return "torch_cudnn_sdpa"
-
-
 @pytest.mark.parametrize(
-    "backend",
-    tuple(AttentionBackend),
-    ids=lambda backend: _implementation(backend).replace("_", "-"),
+    "case",
+    ATTENTION_CASES,
+    ids=lambda case: case.pytest_id,
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @torch.inference_mode()
 def test_dit_network_benchmark(
     benchmark: BenchmarkFixture,
-    backend: AttentionBackend,
+    case: AttentionBenchmarkCase,
 ) -> None:
     """Benchmark the compiled 14B LingBot DiT at steady state."""
     device = _benchmark_device()
@@ -119,7 +99,13 @@ def test_dit_network_benchmark(
 
     dtype = torch.bfloat16
     torch.manual_seed(_SEED)
-    _skip_unsupported_backend(backend, device)
+    skip_unsupported_device(case, device)
+    if (
+        case.attention_backend is AttentionBackend.TRITON
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    ):
+        pytest.skip("Triton attention does not support context parallelism")
     config = LingbotWorldDiTNetwork14BConfig(
         # 16 noise channels + 4 mask channels + 16 first-frame latent
         # channels before the DiT's 1x2x2 patch embedding.
@@ -127,7 +113,8 @@ def test_dit_network_benchmark(
         patch_embedding_type="conv3d",
         control_type="cam",
         cp_method="ulysses",
-        attention_backend=backend,
+        attention_backend=case.attention_backend,
+        sdpa_backend=case.sdpa_backend,
     )
 
     # Avoid materializing the 14B random initialization as fp32 CPU weights.
@@ -145,7 +132,11 @@ def test_dit_network_benchmark(
     cp_size = dist.get_world_size() if dist.is_initialized() else 1
     cp_group = dist.group.WORLD if cp_size > 1 else None
     network.set_context_parallel_group(cp_group)
-    assert all(block.attention_backend is backend for block in network.blocks)
+    assert all(
+        block.attention_backend is case.attention_backend
+        and block.sdpa_backend is case.sdpa_backend
+        for block in network.blocks
+    )
     attention_modules = [
         module
         for module in network.modules()
@@ -284,7 +275,7 @@ def test_dit_network_benchmark(
             "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
             "global_chunk_tokens": global_chunk_tokens,
             "local_chunk_tokens": chunk_tokens,
-            "implementation": _implementation(backend),
+            "implementation": case.implementation,
             "global_window_tokens": global_window_tokens,
             "local_window_tokens": window_tokens,
             "global_sink_tokens": global_sink_tokens,
@@ -301,18 +292,21 @@ def test_dit_network_benchmark(
             "checkpoint": "random_init",
             "dtype": str(dtype),
             "execution_backend": "pytorch",
-            "attention_backend": backend.value,
-            "self_attention_operator": _self_attention_operator(backend),
+            "attention_backend": case.attention_backend.value,
+            "sdpa_backend": case.sdpa_backend.value,
+            "self_attention_operator": case.self_attention_operator,
             "cross_attention_operator": "cudnn",
             "projection_backend": (
                 "separate_qkv"
-                if backend is AttentionBackend.WAN
+                if case.attention_backend is AttentionBackend.WAN
                 else "row_scaled_fp8_fused_qkv_output"
             ),
             "self_attention_cache_dtype": str(cache[0].self_attn.dtype),
             "cross_attention_cache_dtype": str(cache[0].cross_attn.text.dtype),
             "self_attention_context_parallel_method": (
-                config.cp_method if backend is AttentionBackend.WAN else None
+                config.cp_method
+                if case.attention_backend is AttentionBackend.WAN
+                else None
             ),
             "local_attention_methods": sorted(local_attention_methods),
             "context_parallel_size": cp_size,

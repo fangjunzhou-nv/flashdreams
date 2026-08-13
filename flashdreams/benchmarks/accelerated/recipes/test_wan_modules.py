@@ -24,10 +24,13 @@ Run the manual GPU benchmarks with::
 
 from __future__ import annotations
 
+from enum import Enum
+
 import pytest
 import torch
 from pytest_benchmark.fixture import BenchmarkFixture
 
+from flashdreams.accelerated.multi_head_attention_triton import SDPABackend
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from flashdreams.recipes.wan.transformer.impl.modules import (
     AttentionBackend,
@@ -62,6 +65,45 @@ _SINK_TOKENS = 0
 _WARMUP_ROUNDS = 3
 _BENCHMARK_ROUNDS = 20
 _SEED = 42
+
+
+class _Implementation(str, Enum):
+    """Wan attention implementations covered by the benchmark."""
+
+    WAN_TORCH = "wan_torch"
+    TRITON_CUDNN = "triton_cudnn"
+    TRITON_TMA = "triton_tma"
+
+    @property
+    def attention_backend(self) -> AttentionBackend:
+        """Return the DiT attention implementation."""
+        if self is self.WAN_TORCH:
+            return AttentionBackend.WAN
+        return AttentionBackend.TRITON
+
+    @property
+    def sdpa_backend(self) -> SDPABackend:
+        """Return the configured self-attention SDPA implementation."""
+        if self is self.TRITON_TMA:
+            return SDPABackend.TRITON
+        return SDPABackend.CUDNN
+
+    @property
+    def self_attention_operator(self) -> str:
+        """Return the concrete self-attention operator name."""
+        if self is self.WAN_TORCH:
+            return "cudnn"
+        if self is self.TRITON_CUDNN:
+            return "torch_cudnn_sdpa"
+        return "triton_tma_flash_attention_2"
+
+
+assert {case.attention_backend for case in _Implementation} == set(AttentionBackend)
+assert {
+    case.sdpa_backend
+    for case in _Implementation
+    if case.attention_backend is AttentionBackend.TRITON
+} == set(SDPABackend)
 
 
 def _skip_unsupported_device(
@@ -105,37 +147,29 @@ def _make_block(
     return block
 
 
-def _implementation(backend: AttentionBackend) -> str:
-    """Return the stable benchmark implementation name for a backend."""
-    return "wan_torch" if backend is AttentionBackend.WAN else "triton"
-
-
-def _self_attention_operator(backend: AttentionBackend) -> str:
-    """Return the concrete self-attention operator name for a backend."""
-    if backend is AttentionBackend.WAN:
-        return "cudnn"
-    return "torch_cudnn_sdpa"
-
-
 @pytest.mark.parametrize(
-    "backend",
-    tuple(AttentionBackend),
-    ids=lambda backend: _implementation(backend).replace("_", "-"),
+    "implementation",
+    tuple(_Implementation),
+    ids=lambda implementation: implementation.value.replace("_", "-"),
 )
 @torch.inference_mode()
 def test_self_attention_benchmark(
     benchmark: BenchmarkFixture,
-    backend: AttentionBackend,
+    implementation: _Implementation,
 ) -> None:
     """Benchmark Wan self-attention against a full production KV window."""
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Wan self-attention benchmark requires bfloat16 support.")
 
     device = torch.device("cuda")
+    backend = implementation.attention_backend
     _skip_unsupported_device(backend, device)
     dtype = torch.bfloat16
-    config = WanDiTNetwork1pt3BConfig()
-    attention = _make_block(config, backend).self_attn
+    config = WanDiTNetwork1pt3BConfig(sdpa_backend=implementation.sdpa_backend)
+    block = _make_block(config, backend)
+    assert block.attention_backend is backend
+    assert block.sdpa_backend is implementation.sdpa_backend
+    attention = block.self_attn
     attention.to(device=device, dtype=dtype).eval()
     generator = torch.Generator(device=device).manual_seed(_SEED)
 
@@ -178,9 +212,10 @@ def test_self_attention_benchmark(
             "module": "self_attention",
             "model_family": "wan",
             "model_variant": "wan2.1-1.3b",
-            "implementation": _implementation(backend),
+            "implementation": implementation.value,
             "attention_backend": backend.value,
-            "self_attention_operator": _self_attention_operator(backend),
+            "sdpa_backend": implementation.sdpa_backend.value,
+            "self_attention_operator": implementation.self_attention_operator,
             "projection_backend": (
                 "separate_qkv"
                 if backend is AttentionBackend.WAN
@@ -254,24 +289,27 @@ def test_self_attention_benchmark(
 
 
 @pytest.mark.parametrize(
-    "backend",
-    tuple(AttentionBackend),
-    ids=lambda backend: _implementation(backend).replace("_", "-"),
+    "implementation",
+    tuple(_Implementation),
+    ids=lambda implementation: implementation.value.replace("_", "-"),
 )
 @torch.inference_mode()
 def test_dit_block_benchmark(
     benchmark: BenchmarkFixture,
-    backend: AttentionBackend,
+    implementation: _Implementation,
 ) -> None:
     """Benchmark a production-configured Wan DiT block at steady state."""
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Wan DiT block benchmark requires bfloat16 support.")
 
     device = torch.device("cuda")
+    backend = implementation.attention_backend
     _skip_unsupported_device(backend, device)
     dtype = torch.bfloat16
-    config = WanDiTNetwork1pt3BConfig()
+    config = WanDiTNetwork1pt3BConfig(sdpa_backend=implementation.sdpa_backend)
     block = _make_block(config, backend).to(device=device, dtype=dtype).eval()
+    assert block.attention_backend is backend
+    assert block.sdpa_backend is implementation.sdpa_backend
     block.update_parameters_after_loading_checkpoint()
     generator = torch.Generator(device=device).manual_seed(_SEED)
 
@@ -333,9 +371,10 @@ def test_dit_block_benchmark(
             "module": "Block",
             "model_family": "wan",
             "model_variant": "wan2.1-1.3b",
-            "implementation": _implementation(backend),
+            "implementation": implementation.value,
             "attention_backend": backend.value,
-            "self_attention_operator": _self_attention_operator(backend),
+            "sdpa_backend": implementation.sdpa_backend.value,
+            "self_attention_operator": implementation.self_attention_operator,
             "cross_attention_operator": "cudnn",
             "projection_backend": (
                 "separate_qkv"

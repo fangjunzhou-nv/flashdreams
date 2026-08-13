@@ -112,7 +112,7 @@ class WanDiTNetworkConfig(InstantiateConfig):
     """Context-parallel attention method for transformer attention ops."""
     attention_backend: AttentionBackend = AttentionBackend.WAN
     """Self-attention implementation used by every transformer block."""
-    sdpa_backend: SDPABackend = SDPABackend.CUDNN
+    sdpa_backend: SDPABackend = SDPABackend.TRITON
     """SDPA implementation used by accelerated self-attention."""
 
 

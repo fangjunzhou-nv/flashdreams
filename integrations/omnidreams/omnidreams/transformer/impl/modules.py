@@ -605,7 +605,7 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
         n_heads: int = 8,
         head_dim: int = 64,
         cp_method: Literal["ring", "ulysses"] = "ring",
-        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
+        sdpa_backend: SDPABackend = SDPABackend.TRITON,
     ) -> None:
         """Initialize bias-free, FP8-projected self-attention.
 
@@ -694,7 +694,7 @@ class Block(nn.Module):
         enable_cross_view_attn: bool = False,
         cp_method: Literal["ring", "ulysses"] = "ring",
         attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS,
-        sdpa_backend: SDPABackend = SDPABackend.CUDNN,
+        sdpa_backend: SDPABackend = SDPABackend.TRITON,
     ) -> None:
         super().__init__()
         self.x_dim = x_dim

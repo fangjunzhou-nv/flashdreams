@@ -26,10 +26,12 @@ activations, and compiler workspaces. The full-pipeline cases also require the
 Hugging Face access and cache space documented in
 [`integrations/lingbot/README.md`](../README.md).
 
-Each benchmark layer compares the default WAN/cuDNN self-attention with the
-Triton FP8 backend. Triton requires compute capability 9.0 or newer and runs
-only on a single GPU because it does not support context parallelism;
-cross-attention remains cuDNN in both cases.
+Each benchmark layer runs three cases: the WAN/cuDNN reference, Triton FP8
+projections with PyTorch cuDNN SDPA, and Triton FP8 projections with Triton TMA
+FlashAttention2. Their stable labels are `wan_torch`, `triton_cudnn`, and
+`triton_tma`. Both Triton cases require compute capability 9.0 or newer and run
+only on a single GPU because Triton attention does not support context
+parallelism; cross-attention remains cuDNN in all three cases.
 
 First sync the LingBot package and the workspace `test` dependency group,
 which provides both `pytest` and `pytest-benchmark`:

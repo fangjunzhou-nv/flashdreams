@@ -124,7 +124,7 @@ class CosmosDiTNetworkConfig(InstantiateConfig):
     attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS
     """Attention implementation used by every DiT block."""
 
-    sdpa_backend: SDPABackend = SDPABackend.CUDNN
+    sdpa_backend: SDPABackend = SDPABackend.TRITON
     """SDPA implementation used by accelerated self-attention."""
 
     view_condition_dim: int = 16

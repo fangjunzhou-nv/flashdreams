@@ -55,6 +55,11 @@ from flashdreams.recipes.taehv import TeahvVAEDecoderConfig
 from flashdreams.recipes.wan.autoencoder.vae import WanVAEEncoderConfig
 from flashdreams.recipes.wan.pipeline import WanInferencePipelineCache
 from flashdreams.recipes.wan.transformer.impl.modules import AttentionBackend
+from integrations.lingbot.benchmarks.cases import (
+    ATTENTION_CASES,
+    AttentionBenchmarkCase,
+    skip_unsupported_device,
+)
 
 pytestmark = pytest.mark.manual
 
@@ -84,24 +89,13 @@ def _synchronize_ranks() -> None:
         dist.barrier()
 
 
-def _implementation(backend: AttentionBackend) -> str:
-    """Return the stable benchmark implementation name for a backend."""
-    return "wan_torch" if backend is AttentionBackend.WAN else "triton"
-
-
-def _self_attention_operator(backend: AttentionBackend) -> str:
-    """Return the concrete self-attention operator name for a backend."""
-    if backend is AttentionBackend.WAN:
-        return "cudnn"
-    return "torch_cudnn_sdpa"
-
-
-def _skip_unsupported_backend(
-    backend: AttentionBackend,
+def _skip_unsupported_case(
+    case: AttentionBenchmarkCase,
     device: torch.device,
 ) -> None:
-    """Skip Triton where its hardware or context-parallel contract is unmet."""
-    if backend is not AttentionBackend.TRITON:
+    """Skip a case where its hardware or context-parallel contract is unmet."""
+    skip_unsupported_device(case, device)
+    if case.attention_backend is not AttentionBackend.TRITON:
         return
     world_size = (
         dist.get_world_size()
@@ -110,50 +104,48 @@ def _skip_unsupported_backend(
     )
     if world_size > 1:
         pytest.skip("Triton attention does not support context parallelism")
-    if torch.cuda.get_device_capability(device) < (9, 0):
-        pytest.skip("Triton attention requires compute capability 9.0 or newer")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "backend",
-    tuple(AttentionBackend),
-    ids=lambda backend: _implementation(backend).replace("_", "-"),
+    "case",
+    ATTENTION_CASES,
+    ids=lambda case: case.pytest_id,
 )
 def test_full_pipeline_generate_benchmark(
     benchmark: BenchmarkFixture,
-    backend: AttentionBackend,
+    case: AttentionBenchmarkCase,
 ) -> None:
     """Benchmark steady-state LingBot encode, diffuse, and decode."""
-    _run_full_pipeline_benchmark(benchmark, backend=backend, stage="generate")
+    _run_full_pipeline_benchmark(benchmark, case=case, stage="generate")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "backend",
-    tuple(AttentionBackend),
-    ids=lambda backend: _implementation(backend).replace("_", "-"),
+    "case",
+    ATTENTION_CASES,
+    ids=lambda case: case.pytest_id,
 )
 def test_full_pipeline_finalize_benchmark(
     benchmark: BenchmarkFixture,
-    backend: AttentionBackend,
+    case: AttentionBenchmarkCase,
 ) -> None:
     """Benchmark the LingBot DiT cache-finalization update."""
-    _run_full_pipeline_benchmark(benchmark, backend=backend, stage="finalize")
+    _run_full_pipeline_benchmark(benchmark, case=case, stage="finalize")
 
 
 @torch.inference_mode()
 def _run_full_pipeline_benchmark(
     benchmark: BenchmarkFixture,
     *,
-    backend: AttentionBackend,
+    case: AttentionBenchmarkCase,
     stage: Literal["generate", "finalize"],
 ) -> None:
     """Run one full-pipeline lifecycle-stage benchmark."""
     device = _benchmark_device()
     if not torch.cuda.is_bf16_supported():
         pytest.skip("LingBot full-pipeline benchmark requires bfloat16 support")
-    _skip_unsupported_backend(backend, device)
+    _skip_unsupported_case(case, device)
 
     torch.manual_seed(_SEED)
     torch.backends.cudnn.benchmark = True
@@ -165,14 +157,17 @@ def _run_full_pipeline_benchmark(
     # transient fp32 CPU copy and does not affect timed steady-state stages.
     pipeline_config = derive_config(
         PIPELINE_LINGBOT_WORLD_V2_14B_CAUSAL_FAST_TAEHV_WINDOW15_SINK3,
-        name=f"lingbot-world-v2-full-pipeline-{_implementation(backend)}-benchmark",
+        name=f"lingbot-world-v2-full-pipeline-{case.implementation}-benchmark",
         text_encoder=None,
         enable_sync_and_profile=False,
         diffusion_model={
             "seed": _SEED,
             "transformer": {
                 "init_device": str(device),
-                "network": {"attention_backend": backend},
+                "network": {
+                    "attention_backend": case.attention_backend,
+                    "sdpa_backend": case.sdpa_backend,
+                },
             },
         },
     )
@@ -206,7 +201,8 @@ def _run_full_pipeline_benchmark(
     assert isinstance(encoder_config, I2VCamCtrlEncoderConfig)
     assert isinstance(encoder_config.i2v.encoder, WanVAEEncoderConfig)
     assert isinstance(decoder_config, TeahvVAEDecoderConfig)
-    assert transformer_config.network.attention_backend is backend
+    assert transformer_config.network.attention_backend is case.attention_backend
+    assert transformer_config.network.sdpa_backend is case.sdpa_backend
 
     transformer = pipeline.diffusion_model.transformer
     assert isinstance(transformer, LingbotWorldTransformer)
@@ -214,9 +210,11 @@ def _run_full_pipeline_benchmark(
     network = getattr(transformer.network, "_orig_mod", transformer.network)
     assert isinstance(network, LingbotWorldDiTNetwork)
     assert network.blocks
-    assert {AttentionBackend(block.attention_backend) for block in network.blocks} == {
-        backend
-    }
+    assert all(
+        block.attention_backend is case.attention_backend
+        and block.sdpa_backend is case.sdpa_backend
+        for block in network.blocks
+    )
     cp_size = transformer._cp_size
     cp_enabled_attention_modules = [
         attention
@@ -412,22 +410,23 @@ def _run_full_pipeline_benchmark(
             "i2v_encoder_checkpoint": encoder_config.i2v.encoder.checkpoint_path,
             "decoder_checkpoint": decoder_config.checkpoint_path,
             "dtype": str(dtype),
-            "implementation": _implementation(backend),
+            "implementation": case.implementation,
             "dit_execution": "pytorch",
-            "configured_attention_backend": backend.value,
-            "dit_attention_backend": _self_attention_operator(backend),
-            "dit_self_attention_backend": _self_attention_operator(backend),
+            "configured_attention_backend": case.attention_backend.value,
+            "configured_sdpa_backend": case.sdpa_backend.value,
+            "dit_attention_backend": case.self_attention_operator,
+            "dit_self_attention_backend": case.self_attention_operator,
             "dit_cross_attention_backend": "cudnn",
             "projection_backend": (
                 "separate_qkv"
-                if backend is AttentionBackend.WAN
+                if case.attention_backend is AttentionBackend.WAN
                 else "row_scaled_fp8_fused_qkv_output"
             ),
             "dit_self_attention_kv_cache_dtype": self_attention_cache_dtype,
             "dit_cross_attention_kv_cache_dtype": cross_attention_cache_dtype,
             "self_attention_context_parallel_method": (
                 transformer_config.network.cp_method
-                if backend is AttentionBackend.WAN
+                if case.attention_backend is AttentionBackend.WAN
                 else None
             ),
             "local_attention_methods": sorted(local_attention_methods),

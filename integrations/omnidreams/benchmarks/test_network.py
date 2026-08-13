@@ -94,6 +94,7 @@ def test_dit_network_benchmark(
         enable_cross_view_attn=False,
         cp_method="ring",
         attention_backend=case.attention_backend,
+        sdpa_backend=case.sdpa_backend,
     )
     network = CosmosDiTNetwork(config).to(device=device, dtype=dtype)
     network.eval()
@@ -102,6 +103,7 @@ def test_dit_network_benchmark(
     assert all(
         block.attention_backend is case.attention_backend for block in network.blocks
     )
+    assert all(block.sdpa_backend is case.sdpa_backend for block in network.blocks)
     generator = torch.Generator(device=device).manual_seed(_SEED)
 
     patch_t = _CHUNK_SIZE_T // config.patch_temporal
@@ -218,6 +220,7 @@ def test_dit_network_benchmark(
             "dtype": str(dtype),
             "implementation": case.implementation,
             "execution_backend": "pytorch",
+            "sdpa_backend": case.sdpa_backend.value,
             "attention_backend": case.self_attention_operator,
             "self_attention_backend": case.self_attention_operator,
             "cross_attention_backend": case.cross_attention_operator,

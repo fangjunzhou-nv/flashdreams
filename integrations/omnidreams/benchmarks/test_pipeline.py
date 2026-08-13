@@ -127,7 +127,10 @@ def _run_full_pipeline_benchmark(
             "seed": _SEED,
             "transformer": {
                 "compile_network": not native_dit,
-                "network": {"attention_backend": attention_backend},
+                "network": {
+                    "attention_backend": attention_backend,
+                    "sdpa_backend": case.sdpa_backend,
+                },
                 # Keep cache finalization identical across the comparison;
                 # this performs the final context-noise DiT update before
                 # committing each autoregressive cache position.
@@ -157,6 +160,7 @@ def _run_full_pipeline_benchmark(
     assert isinstance(decoder_config, TeahvVAEDecoderConfig)
     network_config = transformer_config.network
     assert network_config.attention_backend is attention_backend
+    assert network_config.sdpa_backend is case.sdpa_backend
 
     transformer = pipeline.diffusion_model.transformer
     assert isinstance(transformer, CosmosTransformer)
@@ -346,6 +350,7 @@ def _run_full_pipeline_benchmark(
             "dtype": str(dtype),
             "implementation": case.implementation,
             "dit_execution": dit_execution,
+            "dit_sdpa_backend": case.sdpa_backend.value,
             "dit_attention_backend": dit_attention_backend,
             "dit_self_attention_backend": dit_self_attention_backend,
             "dit_cross_attention_backend": dit_cross_attention_backend,
