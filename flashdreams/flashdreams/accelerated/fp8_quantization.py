@@ -30,9 +30,13 @@ from flashdreams.accelerated.triton.fp8_quantization import (
 def quantize_fp8_weight(weight: Tensor) -> tuple[Tensor, Tensor]:
     """Quantize a linear weight with one FP32 scale per output row.
 
-    A weight row maps every input feature into one output feature. Scaling each
-    row independently therefore produces one dequantization factor per output
-    feature while preserving the linear layer's ``[O, I]`` layout.
+    A weight row maps every input feature into one output feature. For output
+    row ``o``, this stores
+    ``scale[o] = max(max(abs(weight[o])) / 448, 1e-12)`` and converts
+    ``weight[o] / scale[o]`` to E4M3. Per-row scaling therefore preserves the
+    linear layer's ``[O, I]`` layout while giving every output feature its own
+    dequantization factor. The returned tensors are detached inference data;
+    gradients continue to belong to the source parameter.
 
     Args:
         weight: Linear weight with shape ``[O, I]``.
