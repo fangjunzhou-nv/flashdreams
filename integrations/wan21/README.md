@@ -117,9 +117,11 @@ pipeline.finalize(autoregressive_index=0, cache=cache) # update one-step stats
 
 The WAN21 benchmarks are manual, GPU-only pytest tests for the shipped
 `wan21-t2v-1.3b-480p` configuration. Each benchmark layer compares the default
-WAN/cuDNN self-attention path with the Triton FP8 backend. Triton requires an
-NVIDIA GPU with compute capability 9.0 or newer and does not support context
-parallelism.
+WAN/cuDNN self-attention path, Triton FP8 projections with PyTorch cuDNN SDPA,
+and Triton FP8 projections with Triton FlashAttention2 (FA2). Their stable
+labels are `wan_torch`, `triton_cudnn`, and `triton_fa2`. Both Triton cases
+require an NVIDIA GPU with compute capability 9.0 or newer and do not support
+context parallelism.
 
 First sync this integration and the workspace benchmark dependencies:
 

@@ -15,7 +15,7 @@
 
 """Microbenchmarks for Wan 2.1 self-attention and DiT blocks.
 
-Run both attention backends with::
+Run all attention cases with::
 
     uv run --package flashdreams-wan21 --group test pytest \
         integrations/wan21/benchmarks/test_modules.py \
@@ -39,6 +39,11 @@ from flashdreams.recipes.wan.transformer.impl.modules import (
 )
 from flashdreams.recipes.wan.transformer.impl.network import (
     WanDiTNetwork1pt3BConfig,
+)
+from integrations.wan21.benchmarks.cases import (
+    ATTENTION_CASES,
+    AttentionBenchmarkCase,
+    skip_unsupported_device,
 )
 
 pytestmark = pytest.mark.manual
@@ -77,35 +82,20 @@ def _synchronize_ranks() -> None:
         dist.barrier()
 
 
-def _skip_unsupported_backend(
-    backend: AttentionBackend,
+def _skip_unsupported_case(
+    case: AttentionBenchmarkCase,
     device: torch.device,
     context_parallel_size: int,
 ) -> None:
-    """Skip backend and hardware combinations unsupported by production code."""
-    if backend is not AttentionBackend.TRITON:
-        return
-    if torch.cuda.get_device_capability(device) < (9, 0):
-        pytest.skip("Triton attention requires compute capability 9.0 or newer")
-    if context_parallel_size > 1:
+    """Skip case and execution combinations unsupported by production code."""
+    skip_unsupported_device(case, device)
+    if case.attention_backend is AttentionBackend.TRITON and context_parallel_size > 1:
         pytest.skip("Triton attention does not support context parallelism")
-
-
-def _implementation(backend: AttentionBackend) -> str:
-    """Return the stable benchmark implementation name for a backend."""
-    return "wan_torch" if backend is AttentionBackend.WAN else "triton"
-
-
-def _self_attention_operator(backend: AttentionBackend) -> str:
-    """Return the concrete self-attention operator name for a backend."""
-    if backend is AttentionBackend.WAN:
-        return "cudnn"
-    return "triton_fa2_fp8"
 
 
 def _make_block(
     config: WanDiTNetwork1pt3BConfig,
-    backend: AttentionBackend,
+    case: AttentionBenchmarkCase,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Block:
@@ -122,6 +112,7 @@ def _make_block(
             apply_rope_before_kvcache=config.apply_rope_before_kvcache,
             cp_method=config.cp_method,
             attention_backend=selected_backend,
+            sdpa_backend=config.sdpa_backend,
         )
 
     # Allocate the block directly at its benchmark precision. Initialization
@@ -132,9 +123,9 @@ def _make_block(
         with torch.device(device):
             torch.manual_seed(_SEED)
             reference = make(AttentionBackend.WAN)
-            if backend is AttentionBackend.WAN:
+            if case.attention_backend is AttentionBackend.WAN:
                 return reference
-            block = make(backend)
+            block = make(case.attention_backend)
             block.load_state_dict(reference.state_dict(), strict=True)
             return block
     finally:
@@ -170,14 +161,14 @@ def _token_geometry(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "backend",
-    tuple(AttentionBackend),
-    ids=lambda backend: _implementation(backend).replace("_", "-"),
+    "case",
+    ATTENTION_CASES,
+    ids=lambda case: case.pytest_id,
 )
 @torch.inference_mode()
 def test_self_attention_benchmark(
     benchmark: BenchmarkFixture,
-    backend: AttentionBackend,
+    case: AttentionBenchmarkCase,
 ) -> None:
     """Benchmark Wan 2.1 self-attention over its full single-chunk window."""
     device = _benchmark_device()
@@ -186,15 +177,18 @@ def test_self_attention_benchmark(
 
     dtype = torch.bfloat16
     cp_size = dist.get_world_size() if dist.is_initialized() else 1
-    _skip_unsupported_backend(backend, device, cp_size)
+    _skip_unsupported_case(case, device, cp_size)
+    backend = case.attention_backend
     config = WanDiTNetwork1pt3BConfig(
         cp_method="ring",
         attention_backend=backend,
+        sdpa_backend=case.sdpa_backend,
     )
-    block = _make_block(config, backend, device, dtype).eval()
+    block = _make_block(config, case, device, dtype).eval()
     block.update_parameters_after_loading_checkpoint()
     attention = block.self_attn
     assert block.attention_backend is backend
+    assert block.sdpa_backend is case.sdpa_backend
     del block
 
     cp_group = dist.group.WORLD if cp_size > 1 else None
@@ -258,9 +252,10 @@ def test_self_attention_benchmark(
             "integration": "wan21",
             "model_family": "wan",
             "model_variant": "wan21-t2v-1.3b-480p",
-            "implementation": _implementation(backend),
+            "implementation": case.implementation,
             "attention_backend": backend.value,
-            "self_attention_operator": _self_attention_operator(backend),
+            "sdpa_backend": case.sdpa_backend.value,
+            "self_attention_operator": case.self_attention_operator,
             "projection_backend": (
                 "separate_qkv"
                 if backend is AttentionBackend.WAN
@@ -338,14 +333,14 @@ def test_self_attention_benchmark(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "backend",
-    tuple(AttentionBackend),
-    ids=lambda backend: _implementation(backend).replace("_", "-"),
+    "case",
+    ATTENTION_CASES,
+    ids=lambda case: case.pytest_id,
 )
 @torch.inference_mode()
 def test_dit_block_benchmark(
     benchmark: BenchmarkFixture,
-    backend: AttentionBackend,
+    case: AttentionBenchmarkCase,
 ) -> None:
     """Benchmark the Wan 2.1 T2V DiT block over its full attention window."""
     device = _benchmark_device()
@@ -354,14 +349,17 @@ def test_dit_block_benchmark(
 
     dtype = torch.bfloat16
     cp_size = dist.get_world_size() if dist.is_initialized() else 1
-    _skip_unsupported_backend(backend, device, cp_size)
+    _skip_unsupported_case(case, device, cp_size)
+    backend = case.attention_backend
     config = WanDiTNetwork1pt3BConfig(
         cp_method="ring",
         attention_backend=backend,
+        sdpa_backend=case.sdpa_backend,
     )
-    block = _make_block(config, backend, device, dtype).eval()
+    block = _make_block(config, case, device, dtype).eval()
     block.update_parameters_after_loading_checkpoint()
     assert block.attention_backend is backend
+    assert block.sdpa_backend is case.sdpa_backend
 
     cp_group = dist.group.WORLD if cp_size > 1 else None
     block.set_context_parallel_group(cp_group)
@@ -446,9 +444,10 @@ def test_dit_block_benchmark(
             "model_family": "wan",
             "model_variant": "wan21-t2v-1.3b-480p",
             "benchmark_scope": "whole_wan_t2v_block",
-            "implementation": _implementation(backend),
+            "implementation": case.implementation,
             "attention_backend": backend.value,
-            "self_attention_operator": _self_attention_operator(backend),
+            "sdpa_backend": case.sdpa_backend.value,
+            "self_attention_operator": case.self_attention_operator,
             "cross_attention_operator": "cudnn",
             "projection_backend": (
                 "separate_qkv"

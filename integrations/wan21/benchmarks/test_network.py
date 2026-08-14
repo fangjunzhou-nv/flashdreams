@@ -37,6 +37,11 @@ from flashdreams.recipes.wan.transformer.impl.network import (
     WanDiTNetwork,
     WanDiTNetwork1pt3BConfig,
 )
+from integrations.wan21.benchmarks.cases import (
+    ATTENTION_CASES,
+    AttentionBenchmarkCase,
+    skip_unsupported_device,
+)
 
 pytestmark = pytest.mark.manual
 
@@ -81,41 +86,28 @@ def _synchronize_ranks() -> None:
         dist.barrier()
 
 
-def _skip_unsupported_backend(
-    backend: AttentionBackend,
+def _skip_unsupported_case(
+    case: AttentionBenchmarkCase,
     device: torch.device,
 ) -> None:
-    """Skip Triton where its hardware or execution mode is unsupported."""
-    if backend is not AttentionBackend.TRITON:
+    """Skip a case where its hardware or execution mode is unsupported."""
+    skip_unsupported_device(case, device)
+    if case.attention_backend is not AttentionBackend.TRITON:
         return
     if dist.is_initialized() and dist.get_world_size() > 1:
         pytest.skip("Triton attention does not support context parallelism")
-    if torch.cuda.get_device_capability(device) < (9, 0):
-        pytest.skip("Triton attention requires compute capability 9.0 or newer")
-
-
-def _implementation(backend: AttentionBackend) -> str:
-    """Return the stable benchmark implementation name for a backend."""
-    return "wan_torch" if backend is AttentionBackend.WAN else "triton"
-
-
-def _self_attention_operator(backend: AttentionBackend) -> str:
-    """Return the concrete self-attention operator name for a backend."""
-    if backend is AttentionBackend.WAN:
-        return "cudnn"
-    return "triton_fa2_fp8"
 
 
 @pytest.mark.parametrize(
-    "backend",
-    tuple(AttentionBackend),
-    ids=lambda backend: _implementation(backend).replace("_", "-"),
+    "case",
+    ATTENTION_CASES,
+    ids=lambda case: case.pytest_id,
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @torch.inference_mode()
 def test_dit_network_benchmark(
     benchmark: BenchmarkFixture,
-    backend: AttentionBackend,
+    case: AttentionBenchmarkCase,
 ) -> None:
     """Benchmark one compiled production-size Wan 2.1 DiT evaluation."""
     device = _benchmark_device()
@@ -124,11 +116,13 @@ def test_dit_network_benchmark(
 
     dtype = torch.bfloat16
     torch.manual_seed(_SEED)
-    _skip_unsupported_backend(backend, device)
+    _skip_unsupported_case(case, device)
+    backend = case.attention_backend
     config = WanDiTNetwork1pt3BConfig(
         patch_embedding_type="conv3d",
         cp_method="ring",
         attention_backend=backend,
+        sdpa_backend=case.sdpa_backend,
     )
 
     # Avoid materializing the 1.3B random initialization as fp32 CPU weights.
@@ -146,7 +140,10 @@ def test_dit_network_benchmark(
     cp_size = dist.get_world_size() if dist.is_initialized() else 1
     cp_group = dist.group.WORLD if cp_size > 1 else None
     network.set_context_parallel_group(cp_group)
-    assert all(block.attention_backend is backend for block in network.blocks)
+    assert all(
+        block.attention_backend is backend and block.sdpa_backend is case.sdpa_backend
+        for block in network.blocks
+    )
     attention_modules = [
         module
         for module in network.modules()
@@ -249,10 +246,11 @@ def test_dit_network_benchmark(
             "integration": "wan21",
             "model_family": "wan",
             "model_variant": "wan21-t2v-1.3b-480p",
-            "implementation": _implementation(backend),
+            "implementation": case.implementation,
             "execution_backend": "pytorch",
             "attention_backend": backend.value,
-            "self_attention_operator": _self_attention_operator(backend),
+            "sdpa_backend": case.sdpa_backend.value,
+            "self_attention_operator": case.self_attention_operator,
             "cross_attention_operator": "cudnn",
             "projection_backend": (
                 "separate_qkv"
