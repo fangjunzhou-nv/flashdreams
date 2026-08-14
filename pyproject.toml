@@ -42,6 +42,8 @@ override-dependencies = [
 no-build-isolation-package = ["transformer-engine-torch"]
 
 [tool.pyright]
+exclude = ["flashdreams/flashdreams/accelerated/triton/**"]
+ignore = ["flashdreams/flashdreams/accelerated/triton/**"]
 extraPaths = [
     "flashdreams",
     "apps",
