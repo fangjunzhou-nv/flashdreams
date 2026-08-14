@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Triton kernels used by accelerated module implementations."""
+"""Public Triton attention and fused preprocessing kernels."""
 
+# Importing the FlashAttention surface also installs the device-workspace
+# allocator required by its in-kernel TMA tensor descriptors.
 from flashdreams.accelerated.triton.flash_attention import (
     flash_attention_2_tma,
     is_tma_flash_attention_supported,

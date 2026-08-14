@@ -13,15 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TMA-backed Triton FlashAttention2 for projected attention tensors.
-
-Each program owns one query tile in one batch/head plane. Q is loaded once,
-K/V tiles stream through two-dimensional tensor descriptors, and the kernel
-retains only the online-softmax state and output accumulator in SRAM. No score
-matrix is materialized in global memory. Shape comments use ``B`` for batch,
-``L`` for query tokens, ``S`` for cached key/value tokens, ``H`` for heads, and
-``D`` for the head dimension.
-"""
+"""TMA-backed Triton FlashAttention2 for projected attention tensors."""
 
 from __future__ import annotations
 
@@ -41,9 +33,15 @@ def _allocate_tma_workspace(
 ) -> Tensor:
     """Allocate Triton tensor-descriptor workspace on the active CUDA device.
 
+    Triton invokes this registered allocator for descriptor metadata synthesized
+    by :func:`triton.language.make_tensor_descriptor` inside a kernel. A PyTorch
+    byte tensor owns the requested device storage; the CUDA allocator supplies
+    its alignment and observes the active device and stream.
+
     Args:
         size: Required workspace size in bytes.
-        alignment: Requested alignment; Triton manages the allocation layout.
+        alignment: Alignment requested by Triton's allocator protocol; the
+            PyTorch CUDA allocator provides the actual alignment.
         stream: CUDA stream handle; ``None`` denotes the current stream.
 
     Returns:
@@ -76,7 +74,11 @@ _TMA_ATTENTION_CONFIGS = [
         (128, 128, 8, 3),
     )
 ]
-"""Candidate query/key tile geometries for FlashAttention autotuning."""
+"""Candidate query/key tile geometries for FlashAttention autotuning.
+
+``BLOCK_M`` controls query rows and the FP32 output-accumulator footprint;
+``BLOCK_N`` controls each streamed K/V tile. Warp and stage variants let Triton
+balance parallel dot products against descriptor-pipeline resource use."""
 
 
 def _prune_tma_attention_configs(
@@ -86,9 +88,14 @@ def _prune_tma_attention_configs(
 ) -> list[triton.Config]:
     """Drop tiles that waste work or exceed wide-head shared memory.
 
+    This callback runs before benchmarking so short sequences, wide heads, and
+    one-byte FP8 storage do not compile configurations whose padded work or
+    accumulator/pipeline footprint cannot be competitive.
+
     Args:
         configs: Candidate autotuning configurations.
-        named_args: Runtime arguments containing the query and key lengths.
+        named_args: Runtime arguments containing ``query_length``,
+            ``key_length``, and the tensor ``element_size`` in bytes.
         **meta: Compile-time metadata containing ``HEAD_DIM``.
 
     Returns:
@@ -123,6 +130,11 @@ def _prune_tma_attention_configs(
             and config.num_stages == 2
         )
     ]
+
+
+# Cache the winning tile by logical geometry, sequence strides, and storage
+# width. Pointer values and the numeric softmax scale do not change scheduling,
+# so they intentionally do not create new autotuning entries.
 
 
 @triton.autotune(
@@ -174,9 +186,42 @@ def _flash_attention_2_tma_kernel(
     """Apply tiled non-causal FlashAttention2 with TMA loads and stores.
 
     Inputs are Q ``[B, L, H, D]`` and K/V ``[B, S, H, D]``. Element strides
-    describe metadata-only ``[B, H, L|S, D]`` views. The launch grid is
-    ``[ceil_div(L, BLOCK_M), B * H]``; each program produces
-    ``[BLOCK_M, D]`` while streaming K/V tiles shaped ``[BLOCK_N, D]``.
+    describe metadata-only ``[B, H, L|S, D]`` views over that storage. The grid
+    is ``[ceil_div(L, BLOCK_M), B * H]``. Each program loads one
+    ``[BLOCK_M, D]`` query tile, streams all ``[BLOCK_N, D]`` K/V tiles, and
+    produces the matching output tile. Only FP32 online-softmax state and the
+    output accumulator remain resident; no ``[L, S]`` score matrix is stored.
+
+    Args:
+        query_ptr: Base pointer for logical queries ``[B, L, H, D]``.
+        key_ptr: Base pointer for logical keys ``[B, S, H, D]``.
+        value_ptr: Base pointer for logical values ``[B, S, H, D]``.
+        output_ptr: Base pointer for logical output ``[B, L, H, D]``.
+        query_stride_b: Query batch stride in elements.
+        query_stride_h: Query head stride in elements.
+        query_stride_l: Query-token stride in elements.
+        query_stride_d: Query-feature stride in elements.
+        key_stride_b: Key batch stride in elements.
+        key_stride_h: Key head stride in elements.
+        key_stride_s: Key-token stride in elements.
+        key_stride_d: Key-feature stride in elements.
+        value_stride_b: Value batch stride in elements.
+        value_stride_h: Value head stride in elements.
+        value_stride_s: Value-token stride in elements.
+        value_stride_d: Value-feature stride in elements.
+        output_stride_b: Output batch stride in elements.
+        output_stride_h: Output head stride in elements.
+        output_stride_l: Output-token stride in elements.
+        output_stride_d: Output-feature stride in elements.
+        num_heads: Number of batch/head planes per batch item.
+        query_length: Logical query-token count ``L``.
+        key_length: Logical key/value-token count ``S``.
+        element_size: Query storage width in bytes, used by the autotuning key
+            and configuration pruning.
+        scale: Multiplier applied to QK scores before softmax.
+        HEAD_DIM: Compile-time head width ``D``.
+        BLOCK_M: Compile-time number of query rows owned by one program.
+        BLOCK_N: Compile-time number of key/value rows loaded per iteration.
     """
     # Decode grid axis 1 into one ``(batch, head)`` plane. Grid axis 0 selects
     # the ``[BLOCK_M, D]`` query/output tile within that plane.
@@ -186,7 +231,9 @@ def _flash_attention_2_tma_kernel(
     head = batch_head % num_heads
 
     # Offset each base pointer to one batch/head plane. The two-dimensional
-    # descriptors then traverse only token and feature axes, ``[L|S, D]``.
+    # descriptors then traverse only token and feature axes, ``[L|S, D]``. A
+    # block always spans all ``D`` features; query/output descriptors tile the
+    # token axis by ``BLOCK_M``, while key/value descriptors use ``BLOCK_N``.
     query_base = query_ptr + batch * query_stride_b + head * query_stride_h
     key_base = key_ptr + batch * key_stride_b + head * key_stride_h
     value_base = value_ptr + batch * value_stride_b + head * value_stride_h
@@ -216,7 +263,9 @@ def _flash_attention_2_tma_kernel(
         block_shape=[BLOCK_M, HEAD_DIM],
     )
 
-    # Descriptor boundary handling masks the final partial query tile.
+    # Descriptor boundary handling fills out-of-range rows in the final query
+    # tile and clips the matching output store, so padded query work never
+    # reaches logical output storage.
     query_start = query_block * BLOCK_M
     query = query_desc.load([query_start, 0])
 
@@ -233,8 +282,10 @@ def _flash_attention_2_tma_kernel(
         # ``[BLOCK_M, D] @ [D, BLOCK_N] -> [BLOCK_M, BLOCK_N]``.
         key = key_desc.load([key_start, 0])
         scores = tl.dot(query, tl.trans(key)) * qk_scale
-        # Mask descriptor padding so zero-valued phantom keys cannot enter the
-        # softmax denominator on the final partial K/V tile.
+        # TMA fills the final partial key tile with zeros, but a zero QK score
+        # would still contribute to softmax. Replace those phantom columns with
+        # negative infinity; their zero probability also makes the padded value
+        # lanes inert without a separate V mask.
         if key_length % BLOCK_N != 0:
             key_offsets = tl.arange(0, BLOCK_N)
             scores = tl.where(
@@ -260,13 +311,20 @@ def _flash_attention_2_tma_kernel(
         )
         row_max = next_row_max
 
-    # Normalize each query row and store into logical output ``[B, L, H, D]``.
+    # Normalize each query row in FP32. The descriptor converts to the output
+    # storage dtype and clips a final partial query tile while writing logical
+    # output ``[B, L, H, D]``.
     output = accumulator / denominator[:, None]
     output_desc.store([query_start, 0], output)
 
 
 def _descriptor_layout_supported(x: Tensor) -> bool:
     """Return whether ``x`` satisfies TMA tensor-descriptor stride rules.
+
+    Logical ``[B, L|S, H, D]`` storage is addressed as one
+    ``[B, H, L|S, D]`` metadata view without copying. Both token-major projected
+    tensors and head-major cache views are valid when their actual strides meet
+    the descriptor alignment contract.
 
     Args:
         x: Projected tensor with shape ``[B, L|S, H, D]``.
@@ -291,6 +349,9 @@ def is_tma_flash_attention_supported(
     value: Tensor,
 ) -> bool:
     """Return whether projected tensors can use the TMA attention kernel.
+
+    Check shape, placement, storage type, head geometry, device capability, and
+    descriptor strides without allocating output or launching Triton.
 
     Args:
         query: Query tensor with shape ``[B, L, H, D]``.
@@ -333,18 +394,29 @@ def flash_attention_2_tma(
 ) -> Tensor:
     """Apply non-causal TMA FlashAttention2 to logical Q/K/V tensors.
 
+    Compute ``softmax(scale * Q @ K.T) @ V`` independently for every batch/head
+    plane, without causal masking or dropout. TMA streams K/V tiles while FP32
+    online-softmax state avoids materializing the complete score matrix. FP8
+    operands are consumed directly; this interface carries no additional tensor
+    scale metadata. Empty batch, head, or query axes return an empty output, but
+    the key/value sequence axis must be positive.
+
     Args:
-        query: Query tensor with shape ``[B, L, H, D]``.
-        key: Key tensor with shape ``[B, S, H, D]``.
-        value: Value tensor with shape ``[B, S, H, D]``.
-        scale: QK scale; ``None`` uses ``1 / sqrt(D)``.
+        query: CUDA query tensor with shape ``[B, L, H, D]`` and FP16, BF16,
+            or E4M3 storage.
+        key: Same-device and same-dtype key tensor with shape ``[B, S, H, D]``.
+        value: Value tensor matching ``key`` exactly.
+        scale: Multiplier applied to QK scores before softmax; ``None`` uses
+            ``1 / sqrt(D)``.
 
     Returns:
-        Attention result with shape ``[B, L, H, D]``.
+        Attention result with shape ``[B, L, H, D]`` on the query device and in
+        the query storage dtype.
 
     Raises:
         ValueError: Q/K/V shapes are incompatible or contain an empty key axis.
-        RuntimeError: The device, dtype, or layout does not support TMA.
+        RuntimeError: Placement, dtype, head geometry, device capability, or
+            strides do not satisfy the TMA kernel contract.
     """
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("query, key, and value must have shape [B, L, H, D]")
@@ -372,8 +444,10 @@ def flash_attention_2_tma(
     if batch_size == 0 or num_heads == 0 or query_length == 0:
         return output
 
-    # Reorder logical strides for the per-plane [B, H, L, D] descriptor view;
-    # this is metadata only and does not transpose or copy a tensor.
+    # Reorder logical ``[B, L, H, D]`` strides from ``(B, L, H, D)`` to the
+    # per-plane descriptor order ``(B, H, L, D)``. This is metadata only and
+    # does not transpose or copy input tensors; the output retains the public
+    # logical order.
     query_strides = (
         query.stride(0),
         query.stride(2),
@@ -397,6 +471,14 @@ def flash_attention_2_tma(
     # Autotuning selects the launch shape once per geometry and storage width,
     # then reuses it. Grid axes cover query tiles and ``B * H`` planes.
     def grid(meta: dict[str, int]) -> tuple[int, int]:
+        """Build the two-dimensional launch grid for an autotuned query tile.
+
+        Args:
+            meta: Autotuning metadata containing ``BLOCK_M``.
+
+        Returns:
+            Query-tile count and flattened batch/head plane count.
+        """
         return (
             triton.cdiv(query_length, meta["BLOCK_M"]),
             batch_size * num_heads,
