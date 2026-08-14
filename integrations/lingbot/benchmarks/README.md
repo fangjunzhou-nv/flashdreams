@@ -26,6 +26,11 @@ activations, and compiler workspaces. The full-pipeline cases also require the
 Hugging Face access and cache space documented in
 [`integrations/lingbot/README.md`](../README.md).
 
+Between benchmark cases, pytest synchronizes CUDA, resets compiler and CUDA-graph
+state, collects Python objects, and empties the CUDA allocator cache. This prevents
+one case from retaining memory needed by the next, but does not reduce a case's own
+peak memory requirement.
+
 Each benchmark layer runs three cases: the WAN/cuDNN reference, Triton FP8
 projections with PyTorch cuDNN SDPA, and Triton FP8 projections with Triton
 FlashAttention2 (FA2). Their stable labels are `wan_torch`, `triton_cudnn`, and
