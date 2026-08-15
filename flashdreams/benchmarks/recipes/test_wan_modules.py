@@ -18,7 +18,7 @@
 Run the manual GPU benchmarks with::
 
     uv run --package flashdreams --group test pytest \
-        flashdreams/benchmarks/accelerated/recipes/test_wan_modules.py \
+        flashdreams/benchmarks/recipes/test_wan_modules.py \
         -p no:manual_marker -m manual --benchmark-only -v
 """
 
@@ -179,7 +179,7 @@ def test_self_attention_benchmark(
         device=device,
         dtype=dtype,
     )
-    cache = attention.initialize_cache(
+    cache = attention.allocate_kv_cache(
         batch_size=1,
         chunk_size=_CHUNK_TOKENS,
         window_size=_WINDOW_TOKENS,

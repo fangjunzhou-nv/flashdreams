@@ -84,7 +84,7 @@ def test_triton_self_attention_matches_default_through_window_roll(
     len_t, len_h, len_w = 1, 1, 16
     chunk_size = len_t * len_h * len_w
     window_size = 2 * chunk_size
-    reference_cache = reference.initialize_cache(
+    reference_cache = reference.allocate_kv_cache(
         batch_size=batch_size,
         chunk_size=chunk_size,
         window_size=window_size,
@@ -92,7 +92,7 @@ def test_triton_self_attention_matches_default_through_window_roll(
         device=tma_device,
         dtype=torch.bfloat16,
     )
-    actual_cache = actual_attention.initialize_cache(
+    actual_cache = actual_attention.allocate_kv_cache(
         batch_size=batch_size,
         chunk_size=chunk_size,
         window_size=window_size,

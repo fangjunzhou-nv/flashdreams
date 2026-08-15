@@ -217,7 +217,7 @@ def test_self_attention_benchmark(
         device=device,
         dtype=dtype,
     )
-    cache = attention.initialize_cache(
+    cache = attention.allocate_kv_cache(
         batch_size=1,
         chunk_size=chunk_tokens,
         window_size=window_tokens,

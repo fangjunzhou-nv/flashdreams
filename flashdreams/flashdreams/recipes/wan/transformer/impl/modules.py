@@ -27,8 +27,12 @@ import torch.nn as nn
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from flashdreams.accelerated.multi_head_attention import QKNormScope
+from flashdreams.accelerated.multi_head_attention import (
+    AttentionType,
+    QKNormScope,
+)
 from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
     SDPABackend,
     TritonMultiHeadAttention,
 )
@@ -402,18 +406,38 @@ class SelfAttention(MultiHeadAttention):
         return super().forward(x, kv_cache, rope_freqs=rope_freqs, update_kv_cache=True)
 
 
-class _TritonSelfAttention(TritonMultiHeadAttention):
+class TritonSelfAttention(TritonMultiHeadAttention):
     """Accelerated self-attention adapted to Wan's checkpoint contract."""
 
-    _TRITON_TO_WAN_MODULE = {
-        "q_proj": "q",
-        "k_proj": "k",
-        "v_proj": "v",
-        "output_proj": "o",
-        "q_norm": "norm_q",
-        "k_norm": "norm_k",
-    }
-    """Shared Triton module names mapped to Wan checkpoint names."""
+    @property
+    def query_projection(self) -> nn.Linear:
+        """Return Wan's ``q`` module as the logical query projection."""
+        return self.q
+
+    @property
+    def key_projection(self) -> nn.Linear:
+        """Return Wan's ``k`` module as the logical key projection."""
+        return self.k
+
+    @property
+    def value_projection(self) -> nn.Linear:
+        """Return Wan's ``v`` module as the logical value projection."""
+        return self.v
+
+    @property
+    def output_projection(self) -> nn.Linear:
+        """Return Wan's ``o`` module as the logical output projection."""
+        return self.o
+
+    @property
+    def query_norm(self) -> nn.Module:
+        """Return Wan's ``norm_q`` query normalization module."""
+        return self.norm_q
+
+    @property
+    def key_norm(self) -> nn.Module:
+        """Return Wan's ``norm_k`` key normalization module."""
+        return self.norm_k
 
     def __init__(
         self,
@@ -460,9 +484,9 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
             query_dim=query_dim,
             n_heads=n_heads,
             head_dim=head_dim,
-            qkv_bias=True,
-            output_bias=True,
-            qk_norm=True,
+            context_dim=context_dim,
+            attention_type=AttentionType.SELF_ATTENTION,
+            qkv_fusion_option=QKVFusionOption.FULL,
             qk_norm_eps=eps,
             qk_norm_scope=QKNormScope.INNER,
             rope_interleaved=True,
@@ -470,13 +494,15 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
             sdpa_backend=sdpa_backend,
         )
 
-        # Register only Wan's checkpoint names; inherited Triton methods keep
-        # non-registered aliases to those same modules.
-        for triton_name, wan_name in self._TRITON_TO_WAN_MODULE.items():
-            module = getattr(self, triton_name)
-            delattr(self, triton_name)
-            setattr(self, wan_name, module)
-            object.__setattr__(self, triton_name, module)
+        # Ordinary assignments register only Wan checkpoint names. The logical
+        # properties above expose these modules to the shared Triton kernels.
+        self.q = nn.Linear(self.query_dim, self.inner_dim, bias=True)
+        self.k = nn.Linear(self.context_dim, self.inner_dim, bias=True)
+        self.v = nn.Linear(self.context_dim, self.inner_dim, bias=True)
+        self.o = nn.Linear(self.inner_dim, self.query_dim, bias=True)
+        self.norm_q = nn.RMSNorm(self.inner_dim, eps=self.qk_norm_eps)
+        self.norm_k = nn.RMSNorm(self.inner_dim, eps=self.qk_norm_eps)
+        self._initialize_derived_weights()
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None) -> None:
         """Reject context parallelism unsupported by Triton attention.
@@ -652,7 +678,7 @@ class Block(nn.Module):
                 cp_method=cp_method,
             )
         else:
-            self.self_attn = _TritonSelfAttention(
+            self.self_attn = TritonSelfAttention(
                 query_dim=dim,
                 n_heads=num_heads,
                 head_dim=dim // num_heads,
@@ -736,7 +762,7 @@ class Block(nn.Module):
         if self._parameters_updated_after_loading_checkpoint:
             return
 
-        if isinstance(self.self_attn, _TritonSelfAttention):
+        if isinstance(self.self_attn, TritonSelfAttention):
             self.self_attn._refresh_derived_weights()
         self.modulation.data = self.modulation.data.squeeze(0)
         self._parameters_updated_after_loading_checkpoint = True

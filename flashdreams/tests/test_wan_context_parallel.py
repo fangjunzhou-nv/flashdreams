@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
     SDPABackend,
     TritonMultiHeadAttention,
 )
@@ -118,7 +119,7 @@ def test_kvcache_relative_rope_does_not_mutate_cached_keys(monkeypatch) -> None:
         return x.add_(1.0)
 
     monkeypatch.setattr(wan_modules, "apply_rope_freqs", _fake_apply_rope_freqs)
-    attn.apply_kv(
+    attn.query_kv(
         torch.randn(1, 3, 4),
         cache,
         rope_freqs_q=torch.zeros(3, 1, 1, 4),
@@ -191,7 +192,27 @@ def test_wan_network_propagates_sdpa_backend(
     assert network.sdpa_backend is sdpa_backend
     assert block.sdpa_backend is sdpa_backend
     assert isinstance(block.self_attn, TritonMultiHeadAttention)
+    assert block.self_attn.qkv_fusion_option is QKVFusionOption.FULL
     assert block.self_attn.sdpa_backend is sdpa_backend
+
+
+def test_triton_attention_registers_only_wan_checkpoint_names() -> None:
+    """Expose logical Triton modules without adding generic checkpoint aliases."""
+    reference = wan_modules.SelfAttention(64, n_heads=4, head_dim=16)
+    actual = wan_modules.TritonSelfAttention(64, n_heads=4, head_dim=16)
+    actual.load_state_dict(reference.state_dict(), strict=True)
+
+    assert actual.query_projection is actual.q
+    assert actual.key_projection is actual.k
+    assert actual.value_projection is actual.v
+    assert actual.output_projection is actual.o
+    assert actual.query_norm is actual.norm_q
+    assert actual.key_norm is actual.norm_k
+
+    generic_names = {"q_proj", "k_proj", "v_proj", "output_proj", "q_norm", "k_norm"}
+    assert generic_names.isdisjoint(actual._modules)
+    assert set(actual.state_dict()) == set(reference.state_dict())
+    assert actual._derived_weights.fused_qkv_weight is not None
 
 
 def test_wan_patchify_unpatchify_round_trip_without_cp() -> None:

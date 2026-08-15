@@ -112,7 +112,7 @@ def test_lingbot_network_propagates_attention_backend(
     if backend is AttentionBackend.TRITON:
         assert isinstance(block.self_attn, TritonMultiHeadAttention)
         assert block.self_attn.sdpa_backend is sdpa_backend
-        cache = block.self_attn.initialize_cache(
+        cache = block.self_attn.allocate_kv_cache(
             batch_size=1,
             chunk_size=2,
             window_size=4,

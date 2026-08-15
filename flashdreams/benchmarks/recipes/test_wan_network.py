@@ -18,15 +18,14 @@
 Run the manual GPU benchmarks with::
 
     uv run --package flashdreams --group test pytest \
-        flashdreams/benchmarks/accelerated/recipes/test_wan_network.py \
+        flashdreams/benchmarks/recipes/test_wan_network.py \
         -p no:manual_marker -m manual --benchmark-only -v
 """
 
 from __future__ import annotations
 
-from enum import Enum
-
 import math
+from enum import Enum
 
 import pytest
 import torch
