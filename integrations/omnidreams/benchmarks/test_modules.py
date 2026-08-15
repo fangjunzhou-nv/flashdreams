@@ -36,9 +36,9 @@ from pytest_benchmark.fixture import BenchmarkFixture
 
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from integrations.omnidreams.benchmarks.cases import (
+    CROSS_ATTENTION_CASES,
     PYTORCH_ATTENTION_CASES,
     AttentionBenchmarkCase,
-    CROSS_ATTENTION_CASES,
     skip_unsupported_device,
 )
 
@@ -283,7 +283,7 @@ def test_self_attention_benchmark(
         device=device,
         dtype=dtype,
     )
-    cache = attention.initialize_cache(
+    cache = attention.allocate_kv_cache(
         batch_size=_BATCH_SIZE * _NUM_VIEWS,
         chunk_size=chunk_tokens,
         window_size=window_tokens,
@@ -412,7 +412,7 @@ def test_cross_attention_benchmark(
         device=device,
         dtype=dtype,
     )
-    cache = attention.initialize_cache(context)
+    cache = attention.compute_kv(context)
     torch.cuda.synchronize()
 
     benchmark.group = "omnidreams-dit-cross-attention"

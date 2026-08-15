@@ -27,13 +27,12 @@ from einops import rearrange, repeat
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from flashdreams.accelerated.multi_head_attention import QKNormScope
-from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
+from flashdreams.accelerated.multi_head_attention import AttentionType, QKNormScope
 from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
     SDPABackend,
     TritonMultiHeadAttention,
 )
-from flashdreams.accelerated.triton import flash_attention_2_tma
 from flashdreams.core.attention import BlockKVCache, ContextParallelAttention
 from flashdreams.core.attention.rope import apply_rope_freqs
 
@@ -301,6 +300,7 @@ class MultiHeadAttention(nn.Module):
         self.attn_op.set_context_parallel_group(cp_group=cp_group)
 
     def is_context_parallel_enabled(self) -> bool:
+        """Whether context parallelism is active for attention."""
         return self.attn_op.is_context_parallel_enabled()
 
     def context_parallel_size(self) -> int:
@@ -325,7 +325,7 @@ class MultiHeadAttention(nn.Module):
         """
         batch_shape = context.shape[:-2]
         batch_size = math.prod(batch_shape)
-        L = context.shape[-2]
+        L, D = context.shape[-2:]
         n, d = self.n_heads, self.head_dim
 
         k = self.k_norm(self.k_proj(context).reshape(batch_size, L, n, d))
@@ -356,7 +356,7 @@ class MultiHeadAttention(nn.Module):
         """Append K/V computed from ``x`` into an existing ``kv_cache``."""
         return self._compute_or_update_kv_cache(x, kv_cache, rope_freqs)
 
-    def apply_kv(
+    def query_kv(
         self,
         x: Tensor,
         kv_cache: BlockKVCache,
@@ -409,13 +409,13 @@ class MultiHeadAttention(nn.Module):
         """
         if update_kv_cache:
             kv_cache = self.update_kv(x, kv_cache, rope_freqs)
-        return self.apply_kv(x, kv_cache, rope_freqs)
+        return self.query_kv(x, kv_cache, rope_freqs)
 
 
 class SelfAttention(MultiHeadAttention):
     """Self-attention: queries and K/V are derived from the same ``x`` each step."""
 
-    def initialize_cache(
+    def allocate_kv_cache(
         self,
         batch_size: int,
         chunk_size: int,
@@ -424,7 +424,7 @@ class SelfAttention(MultiHeadAttention):
         device: torch.device,
         dtype: torch.dtype,
     ) -> BlockKVCache:
-        """Initialize KV cache for streaming self-attention.
+        """Allocate a KV cache for streaming self-attention.
 
         Args:
             batch_size: Flattened batch size used by attention.
@@ -462,14 +462,6 @@ class SelfAttention(MultiHeadAttention):
 class CrossAttention(MultiHeadAttention):
     """Cross-attention: K/V live only in ``kv_cache``; ``forward`` does not refresh them."""
 
-    def initialize_cache(
-        self,
-        context: Tensor,  # [B, V, L, D]
-    ) -> BlockKVCache:
-        """Initialize cross-attention cache from the provided context."""
-        cache = self.compute_kv(context)
-        return cache
-
     def forward(
         self,
         x: Tensor,
@@ -479,8 +471,38 @@ class CrossAttention(MultiHeadAttention):
         return super().forward(x, kv_cache, rope_freqs=None, update_kv_cache=False)
 
 
-class _TritonCrossAttention(TorchMultiHeadAttention):
+class TritonCrossAttention(TritonMultiHeadAttention):
     """Static-context cross-attention backed by TMA FlashAttention2."""
+
+    @property
+    def query_projection(self) -> nn.Linear:
+        """Return the canonical query projection."""
+        return self.q_proj
+
+    @property
+    def key_projection(self) -> nn.Linear:
+        """Return the canonical key projection."""
+        return self.k_proj
+
+    @property
+    def value_projection(self) -> nn.Linear:
+        """Return the canonical value projection."""
+        return self.v_proj
+
+    @property
+    def output_projection(self) -> nn.Linear:
+        """Return the canonical output projection."""
+        return self.output_proj
+
+    @property
+    def query_norm(self) -> nn.Module:
+        """Return the canonical query normalization."""
+        return self.q_norm
+
+    @property
+    def key_norm(self) -> nn.Module:
+        """Return the canonical key normalization."""
+        return self.k_norm
 
     def __init__(
         self,
@@ -490,7 +512,7 @@ class _TritonCrossAttention(TorchMultiHeadAttention):
         head_dim: int = 64,
         cp_method: Literal["ring", "ulysses"] = "ring",
     ) -> None:
-        """Initialize bias-free, per-head-normalized Triton cross-attention.
+        """Initialize bias-free, FP8 Triton cross-attention.
 
         Args:
             query_dim: Feature dimension of query tokens and projected output.
@@ -501,28 +523,28 @@ class _TritonCrossAttention(TorchMultiHeadAttention):
             cp_method: Ignored context-parallel method retained for constructor
                 compatibility with Omnidreams attention.
 
-        Raises:
-            ValueError: ``context_dim`` is not positive.
         """
         del cp_method
-        context_dim = query_dim if context_dim is None else context_dim
-        if context_dim <= 0:
-            raise ValueError(f"context_dim must be positive; got {context_dim}")
         super().__init__(
             query_dim=query_dim,
+            context_dim=context_dim,
             n_heads=n_heads,
+            attention_type=AttentionType.CROSS_ATTENTION,
             head_dim=head_dim,
-            qkv_bias=False,
-            output_bias=False,
-            qk_norm=True,
+            qkv_fusion_option=QKVFusionOption.FUSE_KV,
             qk_norm_eps=1e-6,
             qk_norm_scope=QKNormScope.HEAD,
             rope_interleaved=False,
+            use_fp8=True,
+            sdpa_backend=SDPABackend.TRITON,
         )
-        self.context_dim = context_dim
-        if context_dim != query_dim:
-            self.k_proj = nn.Linear(context_dim, self.inner_dim, bias=False)
-            self.v_proj = nn.Linear(context_dim, self.inner_dim, bias=False)
+        self.q_proj = nn.Linear(self.query_dim, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(self.context_dim, self.inner_dim, bias=False)
+        self.v_proj = nn.Linear(self.context_dim, self.inner_dim, bias=False)
+        self.output_proj = nn.Linear(self.inner_dim, self.query_dim, bias=False)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=self.qk_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=self.qk_norm_eps)
+        self._initialize_derived_weights()
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None) -> None:
         """Reject context parallelism unsupported by Triton attention.
@@ -546,57 +568,39 @@ class _TritonCrossAttention(TorchMultiHeadAttention):
         """Return the singleton context-parallel world size."""
         return 1
 
-    def compute_kv(self, context: Tensor) -> BlockKVCache:
-        """Project static context into a flattened Omnidreams K/V cache.
 
-        Args:
-            context: Key/value source with shape ``[..., S, context_dim]``.
-
-        Returns:
-            Cache containing normalized keys and projected values.
-        """
-        batch_size = math.prod(context.shape[:-2])
-        sequence_length = context.shape[-2]
-        context = context.reshape(batch_size, sequence_length, self.context_dim)
-        head_shape = (batch_size, sequence_length, self.n_heads, self.head_dim)
-        key = self.k_norm(self.k_proj(context).reshape(head_shape))
-        value = self.v_proj(context).reshape(head_shape)
-        return BlockKVCache.from_tensor(key, value, seq_dim=-3)
-
-    def apply_kv(self, x: Tensor, kv_cache: BlockKVCache) -> Tensor:
-        """Apply TMA FlashAttention2 to queries and precomputed K/V.
-
-        Args:
-            x: Query tokens with shape ``[..., L, query_dim]``.
-            kv_cache: Static cross-attention K/V cache.
-
-        Returns:
-            Projected attention output with the same shape as ``x``.
-        """
-        batch_shape = x.shape[:-2]
-        sequence_length = x.shape[-2]
-        x = x.reshape(-1, sequence_length, self.query_dim)
-        head_shape = (-1, sequence_length, self.n_heads, self.head_dim)
-        query = self.q_norm(self.q_proj(x).reshape(head_shape))
-        output = self._attention(query, kv_cache.cached_k(), kv_cache.cached_v())
-        output = self._output_projection(output)
-        return output.reshape(batch_shape + (sequence_length, self.query_dim))
-
-    def initialize_cache(self, context: Tensor) -> BlockKVCache:
-        """Initialize the cross-attention cache from ``context``."""
-        return self.compute_kv(context)
-
-    def forward(self, x: Tensor, kv_cache: BlockKVCache) -> Tensor:
-        """Attend to precomputed context without updating its cache."""
-        return self.apply_kv(x, kv_cache)
-
-    def _attention(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
-        """Apply TMA FlashAttention2 to projected query and cached K/V tensors."""
-        return flash_attention_2_tma(query, key, value)
-
-
-class _TritonSelfAttention(TritonMultiHeadAttention):
+class TritonSelfAttention(TritonMultiHeadAttention):
     """Accelerated self-attention adapted to the Omnidreams contract."""
+
+    @property
+    def query_projection(self) -> nn.Linear:
+        """Return the canonical query projection."""
+        return self.q_proj
+
+    @property
+    def key_projection(self) -> nn.Linear:
+        """Return the canonical key projection."""
+        return self.k_proj
+
+    @property
+    def value_projection(self) -> nn.Linear:
+        """Return the canonical value projection."""
+        return self.v_proj
+
+    @property
+    def output_projection(self) -> nn.Linear:
+        """Return the canonical output projection."""
+        return self.output_proj
+
+    @property
+    def query_norm(self) -> nn.Module:
+        """Return the canonical query normalization."""
+        return self.q_norm
+
+    @property
+    def key_norm(self) -> nn.Module:
+        """Return the canonical key normalization."""
+        return self.k_norm
 
     def __init__(
         self,
@@ -633,15 +637,21 @@ class _TritonSelfAttention(TritonMultiHeadAttention):
             query_dim=query_dim,
             n_heads=n_heads,
             head_dim=head_dim,
-            qkv_bias=False,
-            output_bias=False,
-            qk_norm=True,
+            attention_type=AttentionType.SELF_ATTENTION,
+            qkv_fusion_option=QKVFusionOption.FULL,
             qk_norm_eps=1e-6,
             qk_norm_scope=QKNormScope.HEAD,
             rope_interleaved=False,
             use_fp8=True,
             sdpa_backend=sdpa_backend,
         )
+        self.q_proj = nn.Linear(self.query_dim, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(self.context_dim, self.inner_dim, bias=False)
+        self.v_proj = nn.Linear(self.context_dim, self.inner_dim, bias=False)
+        self.output_proj = nn.Linear(self.inner_dim, self.query_dim, bias=False)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=self.qk_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=self.qk_norm_eps)
+        self._initialize_derived_weights()
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None) -> None:
         """Reject context parallelism unsupported by Triton attention.
@@ -727,7 +737,7 @@ class Block(nn.Module):
                 cp_method=cp_method,
             )
         else:
-            self.self_attn = _TritonSelfAttention(
+            self.self_attn = TritonSelfAttention(
                 query_dim=x_dim,
                 context_dim=None,
                 n_heads=num_heads,
@@ -735,7 +745,7 @@ class Block(nn.Module):
                 cp_method=cp_method,
                 sdpa_backend=self.sdpa_backend,
             )
-            self.cross_attn = _TritonCrossAttention(
+            self.cross_attn = TritonCrossAttention(
                 query_dim=x_dim,
                 context_dim=context_dim,
                 n_heads=num_heads,
@@ -791,7 +801,7 @@ class Block(nn.Module):
                     cp_method=cp_method,
                 )
             else:
-                self.cross_view_attn = _TritonCrossAttention(
+                self.cross_view_attn = TritonCrossAttention(
                     query_dim=x_dim,
                     context_dim=x_dim,
                     n_heads=num_heads,
@@ -834,7 +844,7 @@ class Block(nn.Module):
         num_views = context.shape[1]
         self_attn_batch_size = batch_size * num_views
         return BlockCache(
-            self_attn=self.self_attn.initialize_cache(
+            self_attn=self.self_attn.allocate_kv_cache(
                 self_attn_batch_size,
                 chunk_size,
                 window_size,
@@ -842,7 +852,7 @@ class Block(nn.Module):
                 device=device,
                 dtype=dtype,
             ),
-            cross_attn=self.cross_attn.initialize_cache(context),
+            cross_attn=self.cross_attn.compute_kv(context),
         )
 
     @nvtx.annotate("omnidreams.dit.block")

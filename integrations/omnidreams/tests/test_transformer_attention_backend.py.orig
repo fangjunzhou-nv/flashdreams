@@ -66,9 +66,6 @@ def test_omnidreams_attention_preserves_cache_lifecycles(
         n_heads=1,
         head_dim=16,
     )
-    monkeypatch.setattr(
-        transformer_modules, "apply_rope_freqs", lambda tensor, _: tensor
-    )
     monkeypatch.setattr(self_attention.attn_op, "_impl", cpu_sdpa)
     self_cache = self_attention.allocate_kv_cache(
         batch_size=2,
