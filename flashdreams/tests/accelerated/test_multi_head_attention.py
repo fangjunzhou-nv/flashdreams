@@ -13,80 +13,123 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for multi-head attention and its PyTorch reference."""
+"""CPU tests for the abstract multi-head attention interface."""
 
 from __future__ import annotations
 
 from typing import cast
 
 import pytest
-import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from flashdreams.accelerated.multi_head_attention import (
+    AttentionType,
     MultiHeadAttention,
     QKNormScope,
 )
-from flashdreams.accelerated.multi_head_attention_torch import TorchMultiHeadAttention
-from flashdreams.accelerated.multi_head_attention_triton import (
-    SDPABackend,
-    TritonMultiHeadAttention,
-)
-from flashdreams.core.attention import RotaryPositionEmbedding3D
 
 pytestmark = pytest.mark.ci_cpu
 
 
 class _Attention(MultiHeadAttention[object]):
-    """Minimal concrete attention used to test base initialization."""
+    """Behavior-free concrete attention for base-contract tests.
 
-    def initialize_cache(
+    The fixture implements the abstract runtime surface without projection
+    modules so geometry and policy validation stay isolated from any backend.
+    """
+
+    @property
+    def query_projection(self) -> nn.Linear:
+        """Reject access to the intentionally absent query projection."""
+        raise NotImplementedError
+
+    @property
+    def key_projection(self) -> nn.Linear:
+        """Reject access to the intentionally absent key projection."""
+        raise NotImplementedError
+
+    @property
+    def value_projection(self) -> nn.Linear:
+        """Reject access to the intentionally absent value projection."""
+        raise NotImplementedError
+
+    @property
+    def output_projection(self) -> nn.Linear:
+        """Reject access to the intentionally absent output projection."""
+        raise NotImplementedError
+
+    @property
+    def query_norm(self) -> nn.Module:
+        """Reject access to the intentionally absent query normalization."""
+        raise NotImplementedError
+
+    @property
+    def key_norm(self) -> nn.Module:
+        """Reject access to the intentionally absent key normalization."""
+        raise NotImplementedError
+
+    def compute_kv(
         self,
-        batch_size: int,
-        chunk_size: int,
-        window_size: int,
-        sink_size: int,
-        device: torch.device | str,
-        dtype: torch.dtype,
+        context: Tensor,
+        rope_freqs: Tensor | None = None,
     ) -> object:
-        """Return a placeholder cache for interface tests."""
-        del batch_size, chunk_size, window_size, sink_size, device, dtype
+        """Return an opaque cache placeholder for interface tests.
+
+        Args:
+            context: Unused context tokens accepted by the abstract contract.
+            rope_freqs: Unused positional data; ``None`` is also accepted.
+
+        Returns:
+            Fresh opaque object standing in for a backend cache.
+        """
+        del context, rope_freqs
         return object()
 
     def forward(
         self,
-        x: Tensor,
+        query: Tensor,
         kv_cache: object,
         rope_freqs: Tensor | None = None,
     ) -> Tensor:
-        """Return ``x`` unchanged."""
+        """Return ``query`` unchanged through the abstract runtime contract.
+
+        Args:
+            query: Input tokens passed through unchanged.
+            kv_cache: Unused opaque cache placeholder.
+            rope_freqs: Unused positional data; ``None`` is also accepted.
+
+        Returns:
+            Original ``query`` tensor.
+        """
         del kv_cache, rope_freqs
-        return x
+        return query
 
 
-def test_triton_sdpa_backend_constructor_policy() -> None:
-    """Default to cuDNN, retain Triton, and reject every other backend."""
-    assert TritonMultiHeadAttention(128, head_dim=64).sdpa_backend is SDPABackend.CUDNN
-    assert (
-        TritonMultiHeadAttention(
-            128,
-            head_dim=64,
-            sdpa_backend=SDPABackend.TRITON,
-        ).sdpa_backend
-        is SDPABackend.TRITON
-    )
-    string_backend = cast(SDPABackend, "cudnn")
-    with pytest.raises(TypeError, match="SDPABackend"):
-        TritonMultiHeadAttention(128, head_dim=64, sdpa_backend=string_backend)
+def test_forward_and_logical_modules_are_abstract() -> None:
+    """Require one runtime entry point and backend-owned logical modules."""
+    # Pin the complete abstract surface so subclasses cannot silently inherit a
+    # backend-specific projection or cache operation.
+    assert MultiHeadAttention.__abstractmethods__ == {
+        "compute_kv",
+        "forward",
+        "key_norm",
+        "key_projection",
+        "output_projection",
+        "query_norm",
+        "query_projection",
+        "value_projection",
+    }
 
-
-def test_initialize_cache_is_abstract() -> None:
-    """Require every accelerated attention implementation to create its cache."""
-    assert "initialize_cache" in MultiHeadAttention.__abstractmethods__
+    # Cache writes and queries remain private implementation details; callers
+    # interact with attention only through ``forward``.
+    assert "query_kv" not in MultiHeadAttention.__dict__
+    assert "update_kv" not in MultiHeadAttention.__dict__
 
 
 def test_attention_geometry_and_policies_are_stored() -> None:
-    """Preserve defaulted geometry and explicit policy overrides."""
+    """Store default self-attention and explicit cross-attention policies."""
+    # Contrast the default square self-attention geometry with an asymmetric
+    # cross-attention instance that overrides every optional policy.
     self_attention = _Attention(
         query_dim=48,
         n_heads=3,
@@ -97,18 +140,81 @@ def test_attention_geometry_and_policies_are_stored() -> None:
         n_heads=3,
         head_dim=16,
         context_dim=32,
+        attention_type=AttentionType.CROSS_ATTENTION,
+        qk_norm_eps=1e-5,
         qk_norm_scope=QKNormScope.INNER,
         rope_interleaved=True,
     )
 
+    # Self-attention derives context width and inner width from query geometry.
     assert self_attention.context_dim == 48
     assert self_attention.inner_dim == 48
+    assert self_attention.attention_type is AttentionType.SELF_ATTENTION
+    assert self_attention.qk_norm_eps == 1e-6
     assert self_attention.qk_norm_scope is QKNormScope.HEAD
     assert self_attention.rope_interleaved is False
 
+    # Cross-attention preserves its independent context width and explicit
+    # normalization and RoPE choices.
     assert cross_attention.context_dim == 32
+    assert cross_attention.attention_type is AttentionType.CROSS_ATTENTION
+    assert cross_attention.qk_norm_eps == 1e-5
     assert cross_attention.qk_norm_scope is QKNormScope.INNER
     assert cross_attention.rope_interleaved is True
+
+
+def test_attention_type_constructor_policy() -> None:
+    """Expose stable enum values and reject invalid attention geometry."""
+    # Enum values form configuration-facing strings and must remain stable.
+    assert AttentionType.SELF_ATTENTION.value == "self_attention"
+    assert AttentionType.CROSS_ATTENTION.value == "cross_attention"
+    assert QKNormScope.NONE.value == "none"
+
+    # Reject string lookalikes before backend construction can select the wrong
+    # forward branch.
+    string_policy = cast(AttentionType, "self_attention")
+    with pytest.raises(TypeError, match="AttentionType"):
+        _Attention(
+            query_dim=16,
+            n_heads=2,
+            head_dim=8,
+            attention_type=string_policy,
+        )
+
+    # Self-attention projects one token source, so query and context widths must
+    # be identical.
+    with pytest.raises(ValueError, match="self-attention requires"):
+        _Attention(
+            query_dim=16,
+            context_dim=8,
+            n_heads=2,
+            head_dim=8,
+        )
+
+
+@pytest.mark.parametrize(
+    "qk_norm_eps",
+    [
+        pytest.param(0.0, id="zero"),
+        pytest.param(-1.0, id="negative"),
+        pytest.param(float("inf"), id="infinite"),
+        pytest.param(float("-inf"), id="negative-infinite"),
+        pytest.param(float("nan"), id="nan"),
+    ],
+)
+def test_qk_norm_eps_must_be_finite_and_positive(qk_norm_eps: float) -> None:
+    """Reject non-positive or non-finite Q/K normalization epsilon values.
+
+    Args:
+        qk_norm_eps: Invalid epsilon supplied by the parameterized case.
+    """
+    with pytest.raises(ValueError, match="qk_norm_eps"):
+        _Attention(
+            query_dim=16,
+            n_heads=2,
+            head_dim=8,
+            qk_norm_eps=qk_norm_eps,
+        )
 
 
 @pytest.mark.parametrize(
@@ -121,7 +227,12 @@ def test_attention_geometry_and_policies_are_stored() -> None:
     ],
 )
 def test_attention_dimensions_must_be_positive(dimension: str, value: int) -> None:
-    """Reject zero values for every attention dimension."""
+    """Reject a zero value for each attention geometry dimension.
+
+    Args:
+        dimension: Constructor argument under validation.
+        value: Invalid zero dimension supplied to that argument.
+    """
     with pytest.raises(ValueError, match=dimension):
         _Attention(
             query_dim=value if dimension == "query_dim" else 16,
@@ -129,53 +240,3 @@ def test_attention_dimensions_must_be_positive(dimension: str, value: int) -> No
             n_heads=value if dimension == "n_heads" else 2,
             head_dim=value if dimension == "head_dim" else 8,
         )
-
-
-def test_torch_attention_runs_complete_streaming_forward_on_cpu() -> None:
-    """Run the complete PyTorch reference forward path on CPU."""
-    batch_size = 2
-    chunk_size = 2
-    n_heads = 2
-    head_dim = 12
-    query_dim = n_heads * head_dim
-    x = torch.randn(batch_size, chunk_size, query_dim)
-
-    attention = TorchMultiHeadAttention(
-        query_dim=query_dim,
-        n_heads=n_heads,
-        head_dim=head_dim,
-    )
-    kv_cache = attention.initialize_cache(
-        batch_size=batch_size,
-        chunk_size=chunk_size,
-        window_size=chunk_size,
-        sink_size=0,
-        device=torch.device("cpu"),
-        dtype=x.dtype,
-    )
-    rope = RotaryPositionEmbedding3D(
-        head_dim=head_dim,
-        len_t=1,
-        len_h=1,
-        len_w=chunk_size,
-        device=torch.device("cpu"),
-    )
-
-    kv_cache.before_update(0)
-    output = attention(x, kv_cache, rope.shift_t(0))
-
-    assert output.shape == x.shape
-    assert torch.isfinite(output).all()
-    assert kv_cache.cached_k().shape == (
-        batch_size,
-        chunk_size,
-        n_heads,
-        head_dim,
-    )
-    assert kv_cache.cached_v().shape == (
-        batch_size,
-        chunk_size,
-        n_heads,
-        head_dim,
-    )
-    kv_cache.after_update(0)
