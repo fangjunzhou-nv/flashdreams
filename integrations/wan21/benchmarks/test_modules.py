@@ -364,7 +364,7 @@ def test_dit_block_benchmark(
     cp_group = dist.group.WORLD if cp_size > 1 else None
     block.set_context_parallel_group(cp_group)
     self_attention_cp_enabled = block.self_attn.is_context_parallel_enabled()
-    cross_attention_cp_enabled = block.cross_attn.attn_op.is_context_parallel_enabled()
+    cross_attention_cp_enabled = block.cross_attn.is_context_parallel_enabled()
     assert self_attention_cp_enabled == (
         backend is AttentionBackend.WAN and cp_size > 1
     )
@@ -448,7 +448,7 @@ def test_dit_block_benchmark(
             "attention_backend": backend.value,
             "sdpa_backend": case.sdpa_backend.value,
             "self_attention_operator": case.self_attention_operator,
-            "cross_attention_operator": "cudnn",
+            "cross_attention_operator": case.cross_attention_operator,
             "projection_backend": (
                 "separate_qkv"
                 if backend is AttentionBackend.WAN
@@ -480,7 +480,9 @@ def test_dit_block_benchmark(
             "self_attention_context_parallel_method": (
                 config.cp_method if backend is AttentionBackend.WAN else None
             ),
-            "cross_attention_method": block.cross_attn.attn_op.method,
+            "cross_attention_method": (
+                config.cp_method if backend is AttentionBackend.WAN else None
+            ),
             "context_parallel_size": cp_size,
             "self_attention_context_parallel_enabled": (self_attention_cp_enabled),
             "cross_attention_context_parallel_enabled": (cross_attention_cp_enabled),

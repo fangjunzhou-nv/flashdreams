@@ -45,13 +45,13 @@ from flashdreams.core.attention.rope import apply_rope_freqs
 
 
 class AttentionBackend(str, Enum):
-    """Self-attention implementation used by a Wan DiT block."""
+    """Attention implementation used by a Wan DiT block."""
 
     WAN = "wan"
     """Use Wan's context-parallel attention implementation."""
 
     TRITON = "triton"
-    """Use FP8-projected Triton preprocessing with configurable SDPA."""
+    """Use FP8-projected Triton self- and text cross-attention."""
 
 
 def sinusoidal_embedding_1d(dim: int, position: Tensor) -> Tensor:
@@ -623,6 +623,127 @@ class CrossAttention(MultiHeadAttention):
         return self.o(out)
 
 
+class TritonCrossAttention(TritonMultiHeadAttention):
+    """Static text cross-attention adapted to Wan's checkpoint contract."""
+
+    @property
+    def query_projection(self) -> nn.Linear:
+        """Return Wan's ``q`` module as the logical query projection."""
+        return self.q
+
+    @property
+    def key_projection(self) -> nn.Linear:
+        """Return Wan's ``k`` module as the logical key projection."""
+        return self.k
+
+    @property
+    def value_projection(self) -> nn.Linear:
+        """Return Wan's ``v`` module as the logical value projection."""
+        return self.v
+
+    @property
+    def output_projection(self) -> nn.Linear:
+        """Return Wan's ``o`` module as the logical output projection."""
+        return self.o
+
+    @property
+    def query_norm(self) -> nn.Module:
+        """Return Wan's ``norm_q`` query normalization module."""
+        return self.norm_q
+
+    @property
+    def key_norm(self) -> nn.Module:
+        """Return Wan's ``norm_k`` key normalization module."""
+        return self.norm_k
+
+    def __init__(
+        self,
+        query_dim: int,
+        context_dim: int | None = None,
+        n_heads: int = 8,
+        head_dim: int = 64,
+        eps: float = 1e-6,
+        cp_method: Literal["ring", "ulysses"] = "ring",
+    ) -> None:
+        """Initialize FP8 Triton FA2 cross-attention with Wan module names.
+
+        Args:
+            query_dim: Feature dimension of query tokens and projected output.
+            context_dim: Feature dimension of key/value tokens. ``None`` uses
+                ``query_dim``.
+            n_heads: Number of attention heads.
+            head_dim: Per-head feature dimension.
+            eps: Epsilon used by Q/K RMS normalization.
+            cp_method: Ignored context-parallel method retained for constructor
+                compatibility with Wan attention.
+        """
+        del cp_method
+        super().__init__(
+            query_dim=query_dim,
+            context_dim=context_dim,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            attention_type=AttentionType.CROSS_ATTENTION,
+            qkv_fusion_option=QKVFusionOption.FUSE_KV,
+            qk_norm_eps=eps,
+            qk_norm_scope=QKNormScope.INNER,
+            rope_interleaved=False,
+            use_fp8=True,
+            sdpa_backend=SDPABackend.TRITON,
+        )
+
+        self.q = nn.Linear(self.query_dim, self.inner_dim, bias=True)
+        self.k = nn.Linear(self.context_dim, self.inner_dim, bias=True)
+        self.v = nn.Linear(self.context_dim, self.inner_dim, bias=True)
+        self.o = nn.Linear(self.inner_dim, self.query_dim, bias=True)
+        self.norm_q = nn.RMSNorm(self.inner_dim, eps=self.qk_norm_eps)
+        self.norm_k = nn.RMSNorm(self.inner_dim, eps=self.qk_norm_eps)
+        self._initialize_derived_weights()
+
+    def initialize_cache(
+        self,
+        context_text: Tensor,
+        context_img: Tensor | None = None,
+    ) -> CrossAttnCache:
+        """Project text context into the static cache used by ``forward``.
+
+        Args:
+            context_text: Text context tensor shaped ``[..., L_text, D]``.
+            context_img: Unused image context retained for block compatibility.
+
+        Returns:
+            Cross-attention cache containing projected text K/V.
+        """
+        del context_img
+        return CrossAttnCache(text=self.compute_kv(context_text))
+
+    def forward(self, x: Tensor, kv_cache: CrossAttnCache) -> Tensor:
+        """Attend from ``x`` to the precomputed static text cache."""
+        return super().forward(x, kv_cache.text)
+
+    def set_context_parallel_group(self, cp_group: ProcessGroup | None) -> None:
+        """Reject context parallelism unsupported by Triton attention.
+
+        Args:
+            cp_group: Context-parallel process group; ``None`` is a no-op.
+
+        Raises:
+            NotImplementedError: ``cp_group`` is not ``None``.
+        """
+        if cp_group is not None:
+            raise NotImplementedError(
+                "The Triton attention backend does not support context parallelism"
+            )
+
+    def is_context_parallel_enabled(self) -> bool:
+        """Return whether context parallelism is enabled."""
+        return False
+
+    def context_parallel_size(self) -> int:
+        """Return the singleton context-parallel world size."""
+        return 1
+
+
 @dataclass
 class BlockCache:
     """Per-block cache container for self-attention and cross-attention."""
@@ -692,14 +813,26 @@ class Block(nn.Module):
             if cross_attn_norm
             else nn.Identity()
         )
-        self.cross_attn = CrossAttention(
-            query_dim=dim,
-            n_heads=num_heads,
-            head_dim=dim // num_heads,
-            i2v=i2v,
-            eps=eps,
-            cp_method=cp_method,
-        )
+        # ponytail: Wan I2V has independent text/image softmax branches summed
+        # before one output projection; keep it native until a dual-cache Triton
+        # adapter can preserve that ordering.
+        if self.attention_backend is AttentionBackend.TRITON and not i2v:
+            self.cross_attn = TritonCrossAttention(
+                query_dim=dim,
+                n_heads=num_heads,
+                head_dim=dim // num_heads,
+                eps=eps,
+                cp_method=cp_method,
+            )
+        else:
+            self.cross_attn = CrossAttention(
+                query_dim=dim,
+                n_heads=num_heads,
+                head_dim=dim // num_heads,
+                i2v=i2v,
+                eps=eps,
+                cp_method=cp_method,
+            )
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim),
@@ -764,6 +897,8 @@ class Block(nn.Module):
 
         if isinstance(self.self_attn, TritonSelfAttention):
             self.self_attn._refresh_derived_weights()
+        if isinstance(self.cross_attn, TritonCrossAttention):
+            self.cross_attn._refresh_derived_weights()
         self.modulation.data = self.modulation.data.squeeze(0)
         self._parameters_updated_after_loading_checkpoint = True
 

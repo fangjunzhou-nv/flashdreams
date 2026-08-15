@@ -28,7 +28,9 @@ from flashdreams.core.attention import RotaryPositionEmbedding3D
 from flashdreams.recipes.wan.transformer.impl.modules import (
     AttentionBackend,
     Block,
+    CrossAttention,
     SelfAttention,
+    TritonCrossAttention,
 )
 
 pytestmark = pytest.mark.ci_gpu
@@ -146,3 +148,71 @@ def test_triton_self_attention_matches_default_through_window_roll(
 
             reference_cache.after_update(chunk_idx)
             actual_cache.after_update(chunk_idx)
+
+
+def test_triton_cross_attention_matches_default_static_text_cache(
+    tma_device: torch.device,
+) -> None:
+    """Match Wan T2V cross-attention while preserving static text caches.
+
+    Args:
+        tma_device: CUDA device with tensor-memory acceleration support.
+    """
+    torch.manual_seed(19)
+    reference = (
+        CrossAttention(
+            query_dim=256,
+            n_heads=2,
+            head_dim=128,
+        )
+        .to(
+            device=tma_device,
+            dtype=torch.bfloat16,
+        )
+        .eval()
+    )
+    actual_attention = (
+        TritonCrossAttention(
+            query_dim=256,
+            n_heads=2,
+            head_dim=128,
+        )
+        .to(
+            device=tma_device,
+            dtype=torch.bfloat16,
+        )
+        .eval()
+    )
+    actual_attention.load_state_dict(reference.state_dict(), strict=True)
+
+    generator = torch.Generator(device=tma_device).manual_seed(23)
+    context = torch.randn(
+        (1, 32, 256),
+        generator=generator,
+        device=tma_device,
+        dtype=torch.bfloat16,
+    )
+    query = torch.randn(
+        (1, 16, 256),
+        generator=generator,
+        device=tma_device,
+        dtype=torch.bfloat16,
+    )
+
+    with torch.inference_mode():
+        reference_cache = reference.initialize_cache(context)
+        actual_cache = actual_attention.initialize_cache(context)
+        reference_key = reference_cache.text.cached_k().clone()
+        reference_value = reference_cache.text.cached_v().clone()
+        actual_key = actual_cache.text.cached_k().clone()
+        actual_value = actual_cache.text.cached_v().clone()
+
+        expected = reference(query, reference_cache)
+        actual = actual_attention(query, actual_cache)
+
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+    assert torch.equal(reference_cache.text.cached_k(), reference_key)
+    assert torch.equal(reference_cache.text.cached_v(), reference_value)
+    assert torch.equal(actual_cache.text.cached_k(), actual_key)
+    assert torch.equal(actual_cache.text.cached_v(), actual_value)
+    assert actual_cache.text.dtype is torch.float8_e4m3fn

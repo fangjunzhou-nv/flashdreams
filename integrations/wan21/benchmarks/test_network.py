@@ -149,8 +149,9 @@ def test_dit_network_benchmark(
         for module in network.modules()
         if isinstance(module, ContextParallelAttention)
     ]
-    assert attention_modules
-    assert {attention.backend for attention in attention_modules} == {"cudnn"}
+    assert {attention.backend for attention in attention_modules} == (
+        {"cudnn"} if backend is AttentionBackend.WAN else set()
+    )
     cp_enabled_attention_modules = [
         attention
         for attention in attention_modules
@@ -251,7 +252,7 @@ def test_dit_network_benchmark(
             "attention_backend": backend.value,
             "sdpa_backend": case.sdpa_backend.value,
             "self_attention_operator": case.self_attention_operator,
-            "cross_attention_operator": "cudnn",
+            "cross_attention_operator": case.cross_attention_operator,
             "projection_backend": (
                 "separate_qkv"
                 if backend is AttentionBackend.WAN

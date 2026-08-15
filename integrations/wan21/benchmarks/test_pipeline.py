@@ -216,10 +216,9 @@ def _run_full_pipeline_benchmark(
         for module in pipeline.modules()
         if isinstance(module, ContextParallelAttention)
     ]
-    assert context_parallel_attention_modules
-    assert {attention.backend for attention in context_parallel_attention_modules} == {
-        "cudnn"
-    }
+    assert {attention.backend for attention in context_parallel_attention_modules} == (
+        {"cudnn"} if case.attention_backend is AttentionBackend.WAN else set()
+    )
     cp_size = transformer._cp_size
     cp_enabled_attention_modules = [
         attention
@@ -417,7 +416,7 @@ def _run_full_pipeline_benchmark(
             "configured_attention_backend": case.attention_backend.value,
             "configured_sdpa_backend": case.sdpa_backend.value,
             "dit_self_attention_backend": case.self_attention_operator,
-            "dit_cross_attention_backend": "cudnn",
+            "dit_cross_attention_backend": case.cross_attention_operator,
             "projection_backend": (
                 "separate_qkv"
                 if case.attention_backend is AttentionBackend.WAN

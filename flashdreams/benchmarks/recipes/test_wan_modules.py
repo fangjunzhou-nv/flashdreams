@@ -97,6 +97,13 @@ class _Implementation(str, Enum):
             return "torch_cudnn_sdpa"
         return "triton_fa2"
 
+    @property
+    def cross_attention_operator(self) -> str:
+        """Return the concrete cross-attention operator name."""
+        if self is self.WAN_TORCH:
+            return "cudnn"
+        return "triton_fa2"
+
 
 assert {case.attention_backend for case in _Implementation} == set(AttentionBackend)
 assert {
@@ -375,7 +382,7 @@ def test_dit_block_benchmark(
             "attention_backend": backend.value,
             "sdpa_backend": implementation.sdpa_backend.value,
             "self_attention_operator": implementation.self_attention_operator,
-            "cross_attention_operator": "cudnn",
+            "cross_attention_operator": implementation.cross_attention_operator,
             "projection_backend": (
                 "separate_qkv"
                 if backend is AttentionBackend.WAN

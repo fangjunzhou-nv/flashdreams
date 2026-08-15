@@ -37,10 +37,13 @@ class AttentionBenchmarkCase:
     """DiT block implementation configured for this case."""
 
     sdpa_backend: SDPABackend
-    """SDPA implementation configured for Triton multi-head attention."""
+    """SDPA implementation configured for Triton self-attention."""
 
     self_attention_operator: str
     """Self-attention operator reported in benchmark metadata."""
+
+    cross_attention_operator: str
+    """Cross-attention operator reported in benchmark metadata."""
 
     minimum_compute_capability: tuple[int, int] | None = None
     """Minimum CUDA compute capability; ``None`` accepts any CUDA device."""
@@ -56,6 +59,7 @@ WAN_TORCH_CASE = AttentionBenchmarkCase(
     attention_backend=AttentionBackend.WAN,
     sdpa_backend=SDPABackend.CUDNN,
     self_attention_operator="cudnn",
+    cross_attention_operator="cudnn",
 )
 
 TRITON_CUDNN_CASE = AttentionBenchmarkCase(
@@ -63,6 +67,7 @@ TRITON_CUDNN_CASE = AttentionBenchmarkCase(
     attention_backend=AttentionBackend.TRITON,
     sdpa_backend=SDPABackend.CUDNN,
     self_attention_operator="torch_cudnn_sdpa",
+    cross_attention_operator="triton_fa2",
     minimum_compute_capability=(9, 0),
 )
 
@@ -71,6 +76,7 @@ TRITON_FA2_CASE = AttentionBenchmarkCase(
     attention_backend=AttentionBackend.TRITON,
     sdpa_backend=SDPABackend.TRITON,
     self_attention_operator="triton_fa2",
+    cross_attention_operator="triton_fa2",
     minimum_compute_capability=(9, 0),
 )
 

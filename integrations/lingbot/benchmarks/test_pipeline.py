@@ -185,11 +185,12 @@ def _run_full_pipeline_benchmark(
         for module in pipeline.modules()
         if isinstance(module, ContextParallelAttention)
     ]
-    assert context_parallel_attention_modules
     context_parallel_attention_backends = {
         attention.backend for attention in context_parallel_attention_modules
     }
-    assert context_parallel_attention_backends == {"cudnn"}
+    assert context_parallel_attention_backends == (
+        {"cudnn"} if case.attention_backend is AttentionBackend.WAN else set()
+    )
 
     diffusion_config = pipeline_config.diffusion_model
     transformer_config = diffusion_config.transformer
@@ -416,7 +417,7 @@ def _run_full_pipeline_benchmark(
             "configured_sdpa_backend": case.sdpa_backend.value,
             "dit_attention_backend": case.self_attention_operator,
             "dit_self_attention_backend": case.self_attention_operator,
-            "dit_cross_attention_backend": "cudnn",
+            "dit_cross_attention_backend": case.cross_attention_operator,
             "projection_backend": (
                 "separate_qkv"
                 if case.attention_backend is AttentionBackend.WAN

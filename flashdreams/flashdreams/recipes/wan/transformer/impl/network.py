@@ -111,7 +111,7 @@ class WanDiTNetworkConfig(InstantiateConfig):
     cp_method: Literal["ring", "ulysses"] = "ring"
     """Context-parallel attention method for transformer attention ops."""
     attention_backend: AttentionBackend = AttentionBackend.WAN
-    """Self-attention implementation used by every transformer block."""
+    """Self- and text cross-attention implementation used by every block."""
     sdpa_backend: SDPABackend = SDPABackend.TRITON
     """SDPA implementation used by accelerated self-attention."""
 

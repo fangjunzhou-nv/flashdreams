@@ -153,7 +153,7 @@ def test_camctrl_dit_block_benchmark(
     cp_group = dist.group.WORLD if cp_size > 1 else None
     block.set_context_parallel_group(cp_group)
     self_attention_cp_enabled = block.self_attn.is_context_parallel_enabled()
-    cross_attention_cp_enabled = block.cross_attn.attn_op.is_context_parallel_enabled()
+    cross_attention_cp_enabled = block.cross_attn.is_context_parallel_enabled()
     assert self_attention_cp_enabled == (
         case.attention_backend is AttentionBackend.WAN and cp_size > 1
     )
@@ -239,8 +239,9 @@ def test_camctrl_dit_block_benchmark(
     self_attention_cp_method = (
         config.cp_method if case.attention_backend is AttentionBackend.WAN else None
     )
-    cross_attention_method = block.cross_attn.attn_op.method
-    assert block.cross_attn.attn_op.backend == "cudnn"
+    cross_attention_method = (
+        config.cp_method if case.attention_backend is AttentionBackend.WAN else None
+    )
     camera_parameter_count = sum(
         parameter.numel()
         for name, parameter in block.named_parameters()
@@ -278,7 +279,7 @@ def test_camctrl_dit_block_benchmark(
             "attention_backend": case.attention_backend.value,
             "sdpa_backend": case.sdpa_backend.value,
             "self_attention_operator": case.self_attention_operator,
-            "cross_attention_operator": "cudnn",
+            "cross_attention_operator": case.cross_attention_operator,
             "projection_backend": (
                 "separate_qkv"
                 if case.attention_backend is AttentionBackend.WAN
