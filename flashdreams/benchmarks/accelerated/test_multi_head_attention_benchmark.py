@@ -300,7 +300,7 @@ _N_HEADS = 16
 
 _HEAD_DIM = _QUERY_DIM // _N_HEADS
 
-_CHUNK_SIZE = 160 * 90
+_CHUNK_SIZE = 80 * 60
 """Number of query tokens processed by each benchmark call."""
 
 _WINDOW_CHUNKS = 6
