@@ -54,8 +54,8 @@ _NUM_VIEWS = 1
 _PIXEL_HEIGHT = DEFAULT_VIDEO_HEIGHT
 _PIXEL_WIDTH = DEFAULT_VIDEO_WIDTH
 _TEXT_TOKENS = 512
-_WARMUP_ROUNDS = 3
-_BENCHMARK_ROUNDS = 20
+_WARMUP_ROUNDS = 5
+_BENCHMARK_ROUNDS = 50
 _SEED = 0
 _NATIVE_DIT_BACKEND = "fp8_kvcache_cudnn"
 _NATIVE_ATTENTION_BACKEND = "cudnn"
@@ -126,10 +126,14 @@ def _run_full_pipeline_benchmark(
         diffusion_model={
             "seed": _SEED,
             "transformer": {
-                "compile_network": not native_dit,
+                "compile_network": True,
                 "network": {
                     "attention_backend": attention_backend,
                     "sdpa_backend": case.sdpa_backend,
+                    "cross_attn_sdpa_backend": case.sdpa_backend,
+                    "self_attn_qkv_fusion_option": (case.self_attn_qkv_fusion_option),
+                    "cross_attn_qkv_fusion_option": (case.cross_attn_qkv_fusion_option),
+                    "use_fp8": case.use_fp8,
                 },
                 # Keep cache finalization identical across the comparison;
                 # this performs the final context-noise DiT update before
@@ -161,6 +165,14 @@ def _run_full_pipeline_benchmark(
     network_config = transformer_config.network
     assert network_config.attention_backend is attention_backend
     assert network_config.sdpa_backend is case.sdpa_backend
+    assert network_config.cross_attn_sdpa_backend is case.sdpa_backend
+    assert (
+        network_config.self_attn_qkv_fusion_option is case.self_attn_qkv_fusion_option
+    )
+    assert (
+        network_config.cross_attn_qkv_fusion_option is case.cross_attn_qkv_fusion_option
+    )
+    assert network_config.use_fp8 is case.use_fp8
 
     transformer = pipeline.diffusion_model.transformer
     assert isinstance(transformer, CosmosTransformer)
@@ -281,6 +293,9 @@ def _run_full_pipeline_benchmark(
             assert fp8_caches
             assert all(cache_tensor.dtype == torch.uint8 for cache_tensor in fp8_caches)
         dit_execution = "native_cuda"
+        dit_use_fp8 = True
+        dit_self_attn_qkv_fusion_option = "native_cuda"
+        dit_cross_attn_qkv_fusion_option = "native_cuda"
         dit_attention_backend = native_executor._attention_backend
         dit_self_attention_backend = native_executor._attention_backend
         dit_cross_attention_backend = native_executor._attention_backend
@@ -296,6 +311,9 @@ def _run_full_pipeline_benchmark(
         assert native_selection is None
         assert native_executor is None
         dit_execution = "pytorch"
+        dit_use_fp8 = case.use_fp8
+        dit_self_attn_qkv_fusion_option = case.self_attn_qkv_fusion_option.value
+        dit_cross_attn_qkv_fusion_option = case.cross_attn_qkv_fusion_option.value
         dit_attention_backend = case.self_attention_operator
         dit_self_attention_backend = case.self_attention_operator
         dit_cross_attention_backend = case.cross_attention_operator
@@ -351,6 +369,9 @@ def _run_full_pipeline_benchmark(
             "implementation": case.implementation,
             "dit_execution": dit_execution,
             "dit_sdpa_backend": case.sdpa_backend.value,
+            "dit_use_fp8": dit_use_fp8,
+            "dit_self_attn_qkv_fusion_option": dit_self_attn_qkv_fusion_option,
+            "dit_cross_attn_qkv_fusion_option": dit_cross_attn_qkv_fusion_option,
             "dit_attention_backend": dit_attention_backend,
             "dit_self_attention_backend": dit_self_attention_backend,
             "dit_cross_attention_backend": dit_cross_attention_backend,

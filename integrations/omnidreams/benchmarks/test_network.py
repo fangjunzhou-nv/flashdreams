@@ -41,7 +41,7 @@ from flashdreams.infra.acceleration import (
 )
 from flashdreams.infra.compile import compile_module
 from integrations.omnidreams.benchmarks.cases import (
-    PYTORCH_ATTENTION_CASES,
+    ATTENTION_POLICY_CASES,
     AttentionBenchmarkCase,
     skip_unsupported_device,
 )
@@ -64,8 +64,8 @@ _WINDOW_SIZE_T = 6
 _TEXT_TOKENS = 512
 _HDMAP_CHANNELS = 16
 _DIFFUSION_TIMESTEP = 450.0
-_WARMUP_ROUNDS = 3
-_BENCHMARK_ROUNDS = 20
+_WARMUP_ROUNDS = 5
+_BENCHMARK_ROUNDS = 50
 _SEED = 0
 _NATIVE_DIT_BACKEND = "fp8_kvcache_cudnn"
 _NATIVE_ATTENTION_BACKEND = "cudnn"
@@ -73,7 +73,7 @@ _NATIVE_ATTENTION_BACKEND = "cudnn"
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "case", PYTORCH_ATTENTION_CASES, ids=lambda case: case.pytest_id
+    "case", ATTENTION_POLICY_CASES, ids=lambda case: case.pytest_id
 )
 @torch.inference_mode()
 def test_dit_network_benchmark(
@@ -95,6 +95,10 @@ def test_dit_network_benchmark(
         cp_method="ring",
         attention_backend=case.attention_backend,
         sdpa_backend=case.sdpa_backend,
+        cross_attn_sdpa_backend=case.sdpa_backend,
+        self_attn_qkv_fusion_option=case.self_attn_qkv_fusion_option,
+        cross_attn_qkv_fusion_option=case.cross_attn_qkv_fusion_option,
+        use_fp8=case.use_fp8,
     )
     network = CosmosDiTNetwork(config).to(device=device, dtype=dtype)
     network.eval()
@@ -104,6 +108,18 @@ def test_dit_network_benchmark(
         block.attention_backend is case.attention_backend for block in network.blocks
     )
     assert all(block.sdpa_backend is case.sdpa_backend for block in network.blocks)
+    assert all(
+        block.cross_attn_sdpa_backend is case.sdpa_backend for block in network.blocks
+    )
+    assert all(
+        block.self_attn_qkv_fusion_option is case.self_attn_qkv_fusion_option
+        for block in network.blocks
+    )
+    assert all(
+        block.cross_attn_qkv_fusion_option is case.cross_attn_qkv_fusion_option
+        for block in network.blocks
+    )
+    assert all(block.use_fp8 is case.use_fp8 for block in network.blocks)
     generator = torch.Generator(device=device).manual_seed(_SEED)
 
     patch_t = _CHUNK_SIZE_T // config.patch_temporal
@@ -221,6 +237,9 @@ def test_dit_network_benchmark(
             "implementation": case.implementation,
             "execution_backend": "pytorch",
             "sdpa_backend": case.sdpa_backend.value,
+            "use_fp8": case.use_fp8,
+            "self_attn_qkv_fusion_option": case.self_attn_qkv_fusion_option.value,
+            "cross_attn_qkv_fusion_option": case.cross_attn_qkv_fusion_option.value,
             "attention_backend": case.self_attention_operator,
             "self_attention_backend": case.self_attention_operator,
             "cross_attention_backend": case.cross_attention_operator,

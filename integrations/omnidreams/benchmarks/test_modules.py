@@ -29,15 +29,14 @@ import torch
 from omnidreams.transformer.impl.modules import (
     AttentionBackend,
     Block,
-    GPT2FeedForward,
 )
 from omnidreams.transformer.impl.network import CosmosDiTNetworkConfig
 from pytest_benchmark.fixture import BenchmarkFixture
 
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from integrations.omnidreams.benchmarks.cases import (
-    CROSS_ATTENTION_CASES,
-    PYTORCH_ATTENTION_CASES,
+    ATTENTION_POLICY_CASES,
+    MODULE_CROSS_ATTENTION_CASES,
     AttentionBenchmarkCase,
     skip_unsupported_device,
 )
@@ -56,9 +55,20 @@ _LATENT_WIDTH = 160
 _CHUNK_SIZE_T = 2
 _WINDOW_SIZE_T = 6
 _TEXT_TOKENS = 512
-_WARMUP_ROUNDS = 3
-_BENCHMARK_ROUNDS = 20
+_WARMUP_ROUNDS = 5
+_BENCHMARK_ROUNDS = 50
 _SEED = 0
+
+
+def _module_config(case: AttentionBenchmarkCase) -> CosmosDiTNetworkConfig:
+    """Build the network config for one module benchmark row."""
+    return CosmosDiTNetworkConfig(
+        sdpa_backend=case.sdpa_backend,
+        cross_attn_sdpa_backend=case.sdpa_backend,
+        self_attn_qkv_fusion_option=case.self_attn_qkv_fusion_option,
+        cross_attn_qkv_fusion_option=case.cross_attn_qkv_fusion_option,
+        use_fp8=case.use_fp8,
+    )
 
 
 def _make_block(
@@ -80,6 +90,10 @@ def _make_block(
             cp_method=config.cp_method,
             attention_backend=backend,
             sdpa_backend=config.sdpa_backend,
+            cross_attn_sdpa_backend=config.cross_attn_sdpa_backend,
+            self_attn_qkv_fusion_option=config.self_attn_qkv_fusion_option,
+            cross_attn_qkv_fusion_option=config.cross_attn_qkv_fusion_option,
+            use_fp8=config.use_fp8,
         )
 
     torch.manual_seed(_SEED)
@@ -94,7 +108,7 @@ def _make_block(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "case", PYTORCH_ATTENTION_CASES, ids=lambda case: case.pytest_id
+    "case", ATTENTION_POLICY_CASES, ids=lambda case: case.pytest_id
 )
 @torch.inference_mode()
 def test_dit_block_benchmark(
@@ -108,7 +122,7 @@ def test_dit_block_benchmark(
     device = torch.device("cuda")
     skip_unsupported_device(case, device)
     dtype = torch.bfloat16
-    config = CosmosDiTNetworkConfig(sdpa_backend=case.sdpa_backend)
+    config = _module_config(case)
     block = _make_block(config, case).to(device=device, dtype=dtype)
     block.eval()
     generator = torch.Generator(device=device).manual_seed(_SEED)
@@ -211,6 +225,9 @@ def test_dit_block_benchmark(
             "dtype": str(dtype),
             "implementation": case.implementation,
             "sdpa_backend": case.sdpa_backend.value,
+            "use_fp8": case.use_fp8,
+            "self_attn_qkv_fusion_option": case.self_attn_qkv_fusion_option.value,
+            "cross_attn_qkv_fusion_option": case.cross_attn_qkv_fusion_option.value,
             "attention_backend": case.self_attention_operator,
             "self_attention_backend": case.self_attention_operator,
             "cross_attention_backend": case.cross_attention_operator,
@@ -247,7 +264,7 @@ def test_dit_block_benchmark(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "case", PYTORCH_ATTENTION_CASES, ids=lambda case: case.pytest_id
+    "case", ATTENTION_POLICY_CASES, ids=lambda case: case.pytest_id
 )
 @torch.inference_mode()
 def test_self_attention_benchmark(
@@ -261,7 +278,7 @@ def test_self_attention_benchmark(
     device = torch.device("cuda")
     skip_unsupported_device(case, device)
     dtype = torch.bfloat16
-    config = CosmosDiTNetworkConfig(sdpa_backend=case.sdpa_backend)
+    config = _module_config(case)
     attention = _make_block(config, case).self_attn.to(device=device, dtype=dtype)
     attention.eval()
     generator = torch.Generator(device=device).manual_seed(_SEED)
@@ -327,6 +344,8 @@ def test_self_attention_benchmark(
             "dtype": str(dtype),
             "implementation": case.implementation,
             "sdpa_backend": case.sdpa_backend.value,
+            "use_fp8": case.use_fp8,
+            "qkv_fusion_option": case.self_attn_qkv_fusion_option.value,
             "attention_backend": case.self_attention_operator,
             "cache_dtype": str(cache.dtype),
             "cache_state": "full_window",
@@ -368,7 +387,9 @@ def test_self_attention_benchmark(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-@pytest.mark.parametrize("case", CROSS_ATTENTION_CASES, ids=lambda case: case.pytest_id)
+@pytest.mark.parametrize(
+    "case", MODULE_CROSS_ATTENTION_CASES, ids=lambda case: case.pytest_id
+)
 @torch.inference_mode()
 def test_cross_attention_benchmark(
     benchmark: BenchmarkFixture,
@@ -381,7 +402,7 @@ def test_cross_attention_benchmark(
     device = torch.device("cuda")
     skip_unsupported_device(case, device)
     dtype = torch.bfloat16
-    config = CosmosDiTNetworkConfig(sdpa_backend=case.sdpa_backend)
+    config = _module_config(case)
     attention = _make_block(config, case).cross_attn.to(device=device, dtype=dtype)
     attention.eval()
     generator = torch.Generator(device=device).manual_seed(_SEED)
@@ -434,6 +455,8 @@ def test_cross_attention_benchmark(
             "dtype": str(dtype),
             "implementation": case.implementation,
             "sdpa_backend": case.sdpa_backend.value,
+            "use_fp8": case.use_fp8,
+            "qkv_fusion_option": case.cross_attn_qkv_fusion_option.value,
             "attention_backend": case.cross_attention_operator,
             "cache_dtype": str(cache.dtype),
             "cache_state": "static_context",
@@ -449,78 +472,6 @@ def test_cross_attention_benchmark(
 
     def synchronized_forward() -> torch.Tensor:
         result = attention(x, kv_cache=cache)
-        torch.cuda.synchronize()
-        return result
-
-    output = benchmark.pedantic(
-        synchronized_forward,
-        iterations=1,
-        rounds=_BENCHMARK_ROUNDS,
-        warmup_rounds=_WARMUP_ROUNDS,
-    )
-
-    assert output.shape == x.shape
-    assert torch.isfinite(output).all()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-@torch.inference_mode()
-def test_mlp_benchmark(benchmark: BenchmarkFixture) -> None:
-    """Benchmark the production-configured DiT feed-forward module."""
-    if not torch.cuda.is_bf16_supported():
-        pytest.skip("Omnidreams MLP benchmark requires bfloat16 support")
-
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    torch.manual_seed(_SEED)
-    config = CosmosDiTNetworkConfig()
-    intermediate_channels = int(config.model_channels * config.mlp_ratio)
-    mlp = GPT2FeedForward(
-        d_model=config.model_channels,
-        d_ff=intermediate_channels,
-    ).to(device=device, dtype=dtype)
-    mlp.eval()
-
-    patch_t = _CHUNK_SIZE_T // config.patch_temporal
-    patch_h = _LATENT_HEIGHT // config.patch_spatial
-    patch_w = _LATENT_WIDTH // config.patch_spatial
-    chunk_tokens = patch_t * patch_h * patch_w
-    x = torch.randn(
-        (
-            _BATCH_SIZE,
-            _NUM_VIEWS,
-            chunk_tokens,
-            config.model_channels,
-        ),
-        device=device,
-        dtype=dtype,
-    )
-    torch.cuda.synchronize()
-
-    benchmark.group = "omnidreams-dit-mlp"
-    benchmark.extra_info.update(
-        {
-            "module": "mlp",
-            "batch_size": _BATCH_SIZE,
-            "num_views": _NUM_VIEWS,
-            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
-            "chunk_tokens": chunk_tokens,
-            "model_channels": config.model_channels,
-            "mlp_ratio": config.mlp_ratio,
-            "intermediate_channels": intermediate_channels,
-            "parameter_count": sum(parameter.numel() for parameter in mlp.parameters()),
-            "checkpoint": "random_init",
-            "dtype": str(dtype),
-            "gpu": torch.cuda.get_device_name(device),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "seed": _SEED,
-        }
-    )
-
-    def synchronized_forward() -> torch.Tensor:
-        result = mlp(x)
         torch.cuda.synchronize()
         return result
 

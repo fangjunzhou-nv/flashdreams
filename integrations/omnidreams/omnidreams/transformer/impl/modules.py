@@ -511,8 +511,11 @@ class TritonCrossAttention(TritonMultiHeadAttention):
         n_heads: int = 8,
         head_dim: int = 64,
         cp_method: Literal["ring", "ulysses"] = "ring",
+        sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV,
+        use_fp8: bool = True,
     ) -> None:
-        """Initialize bias-free, FP8 Triton cross-attention.
+        """Initialize bias-free Triton cross-attention.
 
         Args:
             query_dim: Feature dimension of query tokens and projected output.
@@ -522,7 +525,10 @@ class TritonCrossAttention(TritonMultiHeadAttention):
             head_dim: Per-head feature dimension.
             cp_method: Ignored context-parallel method retained for constructor
                 compatibility with Omnidreams attention.
-
+            sdpa_backend: Scaled-dot-product attention implementation.
+            qkv_fusion_option: Projection fusion policy.
+            use_fp8: Whether projection GEMMs and supported attention storage
+                use FP8.
         """
         del cp_method
         super().__init__(
@@ -531,12 +537,12 @@ class TritonCrossAttention(TritonMultiHeadAttention):
             n_heads=n_heads,
             attention_type=AttentionType.CROSS_ATTENTION,
             head_dim=head_dim,
-            qkv_fusion_option=QKVFusionOption.FUSE_KV,
+            qkv_fusion_option=qkv_fusion_option,
             qk_norm_eps=1e-6,
             qk_norm_scope=QKNormScope.HEAD,
             rope_interleaved=False,
-            use_fp8=True,
-            sdpa_backend=SDPABackend.TRITON,
+            use_fp8=use_fp8,
+            sdpa_backend=sdpa_backend,
         )
         self.q_proj = nn.Linear(self.query_dim, self.inner_dim, bias=False)
         self.k_proj = nn.Linear(self.context_dim, self.inner_dim, bias=False)
@@ -610,8 +616,10 @@ class TritonSelfAttention(TritonMultiHeadAttention):
         head_dim: int = 64,
         cp_method: Literal["ring", "ulysses"] = "ring",
         sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
+        use_fp8: bool = True,
     ) -> None:
-        """Initialize bias-free, FP8-projected self-attention.
+        """Initialize bias-free Triton self-attention.
 
         Args:
             query_dim: Feature dimension of input and output tokens.
@@ -622,6 +630,9 @@ class TritonSelfAttention(TritonMultiHeadAttention):
             cp_method: Ignored context-parallel method retained for constructor
                 compatibility with Omnidreams attention.
             sdpa_backend: Scaled-dot-product attention implementation.
+            qkv_fusion_option: Projection fusion policy.
+            use_fp8: Whether projection GEMMs and supported attention storage
+                use FP8.
 
         Raises:
             ValueError: ``context_dim`` differs from ``query_dim``.
@@ -638,11 +649,11 @@ class TritonSelfAttention(TritonMultiHeadAttention):
             n_heads=n_heads,
             head_dim=head_dim,
             attention_type=AttentionType.SELF_ATTENTION,
-            qkv_fusion_option=QKVFusionOption.FULL,
+            qkv_fusion_option=qkv_fusion_option,
             qk_norm_eps=1e-6,
             qk_norm_scope=QKNormScope.HEAD,
             rope_interleaved=False,
-            use_fp8=True,
+            use_fp8=use_fp8,
             sdpa_backend=sdpa_backend,
         )
         self.q_proj = nn.Linear(self.query_dim, self.inner_dim, bias=False)
@@ -705,12 +716,22 @@ class Block(nn.Module):
         cp_method: Literal["ring", "ulysses"] = "ring",
         attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS,
         sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
+        cross_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV,
+        use_fp8: bool = True,
     ) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.enable_cross_view_attn = enable_cross_view_attn
         self.attention_backend = AttentionBackend(attention_backend)
         self.sdpa_backend = SDPABackend(sdpa_backend)
+        self.cross_attn_sdpa_backend = SDPABackend(cross_attn_sdpa_backend)
+        self.self_attn_qkv_fusion_option = QKVFusionOption(self_attn_qkv_fusion_option)
+        self.cross_attn_qkv_fusion_option = QKVFusionOption(
+            cross_attn_qkv_fusion_option
+        )
+        self.use_fp8 = use_fp8
 
         # Self-attention
         self.layer_norm_self_attn = nn.LayerNorm(
@@ -744,6 +765,8 @@ class Block(nn.Module):
                 head_dim=x_dim // num_heads,
                 cp_method=cp_method,
                 sdpa_backend=self.sdpa_backend,
+                qkv_fusion_option=self.self_attn_qkv_fusion_option,
+                use_fp8=self.use_fp8,
             )
             self.cross_attn = TritonCrossAttention(
                 query_dim=x_dim,
@@ -751,6 +774,9 @@ class Block(nn.Module):
                 n_heads=num_heads,
                 head_dim=x_dim // num_heads,
                 cp_method=cp_method,
+                sdpa_backend=self.cross_attn_sdpa_backend,
+                qkv_fusion_option=self.cross_attn_qkv_fusion_option,
+                use_fp8=self.use_fp8,
             )
 
         # MLP
@@ -807,6 +833,9 @@ class Block(nn.Module):
                     n_heads=num_heads,
                     head_dim=x_dim // num_heads,
                     cp_method=cp_method,
+                    sdpa_backend=self.cross_attn_sdpa_backend,
+                    qkv_fusion_option=self.cross_attn_qkv_fusion_option,
+                    use_fp8=self.use_fp8,
                 )
 
     def set_context_parallel_group(

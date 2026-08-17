@@ -30,6 +30,11 @@ from flashdreams.accelerated.multi_head_attention_triton import (
     SDPABackend,
     TritonMultiHeadAttention,
 )
+from integrations.omnidreams.benchmarks.cases import (
+    ATTENTION_POLICY_CASES,
+    MODULE_CROSS_ATTENTION_CASES,
+    PIPELINE_CASES,
+)
 
 pytestmark = pytest.mark.ci_cpu
 
@@ -173,6 +178,82 @@ def test_network_config_selects_triton_attention(
     assert block.cross_view_attn.qkv_fusion_option is QKVFusionOption.FUSE_KV
     assert block.cross_view_attn.use_fp8 is True
     assert block.cross_view_attn.sdpa_backend is SDPABackend.TRITON
+
+
+def test_network_config_selects_triton_attention_policies() -> None:
+    """Propagate cross-attention SDPA, QKV fusion, and FP8 policies."""
+    config = CosmosDiTNetworkConfig(
+        model_channels=32,
+        num_blocks=1,
+        num_heads=2,
+        crossattn_emb_channels=16,
+        use_crossattn_projection=False,
+        enable_cross_view_attn=True,
+        attention_backend=AttentionBackend.TRITON,
+        cross_attn_sdpa_backend=SDPABackend.CUDNN,
+        self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        use_fp8=False,
+    )
+
+    network = CosmosDiTNetwork(config)
+    block = network.blocks[0]
+    assert isinstance(block, Block)
+    self_attention = block.self_attn
+    cross_attention = block.cross_attn
+    cross_view_attention = block.cross_view_attn
+    assert isinstance(self_attention, TritonMultiHeadAttention)
+    assert isinstance(cross_attention, TritonMultiHeadAttention)
+    assert isinstance(cross_view_attention, TritonMultiHeadAttention)
+
+    assert network.cross_attn_sdpa_backend is SDPABackend.CUDNN
+    assert network.self_attn_qkv_fusion_option is QKVFusionOption.NONE
+    assert network.cross_attn_qkv_fusion_option is QKVFusionOption.NONE
+    assert network.use_fp8 is False
+    assert self_attention.sdpa_backend is SDPABackend.TRITON
+    assert cross_attention.sdpa_backend is SDPABackend.CUDNN
+    assert cross_view_attention.sdpa_backend is SDPABackend.CUDNN
+    assert self_attention.qkv_fusion_option is QKVFusionOption.NONE
+    assert cross_attention.qkv_fusion_option is QKVFusionOption.NONE
+    assert cross_view_attention.qkv_fusion_option is QKVFusionOption.NONE
+    assert self_attention.use_fp8 is False
+    assert cross_attention.use_fp8 is False
+    assert cross_view_attention.use_fp8 is False
+
+
+def test_benchmark_cases_cover_attention_policy_matrix() -> None:
+    """Cover every valid benchmark precision, SDPA, and QKV fusion combination."""
+    triton_cases = tuple(
+        case
+        for case in ATTENTION_POLICY_CASES
+        if case.attention_backend is AttentionBackend.TRITON
+    )
+    expected_cases = {
+        (sdpa_backend, use_fp8, qkv_fusion_option)
+        for sdpa_backend in SDPABackend
+        for use_fp8 in (False, True)
+        for qkv_fusion_option in QKVFusionOption
+    }
+
+    assert {
+        (
+            case.sdpa_backend,
+            case.use_fp8,
+            case.self_attn_qkv_fusion_option,
+        )
+        for case in triton_cases
+    } == expected_cases
+    assert len({case.pytest_id for case in ATTENTION_POLICY_CASES}) == len(
+        ATTENTION_POLICY_CASES
+    )
+    assert all(
+        case.self_attn_qkv_fusion_option is not QKVFusionOption.FULL
+        for case in MODULE_CROSS_ATTENTION_CASES
+        if case.attention_backend is AttentionBackend.TRITON
+    )
+    assert len(MODULE_CROSS_ATTENTION_CASES) == 9
+    assert PIPELINE_CASES[:-1] == ATTENTION_POLICY_CASES
+    assert PIPELINE_CASES[-1].native_dit is True
 
 
 def test_triton_backend_preserves_checkpoint_keys() -> None:

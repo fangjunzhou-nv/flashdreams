@@ -23,7 +23,10 @@ import pytest
 import torch
 from omnidreams.transformer.impl.modules import AttentionBackend
 
-from flashdreams.accelerated.multi_head_attention_triton import SDPABackend
+from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
+    SDPABackend,
+)
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,15 @@ class AttentionBenchmarkCase:
     cross_attention_operator: str
     """Cross-attention operator reported in benchmark metadata."""
 
+    use_fp8: bool = True
+    """Whether accelerated projections and supported attention storage use FP8."""
+
+    self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL
+    """Projection fusion policy used by accelerated self-attention."""
+
+    cross_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV
+    """Projection fusion policy used by accelerated cross-attention."""
+
     native_dit: bool = False
     """Whether the full-pipeline case bypasses the PyTorch network."""
 
@@ -63,6 +75,9 @@ OMNIDREAMS_TORCH_CASE = AttentionBenchmarkCase(
     sdpa_backend=SDPABackend.CUDNN,
     self_attention_operator="cudnn",
     cross_attention_operator="cudnn",
+    use_fp8=False,
+    self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+    cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
 )
 
 TRITON_CUDNN_CASE = AttentionBenchmarkCase(
@@ -89,6 +104,9 @@ NATIVE_CUDA_CASE = AttentionBenchmarkCase(
     sdpa_backend=SDPABackend.CUDNN,
     self_attention_operator="cudnn",
     cross_attention_operator="cudnn",
+    use_fp8=False,
+    self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+    cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
     native_dit=True,
 )
 
@@ -99,10 +117,64 @@ PYTORCH_ATTENTION_CASES = (
 )
 """Attention cases that execute the PyTorch DiT network."""
 
+ATTENTION_POLICY_CASES = (
+    OMNIDREAMS_TORCH_CASE,
+    *(
+        AttentionBenchmarkCase(
+            implementation=(
+                f"triton_{'fa2' if sdpa_backend is SDPABackend.TRITON else 'cudnn'}_"
+                f"{'fp8' if use_fp8 else 'bf16'}_{qkv_fusion_option.value}"
+            ),
+            attention_backend=AttentionBackend.TRITON,
+            sdpa_backend=sdpa_backend,
+            self_attention_operator=(
+                "triton_fa2"
+                if sdpa_backend is SDPABackend.TRITON
+                else "torch_cudnn_sdpa"
+            ),
+            cross_attention_operator=(
+                "triton_fa2"
+                if sdpa_backend is SDPABackend.TRITON
+                else "torch_cudnn_sdpa"
+            ),
+            use_fp8=use_fp8,
+            self_attn_qkv_fusion_option=qkv_fusion_option,
+            cross_attn_qkv_fusion_option=(
+                qkv_fusion_option
+                if qkv_fusion_option is not QKVFusionOption.FULL
+                else QKVFusionOption.FUSE_KV
+            ),
+            minimum_compute_capability=(
+                (9, 0) if use_fp8 or sdpa_backend is SDPABackend.TRITON else None
+            ),
+        )
+        for sdpa_backend in SDPABackend
+        for use_fp8 in (False, True)
+        for qkv_fusion_option in (
+            QKVFusionOption.NONE,
+            QKVFusionOption.FUSE_KV,
+            QKVFusionOption.FULL,
+        )
+    ),
+)
+"""Omnidreams reference plus every PyTorch backend, precision, and fusion row.
+
+Full QKV fusion applies to self-attention; the unequal-width production text
+cross-attention branch retains K/V fusion for those block rows.
+"""
+
+MODULE_CROSS_ATTENTION_CASES = tuple(
+    case
+    for case in ATTENTION_POLICY_CASES
+    if case.attention_backend is AttentionBackend.OMNIDREAMS
+    or case.self_attn_qkv_fusion_option is not QKVFusionOption.FULL
+)
+"""Module cases valid for unequal-width production text cross-attention."""
+
 CROSS_ATTENTION_CASES = (OMNIDREAMS_TORCH_CASE, TRITON_CUDNN_CASE)
 """One case per concrete cross-attention implementation."""
 
-PIPELINE_CASES = (*PYTORCH_ATTENTION_CASES, NATIVE_CUDA_CASE)
+PIPELINE_CASES = (*ATTENTION_POLICY_CASES, NATIVE_CUDA_CASE)
 """Attention cases exercised by the full-pipeline benchmark."""
 
 assert {case.attention_backend for case in PYTORCH_ATTENTION_CASES} == set(
