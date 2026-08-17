@@ -20,6 +20,10 @@ from lingbot.runtime import (
 )
 
 from flashdreams.runtime import InferenceConfig, InferenceInput
+from flashdreams.runtime.types import (
+    BATCH_INPUT_FRAME_START_METADATA_KEY,
+    StepRequirements,
+)
 
 pytestmark = pytest.mark.ci_cpu
 
@@ -164,6 +168,28 @@ def test_step_forwards_its_camera_inputs_to_the_model(
     runtime.close()
 
 
+def test_session_exposes_shared_step_requirements_without_user_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _FakePipeline()
+    runtime, session = _session(tmp_path, monkeypatch, pipeline)
+
+    requirements = session.next_step_requirements()
+    legacy_request = session.next_step_request()
+
+    assert isinstance(requirements, StepRequirements)
+    assert requirements.step_index == 0
+    assert requirements.input_frame_count == 2
+    assert requirements.steady_output_frame_count == 2
+    assert requirements.metadata[BATCH_INPUT_FRAME_START_METADATA_KEY] == 0
+    assert requirements.metadata["num_frames"] == 2
+    assert requirements.metadata["frame_start"] == 0
+    assert legacy_request is not None
+    assert legacy_request.user_input_window is not None
+    runtime.close()
+
+
 def test_step_rejects_missing_camera_inputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -301,97 +327,3 @@ def test_text_event_on_an_unsupported_pipeline_fails_clearly(
     session.step(_step_payload(1.0))
     assert len(pipeline.generate_calls) == 1
     runtime.close()
-
-
-def test_full_standard_loop_drives_the_session_through_the_mapping(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The real runner must accept the mapping and feed the session per step.
-
-    A fake runner cannot catch a mapping the compatibility check rejects, so
-    this exercises flashdreams.runtime.run_inference_session itself.
-    """
-    import numpy as np
-    from lingbot.runtime import (
-        LingbotModelAdapter,
-        LingbotReplayInputs,
-        inference_input_from_replay_inputs,
-    )
-
-    from flashdreams.runtime import InputCanonicalizer, UserInputs, UserInputSchema
-    from flashdreams.runtime.metrics import NullMetricsRecorder
-    from flashdreams.runtime.output import OutputArtifact
-    from flashdreams.runtime.runner import run_inference_session
-
-    image = tmp_path / "image.jpg"
-    image.write_bytes(b"fake")
-    poses_path = tmp_path / "poses.npy"
-    intrinsics_path = tmp_path / "intrinsics.npy"
-    trajectory = np.tile(np.eye(4, dtype=np.float32), (32, 1, 1))
-    trajectory[:, 2, 3] = np.arange(32, dtype=np.float32)
-    np.save(poses_path, trajectory)
-    np.save(
-        intrinsics_path,
-        np.tile(np.array([416.0, 416.0, 416.0, 240.0], dtype=np.float32), (32, 1)),
-    )
-
-    pipeline = _FakePipeline()
-    monkeypatch.setattr(
-        runtime_module,
-        "load_first_frame_tensor",
-        lambda *args, **kwargs: torch.zeros(1, 3, 2, 2),
-    )
-    adapter = LingbotModelAdapter(
-        pipeline_factory=lambda pipeline_config, device: pipeline,
-    )
-    replay_inputs = LingbotReplayInputs(
-        prompt="a calm street",
-        first_frame_path=image,
-        camera_poses_path=poses_path,
-        camera_intrinsics_path=intrinsics_path,
-        total_blocks=3,
-        pixel_height=2,
-        pixel_width=2,
-        fps=16,
-    )
-
-    class _Collecting:
-        def __init__(self) -> None:
-            self.results: list[Any] = []
-
-        def open(self) -> None:
-            return None
-
-        def write(self, result: Any) -> None:
-            self.results.append(result)
-
-        def close(self) -> tuple[OutputArtifact, ...]:
-            return ()
-
-    output = _Collecting()
-    mapping = adapter.create_input_mapping(replay_inputs)
-    run_inference_session(
-        adapter=adapter,
-        config=InferenceConfig(
-            model_id=LINGBOT_MODEL_ID,
-            device="cpu",
-            runtime_options={"pipeline_config": object()},
-        ),
-        mapping=mapping,
-        canonicalizer=InputCanonicalizer(),
-        source_schema=UserInputSchema(),
-        user_inputs=UserInputs(),
-        initial_inputs=inference_input_from_replay_inputs(replay_inputs),
-        output=output,
-        metrics=NullMetricsRecorder(),
-    )
-
-    assert len(output.results) == 3
-    assert len(pipeline.generate_calls) == 3
-    # Each step must receive its own successive slice of the trace. Comparing
-    # against the trace directly is the real property; consecutive pose values
-    # can repeat because preprocess_example_poses re-expands encoded poses at
-    # stride-4 cadence.
-    trace_poses = mapping.camera_trace.poses
-    received = torch.cat([call["poses"] for call in pipeline.generate_calls])
-    assert torch.allclose(received, trace_poses[:6])

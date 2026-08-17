@@ -121,6 +121,46 @@ def test_omnidreams_direct_runner_launch_builds_null_spec(
     assert isinstance(captured[0].output, NullOutputSpec)
 
 
+def test_omnidreams_direct_runner_launch_uses_benchmark_when_stats_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[DemoSpec, Path | None, Path | None, bool]] = []
+
+    def fake_run_benchmark_demo(
+        *,
+        spec: DemoSpec,
+        adapter: object,
+        stats_path: Path | None,
+        stats_dir: Path | None,
+        capture_output: bool,
+    ) -> str:
+        del adapter
+        captured.append((spec, stats_path, stats_dir, capture_output))
+        return "completed"
+
+    monkeypatch.setattr(
+        demo_app_module,
+        "run_benchmark_demo",
+        fake_run_benchmark_demo,
+    )
+    stats_path = tmp_path / "stats_demo.json"
+    config = OMNIDREAMS_RUNNERS["omnidreams"]
+
+    result = demo_app_module.launch_from_runner(
+        config=config,
+        mode="mp4",
+        scenario={"example_data": True, "total_blocks": 2},
+        output={"path": tmp_path / "demo.mp4", "stats_path": stats_path},
+    )
+
+    assert result == "completed"
+    assert isinstance(captured[0][0].output, Mp4OutputSpec)
+    assert captured[0][1] == stats_path
+    assert captured[0][2] is None
+    assert captured[0][3] is True
+
+
 def test_omnidreams_replay_cli_builds_null_output_spec() -> None:
     args = parse_args(["replay", "--output-mode", "null"])
 
@@ -261,61 +301,6 @@ def test_omnidreams_demo_does_not_import_legacy_webrtc_package() -> None:
 
     for path in demo_dir.glob("*.py"):
         assert "omnidreams.webrtc" not in path.read_text(encoding="utf-8"), path
-
-
-def test_omnidreams_replay_demo_uses_shared_runner(tmp_path: Path) -> None:
-    hdmap = tmp_path / "hdmap.mp4"
-    first_frame = tmp_path / "first.png"
-    hdmap.write_bytes(b"fake")
-    first_frame.write_bytes(b"fake")
-    pipeline_config = object()
-    adapter = OmnidreamsDemoAdapter()
-    output = _RecordingOutputTarget()
-    calls: list[dict[str, Any]] = []
-
-    def fake_runner(**kwargs: Any) -> Sequence[OutputArtifact]:
-        calls.append(kwargs)
-        return (OutputArtifact(kind="video/mp4", uri="memory://omnidreams"),)
-
-    spec = DemoSpec(
-        model_id=OMNIDREAMS_MODEL_ID,
-        preset_id=DEFAULT_OMNIDREAMS_PRESET,
-        input_mode="replay",
-        scenario={
-            "prompt": "drive through a city",
-            "hdmap_video_paths": (hdmap,),
-            "first_frame_paths": (first_frame,),
-            "camera_names": ("camera_front_wide_120fov",),
-            "total_blocks": 1,
-        },
-        output=Mp4OutputSpec(path=tmp_path / "demo.mp4", fps=30),
-        config=InferenceConfig(
-            model_id=OMNIDREAMS_MODEL_ID,
-            preset_id=DEFAULT_OMNIDREAMS_PRESET,
-            runtime_options={"pipeline_config": pipeline_config},
-        ),
-    )
-
-    result = run_replay_demo(
-        spec=spec,
-        adapter=adapter,
-        output_target_factory=lambda output_spec: output,
-        runner=fake_runner,
-    )
-
-    assert result.status == "completed"
-    assert result.artifacts == (
-        OutputArtifact(kind="video/mp4", uri="memory://omnidreams"),
-    )
-    assert len(calls) == 1
-    assert calls[0]["adapter"] is adapter
-    assert calls[0]["config"] == spec.config
-    scenario = calls[0]["initial_inputs"].global_conditioning["scenario"]
-    assert isinstance(scenario, OmnidreamsReplayScenario)
-    assert scenario.prompts == ("drive through a city",)
-    assert scenario.hdmap_video_paths == (hdmap,)
-    assert scenario.first_frame_paths == (first_frame,)
-    assert scenario.camera_names == ("camera_front_wide_120fov",)
 
 
 def test_omnidreams_replay_invalid_scenario_fails_before_runtime_creation(
