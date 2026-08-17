@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
-shopt -s nullglob
+shopt -s globstar nullglob
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 status=0
-for run_script in "$script_dir"/*/run.sh; do
+for run_script in "$script_dir"/**/run.sh; do
     "$run_script" "$@" || status=$?
 done
 
