@@ -41,7 +41,7 @@ from flashdreams.infra.acceleration import (
 )
 from flashdreams.infra.compile import compile_module
 from integrations.omnidreams.benchmarks.cases import (
-    ATTENTION_POLICY_CASES,
+    BENCHMARK_CASES,
     AttentionBenchmarkCase,
     skip_unsupported_device,
 )
@@ -67,13 +67,13 @@ _DIFFUSION_TIMESTEP = 450.0
 _WARMUP_ROUNDS = 5
 _BENCHMARK_ROUNDS = 50
 _SEED = 0
-_NATIVE_DIT_BACKEND = "fp8_kvcache_cudnn"
-_NATIVE_ATTENTION_BACKEND = "cudnn"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "case", ATTENTION_POLICY_CASES, ids=lambda case: case.pytest_id
+    "case",
+    [case for case in BENCHMARK_CASES if not case.native_dit],
+    ids=lambda case: case.pytest_id,
 )
 @torch.inference_mode()
 def test_dit_network_benchmark(
@@ -93,7 +93,8 @@ def test_dit_network_benchmark(
         additional_concat_ch=_HDMAP_CHANNELS,
         enable_cross_view_attn=False,
         cp_method="ring",
-        attention_backend=case.attention_backend,
+        self_attention_backend=case.self_attention_backend,
+        cross_attention_backend=case.cross_attention_backend,
         sdpa_backend=case.sdpa_backend,
         cross_attn_sdpa_backend=case.sdpa_backend,
         self_attn_qkv_fusion_option=case.self_attn_qkv_fusion_option,
@@ -105,7 +106,12 @@ def test_dit_network_benchmark(
     network.update_parameters_after_loading_checkpoint()
     parameter_count = sum(parameter.numel() for parameter in network.parameters())
     assert all(
-        block.attention_backend is case.attention_backend for block in network.blocks
+        block.self_attention_backend is case.self_attention_backend
+        for block in network.blocks
+    )
+    assert all(
+        block.cross_attention_backend is case.cross_attention_backend
+        for block in network.blocks
     )
     assert all(block.sdpa_backend is case.sdpa_backend for block in network.blocks)
     assert all(
@@ -291,15 +297,26 @@ def test_dit_network_benchmark(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
+@pytest.mark.parametrize(
+    "case",
+    [case for case in BENCHMARK_CASES if case.native_dit],
+    ids=lambda case: case.pytest_id,
+)
 @torch.inference_mode()
-def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
+def test_native_cuda_dit_network_benchmark(
+    benchmark: BenchmarkFixture,
+    case: AttentionBenchmarkCase,
+) -> None:
     """Benchmark the production native CUDA DiT backend at steady state."""
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Omnidreams native DiT benchmark requires bfloat16 support")
-    if not hasattr(torch, "float8_e4m3fn"):
+    if case.native_dit_backend == "fp8_kvcache_cudnn" and not hasattr(
+        torch, "float8_e4m3fn"
+    ):
         pytest.skip("Omnidreams native DiT benchmark requires float8_e4m3fn")
 
     device = torch.device("cuda")
+    skip_unsupported_device(case, device)
     dtype = torch.bfloat16
     torch.manual_seed(_SEED)
 
@@ -319,8 +336,8 @@ def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
         compile_network=False,
         use_cuda_graph=True,
         native_dit_acceleration="required",
-        native_dit_backend=_NATIVE_DIT_BACKEND,
-        native_dit_attention_backend=_NATIVE_ATTENTION_BACKEND,
+        native_dit_backend=case.native_dit_backend,
+        native_dit_attention_backend=case.native_attention_backend,
     )
     transformer = CosmosTransformer(transformer_config).to(device=device, dtype=dtype)
     transformer.eval()
@@ -415,8 +432,10 @@ def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
     assert native_selection is not None and native_selection.enabled
     assert native_executor is not None
 
-    assert native_executor._uses_fp8_dit is True
-    assert native_executor._attention_backend == _NATIVE_ATTENTION_BACKEND
+    assert native_executor._uses_fp8_dit is (
+        case.native_dit_backend == "fp8_kvcache_cudnn"
+    )
+    assert native_executor._attention_backend == case.native_attention_backend
     benchmark.group = "omnidreams-dit-network"
     benchmark.extra_info.update(
         {
@@ -434,9 +453,13 @@ def test_native_cuda_dit_network_benchmark(benchmark: BenchmarkFixture) -> None:
             "parameter_count": parameter_count,
             "checkpoint": "random_init",
             "dtype": str(dtype),
-            "implementation": "cuda",
+            "implementation": case.implementation,
             "execution_backend": "native_cuda",
             "native_dit_backend": transformer_config.native_dit_backend,
+            "native_dit_attention_backend": (
+                transformer_config.native_dit_attention_backend
+            ),
+            "use_fp8": native_executor._uses_fp8_dit,
             "attention_backend": native_executor._attention_backend,
             "self_attention_backend": native_executor._attention_backend,
             "cross_attention_backend": native_executor._attention_backend,

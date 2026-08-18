@@ -33,10 +33,13 @@ from omnidreams.transformer.impl.modules import (
 from omnidreams.transformer.impl.network import CosmosDiTNetworkConfig
 from pytest_benchmark.fixture import BenchmarkFixture
 
+from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
+    SDPABackend,
+)
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from integrations.omnidreams.benchmarks.cases import (
-    ATTENTION_POLICY_CASES,
-    MODULE_CROSS_ATTENTION_CASES,
+    BENCHMARK_CASES,
     AttentionBenchmarkCase,
     skip_unsupported_device,
 )
@@ -59,10 +62,71 @@ _WARMUP_ROUNDS = 5
 _BENCHMARK_ROUNDS = 50
 _SEED = 0
 
+_OMNIDREAMS_TORCH_CASE = next(
+    case for case in BENCHMARK_CASES if case.implementation == "omnidreams_torch"
+)
+_HYBRID_ATTENTION_CASE = next(
+    case
+    for case in BENCHMARK_CASES
+    if case.implementation == "triton_cudnn_bf16_full_omnidreams_cross"
+)
+
+_MODULE_BENCHMARK_CASES = [
+    _OMNIDREAMS_TORCH_CASE,
+    *[
+        AttentionBenchmarkCase(
+            implementation=(
+                f"triton_{'fa2' if sdpa_backend is SDPABackend.TRITON else 'cudnn'}_"
+                f"{'fp8' if use_fp8 else 'bf16'}_{qkv_fusion_option.value}"
+            ),
+            self_attention_backend=AttentionBackend.TRITON,
+            cross_attention_backend=AttentionBackend.TRITON,
+            sdpa_backend=sdpa_backend,
+            self_attention_operator=(
+                "triton_fa2"
+                if sdpa_backend is SDPABackend.TRITON
+                else "torch_cudnn_sdpa"
+            ),
+            cross_attention_operator=(
+                "triton_fa2"
+                if sdpa_backend is SDPABackend.TRITON
+                else "torch_cudnn_sdpa"
+            ),
+            use_fp8=use_fp8,
+            self_attn_qkv_fusion_option=qkv_fusion_option,
+            cross_attn_qkv_fusion_option=(
+                qkv_fusion_option
+                if qkv_fusion_option is not QKVFusionOption.FULL
+                else QKVFusionOption.FUSE_KV
+            ),
+            minimum_compute_capability=(
+                (9, 0) if use_fp8 or sdpa_backend is SDPABackend.TRITON else None
+            ),
+        )
+        for sdpa_backend in SDPABackend
+        for use_fp8 in (False, True)
+        for qkv_fusion_option in QKVFusionOption
+    ],
+    _HYBRID_ATTENTION_CASE,
+]
+_MODULE_SELF_ATTENTION_CASES = [
+    case
+    for case in _MODULE_BENCHMARK_CASES
+    if case.self_attention_backend is case.cross_attention_backend
+]
+_MODULE_CROSS_ATTENTION_CASES = [
+    case
+    for case in _MODULE_BENCHMARK_CASES
+    if case.self_attention_backend is AttentionBackend.OMNIDREAMS
+    or case.self_attn_qkv_fusion_option is not QKVFusionOption.FULL
+]
+
 
 def _module_config(case: AttentionBenchmarkCase) -> CosmosDiTNetworkConfig:
     """Build the network config for one module benchmark row."""
     return CosmosDiTNetworkConfig(
+        self_attention_backend=case.self_attention_backend,
+        cross_attention_backend=case.cross_attention_backend,
         sdpa_backend=case.sdpa_backend,
         cross_attn_sdpa_backend=case.sdpa_backend,
         self_attn_qkv_fusion_option=case.self_attn_qkv_fusion_option,
@@ -77,7 +141,7 @@ def _make_block(
 ) -> Block:
     """Build a backend-selected block with shared random weights."""
 
-    def make(backend: AttentionBackend) -> Block:
+    def make(self_backend: AttentionBackend, cross_backend: AttentionBackend) -> Block:
         # Keep this constructor in lockstep with CosmosDiTNetwork.__init__.
         return Block(
             x_dim=config.model_channels,
@@ -88,7 +152,8 @@ def _make_block(
             adaln_lora_dim=config.adaln_lora_dim,
             enable_cross_view_attn=config.enable_cross_view_attn,
             cp_method=config.cp_method,
-            attention_backend=backend,
+            self_attention_backend=self_backend,
+            cross_attention_backend=cross_backend,
             sdpa_backend=config.sdpa_backend,
             cross_attn_sdpa_backend=config.cross_attn_sdpa_backend,
             self_attn_qkv_fusion_option=config.self_attn_qkv_fusion_option,
@@ -97,18 +162,21 @@ def _make_block(
         )
 
     torch.manual_seed(_SEED)
-    omnidreams_block = make(AttentionBackend.OMNIDREAMS)
-    if case.attention_backend is AttentionBackend.OMNIDREAMS:
+    omnidreams_block = make(AttentionBackend.OMNIDREAMS, AttentionBackend.OMNIDREAMS)
+    if (
+        case.self_attention_backend is AttentionBackend.OMNIDREAMS
+        and case.cross_attention_backend is AttentionBackend.OMNIDREAMS
+    ):
         return omnidreams_block
 
-    block = make(case.attention_backend)
+    block = make(case.self_attention_backend, case.cross_attention_backend)
     block.load_state_dict(omnidreams_block.state_dict(), strict=True)
     return block
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "case", ATTENTION_POLICY_CASES, ids=lambda case: case.pytest_id
+    "case", _MODULE_BENCHMARK_CASES, ids=lambda case: case.pytest_id
 )
 @torch.inference_mode()
 def test_dit_block_benchmark(
@@ -264,7 +332,7 @@ def test_dit_block_benchmark(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "case", ATTENTION_POLICY_CASES, ids=lambda case: case.pytest_id
+    "case", _MODULE_SELF_ATTENTION_CASES, ids=lambda case: case.pytest_id
 )
 @torch.inference_mode()
 def test_self_attention_benchmark(
@@ -388,7 +456,7 @@ def test_self_attention_benchmark(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
-    "case", MODULE_CROSS_ATTENTION_CASES, ids=lambda case: case.pytest_id
+    "case", _MODULE_CROSS_ATTENTION_CASES, ids=lambda case: case.pytest_id
 )
 @torch.inference_mode()
 def test_cross_attention_benchmark(

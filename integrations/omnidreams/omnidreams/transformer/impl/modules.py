@@ -44,7 +44,7 @@ class AttentionBackend(str, Enum):
     """Use the integration's context-parallel cuDNN attention."""
 
     TRITON = "triton"
-    """Use Triton-accelerated self- and cross-attention."""
+    """Use Triton-accelerated attention for the selected branch."""
 
 
 class GPT2FeedForward(nn.Module):
@@ -714,7 +714,8 @@ class Block(nn.Module):
         adaln_lora_dim: int = 256,
         enable_cross_view_attn: bool = False,
         cp_method: Literal["ring", "ulysses"] = "ring",
-        attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS,
+        self_attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS,
+        cross_attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS,
         sdpa_backend: SDPABackend = SDPABackend.TRITON,
         cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON,
         self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
@@ -724,7 +725,8 @@ class Block(nn.Module):
         super().__init__()
         self.x_dim = x_dim
         self.enable_cross_view_attn = enable_cross_view_attn
-        self.attention_backend = AttentionBackend(attention_backend)
+        self.self_attention_backend = AttentionBackend(self_attention_backend)
+        self.cross_attention_backend = AttentionBackend(cross_attention_backend)
         self.sdpa_backend = SDPABackend(sdpa_backend)
         self.cross_attn_sdpa_backend = SDPABackend(cross_attn_sdpa_backend)
         self.self_attn_qkv_fusion_option = QKVFusionOption(self_attn_qkv_fusion_option)
@@ -742,17 +744,10 @@ class Block(nn.Module):
         self.layer_norm_cross_attn = nn.LayerNorm(
             x_dim, elementwise_affine=False, eps=1e-6
         )
-        if self.attention_backend is AttentionBackend.OMNIDREAMS:
+        if self.self_attention_backend is AttentionBackend.OMNIDREAMS:
             self.self_attn = SelfAttention(
                 query_dim=x_dim,
                 context_dim=None,
-                n_heads=num_heads,
-                head_dim=x_dim // num_heads,
-                cp_method=cp_method,
-            )
-            self.cross_attn = CrossAttention(
-                query_dim=x_dim,
-                context_dim=context_dim,
                 n_heads=num_heads,
                 head_dim=x_dim // num_heads,
                 cp_method=cp_method,
@@ -768,6 +763,16 @@ class Block(nn.Module):
                 qkv_fusion_option=self.self_attn_qkv_fusion_option,
                 use_fp8=self.use_fp8,
             )
+
+        if self.cross_attention_backend is AttentionBackend.OMNIDREAMS:
+            self.cross_attn = CrossAttention(
+                query_dim=x_dim,
+                context_dim=context_dim,
+                n_heads=num_heads,
+                head_dim=x_dim // num_heads,
+                cp_method=cp_method,
+            )
+        else:
             self.cross_attn = TritonCrossAttention(
                 query_dim=x_dim,
                 context_dim=context_dim,
@@ -818,7 +823,7 @@ class Block(nn.Module):
                 x_dim, elementwise_affine=True, eps=1e-6
             )
             # dense cross view attention
-            if self.attention_backend is AttentionBackend.OMNIDREAMS:
+            if self.cross_attention_backend is AttentionBackend.OMNIDREAMS:
                 self.cross_view_attn = CrossAttention(
                     query_dim=x_dim,
                     context_dim=x_dim,

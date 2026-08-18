@@ -124,8 +124,11 @@ class CosmosDiTNetworkConfig(InstantiateConfig):
     cp_method: Literal["ring", "ulysses"] = "ring"
     """Context-parallel attention method for transformer attention ops."""
 
-    attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS
-    """Attention implementation used by every DiT block."""
+    self_attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS
+    """Self-attention implementation used by every DiT block."""
+
+    cross_attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS
+    """Text and cross-view attention implementation used by every DiT block."""
 
     sdpa_backend: SDPABackend = SDPABackend.TRITON
     """SDPA implementation used by accelerated self-attention."""
@@ -209,7 +212,8 @@ class CosmosDiTNetwork(nn.Module):
                     adaln_lora_dim=self.config.adaln_lora_dim,
                     enable_cross_view_attn=self.config.enable_cross_view_attn,
                     cp_method=self.config.cp_method,
-                    attention_backend=self.config.attention_backend,
+                    self_attention_backend=self.config.self_attention_backend,
+                    cross_attention_backend=self.config.cross_attention_backend,
                     sdpa_backend=self.sdpa_backend,
                     cross_attn_sdpa_backend=self.cross_attn_sdpa_backend,
                     self_attn_qkv_fusion_option=self.self_attn_qkv_fusion_option,

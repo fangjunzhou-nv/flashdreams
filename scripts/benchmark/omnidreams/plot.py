@@ -39,6 +39,20 @@ _END_TO_END_PANELS = (
 )
 _PANELS = (*_MODULE_PANELS, *_END_TO_END_PANELS)
 
+_END_TO_END_LABELS = {
+    "omnidreams_torch": "Omnidreams PyTorch\nself + cross",
+    "triton_fa2_fp8_full": "Triton FA2 FP8\nQKV self + KV cross",
+    "triton_cudnn_bf16_full": "Triton cuDNN BF16\nQKV self + KV cross",
+    "triton_cudnn_bf16_full_omnidreams_cross": (
+        "Triton cuDNN BF16\nQKV self + Omnidreams cross"
+    ),
+    "cuda": "Native CUDA FP8\ncuDNN",
+    "cuda_sparge": "Native CUDA FP8\nSparge",
+    "cuda_sage3": "Native CUDA BF16\nSage3",
+    "cuda_sage3_fp8": "Native CUDA FP8\nSage3",
+}
+"""Compact labels for the selected mixed self/cross end-to-end configurations."""
+
 BenchmarkValues = dict[str, dict[str, float]]
 Panel = tuple[str, str]
 
@@ -164,21 +178,39 @@ def _subtitle(payload: dict[str, object], extra: dict[str, object]) -> str:
     return " · ".join(parts)
 
 
-def _configuration_label(implementation: str) -> str:
-    """Format a stable implementation name as a compact axis label."""
+def _configuration_label(
+    implementation: str,
+    *,
+    end_to_end: bool = False,
+) -> str:
+    """Format a stable implementation name as a compact axis label.
+
+    Args:
+        implementation: Stable benchmark implementation identifier.
+        end_to_end: Whether to describe both self- and cross-attention branches.
+
+    Returns:
+        Compact multi-line label for the plot axis.
+    """
+    if end_to_end:
+        label = _END_TO_END_LABELS.get(implementation)
+        if label is not None:
+            return label
+    if implementation == "triton_cudnn_bf16_full_omnidreams_cross":
+        return _END_TO_END_LABELS[implementation]
     if implementation == "omnidreams_torch":
         return "Omnidreams\nPyTorch"
     if implementation == "cuda":
         return "Native\nCUDA"
     if implementation.startswith("triton_"):
-        backend, precision, fusion = implementation.removeprefix("triton_").split(
-            "_", maxsplit=2
-        )
-        backend_label = "cuDNN" if backend == "cudnn" else backend.upper()
-        fusion_label = (
-            "FUSE QKV" if fusion == "full" else fusion.replace("_", " ").upper()
-        )
-        return f"{backend_label}\n{precision.upper()}\n{fusion_label}"
+        parts = implementation.removeprefix("triton_").split("_", maxsplit=2)
+        if len(parts) == 3:
+            backend, precision, fusion = parts
+            backend_label = "cuDNN" if backend == "cudnn" else backend.upper()
+            fusion_label = (
+                "FUSE QKV" if fusion == "full" else fusion.replace("_", " ").upper()
+            )
+            return f"{backend_label}\n{precision.upper()}\n{fusion_label}"
     return implementation.replace("_", "\n")
 
 
@@ -243,6 +275,7 @@ def _write_bar_figure(
         configurations: Stable implementation order.
         subtitle: Benchmark environment summary.
     """
+    end_to_end = panels == _END_TO_END_PANELS
     panel_configurations = _panel_configurations(panels, values, configurations)
     figure, axes = plt.subplots(
         len(panels),
@@ -308,12 +341,19 @@ def _write_bar_figure(
         axes_item.set_xticks(
             range(len(ordered_configurations)),
             labels=[
-                _configuration_label(configuration)
+                _configuration_label(
+                    configuration,
+                    end_to_end=end_to_end,
+                )
                 for configuration in ordered_configurations
             ],
         )
 
-    figure.supxlabel("Configuration (SDPA backend / precision / QKV fusion)")
+    figure.supxlabel(
+        "Configuration (self-attention + cross-attention)"
+        if end_to_end
+        else "Configuration (SDPA backend / precision / QKV fusion)"
+    )
     figure.suptitle(f"{title}\n{subtitle}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path)

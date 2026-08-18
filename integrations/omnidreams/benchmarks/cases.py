@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import pytest
 import torch
@@ -36,8 +37,11 @@ class AttentionBenchmarkCase:
     implementation: str
     """Stable implementation name stored in benchmark metadata."""
 
-    attention_backend: AttentionBackend
-    """PyTorch network backend configured for this case."""
+    self_attention_backend: AttentionBackend
+    """Self-attention implementation configured for this case."""
+
+    cross_attention_backend: AttentionBackend
+    """Cross-attention implementation configured for this case."""
 
     sdpa_backend: SDPABackend
     """SDPA backend configured for accelerated self-attention."""
@@ -60,6 +64,12 @@ class AttentionBenchmarkCase:
     native_dit: bool = False
     """Whether the full-pipeline case bypasses the PyTorch network."""
 
+    native_dit_backend: Literal["fp8_kvcache_cudnn", "bf16"] = "fp8_kvcache_cudnn"
+    """Native DiT compute backend used when ``native_dit`` is enabled."""
+
+    native_attention_backend: Literal["cudnn", "sparge", "sage3", "sage3_fp8"] = "cudnn"
+    """Native attention backend used when ``native_dit`` is enabled."""
+
     minimum_compute_capability: tuple[int, int] | None = None
     """Minimum CUDA compute capability; ``None`` accepts any CUDA device."""
 
@@ -69,122 +79,107 @@ class AttentionBenchmarkCase:
         return self.implementation.replace("_", "-")
 
 
-OMNIDREAMS_TORCH_CASE = AttentionBenchmarkCase(
-    implementation="omnidreams_torch",
-    attention_backend=AttentionBackend.OMNIDREAMS,
-    sdpa_backend=SDPABackend.CUDNN,
-    self_attention_operator="cudnn",
-    cross_attention_operator="cudnn",
-    use_fp8=False,
-    self_attn_qkv_fusion_option=QKVFusionOption.NONE,
-    cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
-)
-
-TRITON_CUDNN_CASE = AttentionBenchmarkCase(
-    implementation="triton_cudnn",
-    attention_backend=AttentionBackend.TRITON,
-    sdpa_backend=SDPABackend.CUDNN,
-    self_attention_operator="torch_cudnn_sdpa",
-    cross_attention_operator="triton_fa2",
-    minimum_compute_capability=(9, 0),
-)
-
-TRITON_FA2_CASE = AttentionBenchmarkCase(
-    implementation="triton_fa2",
-    attention_backend=AttentionBackend.TRITON,
-    sdpa_backend=SDPABackend.TRITON,
-    self_attention_operator="triton_fa2",
-    cross_attention_operator="triton_fa2",
-    minimum_compute_capability=(9, 0),
-)
-
-NATIVE_CUDA_CASE = AttentionBenchmarkCase(
-    implementation="cuda",
-    attention_backend=AttentionBackend.OMNIDREAMS,
-    sdpa_backend=SDPABackend.CUDNN,
-    self_attention_operator="cudnn",
-    cross_attention_operator="cudnn",
-    use_fp8=False,
-    self_attn_qkv_fusion_option=QKVFusionOption.NONE,
-    cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
-    native_dit=True,
-)
-
-PYTORCH_ATTENTION_CASES = (
-    OMNIDREAMS_TORCH_CASE,
-    TRITON_CUDNN_CASE,
-    TRITON_FA2_CASE,
-)
-"""Attention cases that execute the PyTorch DiT network."""
-
-ATTENTION_POLICY_CASES = (
-    OMNIDREAMS_TORCH_CASE,
-    *(
-        AttentionBenchmarkCase(
-            implementation=(
-                f"triton_{'fa2' if sdpa_backend is SDPABackend.TRITON else 'cudnn'}_"
-                f"{'fp8' if use_fp8 else 'bf16'}_{qkv_fusion_option.value}"
-            ),
-            attention_backend=AttentionBackend.TRITON,
-            sdpa_backend=sdpa_backend,
-            self_attention_operator=(
-                "triton_fa2"
-                if sdpa_backend is SDPABackend.TRITON
-                else "torch_cudnn_sdpa"
-            ),
-            cross_attention_operator=(
-                "triton_fa2"
-                if sdpa_backend is SDPABackend.TRITON
-                else "torch_cudnn_sdpa"
-            ),
-            use_fp8=use_fp8,
-            self_attn_qkv_fusion_option=qkv_fusion_option,
-            cross_attn_qkv_fusion_option=(
-                qkv_fusion_option
-                if qkv_fusion_option is not QKVFusionOption.FULL
-                else QKVFusionOption.FUSE_KV
-            ),
-            minimum_compute_capability=(
-                (9, 0) if use_fp8 or sdpa_backend is SDPABackend.TRITON else None
-            ),
-        )
-        for sdpa_backend in SDPABackend
-        for use_fp8 in (False, True)
-        for qkv_fusion_option in (
-            QKVFusionOption.NONE,
-            QKVFusionOption.FUSE_KV,
-            QKVFusionOption.FULL,
-        )
+BENCHMARK_CASES = [
+    AttentionBenchmarkCase(
+        implementation="omnidreams_torch",
+        self_attention_backend=AttentionBackend.OMNIDREAMS,
+        cross_attention_backend=AttentionBackend.OMNIDREAMS,
+        sdpa_backend=SDPABackend.CUDNN,
+        self_attention_operator="cudnn",
+        cross_attention_operator="cudnn",
+        use_fp8=False,
+        self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
     ),
-)
-"""Omnidreams reference plus every PyTorch backend, precision, and fusion row.
+    AttentionBenchmarkCase(
+        implementation="triton_fa2_fp8_full",
+        self_attention_backend=AttentionBackend.TRITON,
+        cross_attention_backend=AttentionBackend.TRITON,
+        sdpa_backend=SDPABackend.TRITON,
+        self_attention_operator="triton_fa2",
+        cross_attention_operator="triton_fa2",
+        minimum_compute_capability=(9, 0),
+    ),
+    AttentionBenchmarkCase(
+        implementation="triton_cudnn_bf16_full",
+        self_attention_backend=AttentionBackend.TRITON,
+        cross_attention_backend=AttentionBackend.TRITON,
+        sdpa_backend=SDPABackend.CUDNN,
+        self_attention_operator="torch_cudnn_sdpa",
+        cross_attention_operator="torch_cudnn_sdpa",
+        use_fp8=False,
+    ),
+    AttentionBenchmarkCase(
+        implementation="triton_cudnn_bf16_full_omnidreams_cross",
+        self_attention_backend=AttentionBackend.TRITON,
+        cross_attention_backend=AttentionBackend.OMNIDREAMS,
+        sdpa_backend=SDPABackend.CUDNN,
+        self_attention_operator="torch_cudnn_sdpa",
+        cross_attention_operator="cudnn",
+        use_fp8=False,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+    ),
+    AttentionBenchmarkCase(
+        implementation="cuda",
+        self_attention_backend=AttentionBackend.OMNIDREAMS,
+        cross_attention_backend=AttentionBackend.OMNIDREAMS,
+        sdpa_backend=SDPABackend.CUDNN,
+        self_attention_operator="cudnn",
+        cross_attention_operator="cudnn",
+        use_fp8=False,
+        self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        native_dit=True,
+    ),
+    AttentionBenchmarkCase(
+        implementation="cuda_sparge",
+        self_attention_backend=AttentionBackend.OMNIDREAMS,
+        cross_attention_backend=AttentionBackend.OMNIDREAMS,
+        sdpa_backend=SDPABackend.CUDNN,
+        self_attention_operator="sparge",
+        cross_attention_operator="sparge",
+        use_fp8=False,
+        self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        native_dit=True,
+        native_attention_backend="sparge",
+        minimum_compute_capability=(12, 0),
+    ),
+    AttentionBenchmarkCase(
+        implementation="cuda_sage3",
+        self_attention_backend=AttentionBackend.OMNIDREAMS,
+        cross_attention_backend=AttentionBackend.OMNIDREAMS,
+        sdpa_backend=SDPABackend.CUDNN,
+        self_attention_operator="sage3",
+        cross_attention_operator="sage3",
+        use_fp8=False,
+        self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        native_dit=True,
+        native_dit_backend="bf16",
+        native_attention_backend="sage3",
+        minimum_compute_capability=(12, 0),
+    ),
+    AttentionBenchmarkCase(
+        implementation="cuda_sage3_fp8",
+        self_attention_backend=AttentionBackend.OMNIDREAMS,
+        cross_attention_backend=AttentionBackend.OMNIDREAMS,
+        sdpa_backend=SDPABackend.CUDNN,
+        self_attention_operator="sage3_fp8",
+        cross_attention_operator="sage3_fp8",
+        use_fp8=False,
+        self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        native_dit=True,
+        native_attention_backend="sage3_fp8",
+        minimum_compute_capability=(12, 0),
+    ),
+]
+"""Attention cases exercised by the OmniDreams benchmarks.
 
-Full QKV fusion applies to self-attention; the unequal-width production text
-cross-attention branch retains K/V fusion for those block rows.
+Full QKV fusion only applies to self-attention because production text
+cross-attention has unequal query and context widths.
 """
-
-MODULE_CROSS_ATTENTION_CASES = tuple(
-    case
-    for case in ATTENTION_POLICY_CASES
-    if case.attention_backend is AttentionBackend.OMNIDREAMS
-    or case.self_attn_qkv_fusion_option is not QKVFusionOption.FULL
-)
-"""Module cases valid for unequal-width production text cross-attention."""
-
-CROSS_ATTENTION_CASES = (OMNIDREAMS_TORCH_CASE, TRITON_CUDNN_CASE)
-"""One case per concrete cross-attention implementation."""
-
-PIPELINE_CASES = (*ATTENTION_POLICY_CASES, NATIVE_CUDA_CASE)
-"""Attention cases exercised by the full-pipeline benchmark."""
-
-assert {case.attention_backend for case in PYTORCH_ATTENTION_CASES} == set(
-    AttentionBackend
-), "Every AttentionBackend must have a PyTorch benchmark case"
-assert {
-    case.sdpa_backend
-    for case in PYTORCH_ATTENTION_CASES
-    if case.attention_backend is AttentionBackend.TRITON
-} == set(SDPABackend), "Every SDPABackend must have a Triton benchmark case"
 
 
 def skip_unsupported_device(
