@@ -26,7 +26,10 @@ from einops import rearrange
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from flashdreams.accelerated.multi_head_attention_triton import SDPABackend
+from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
+    SDPABackend,
+)
 from flashdreams.core.distributed.context_parallel import (
     cat_outputs_cp,
     split_inputs_cp,
@@ -114,6 +117,14 @@ class WanDiTNetworkConfig(InstantiateConfig):
     """Self- and text cross-attention implementation used by every block."""
     sdpa_backend: SDPABackend = SDPABackend.TRITON
     """SDPA implementation used by accelerated self-attention."""
+    cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON
+    """SDPA implementation used by accelerated cross-attention."""
+    self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL
+    """Projection fusion policy used by accelerated self-attention."""
+    cross_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV
+    """Projection fusion policy used by accelerated cross-attention."""
+    use_fp8: bool = True
+    """Whether accelerated projections and supported cache storage use FP8."""
 
 
 @dataclass
@@ -183,6 +194,14 @@ class WanDiTNetwork(nn.Module):
         self.cp_method = config.cp_method
         self.attention_backend = AttentionBackend(config.attention_backend)
         self.sdpa_backend = SDPABackend(config.sdpa_backend)
+        self.cross_attn_sdpa_backend = SDPABackend(config.cross_attn_sdpa_backend)
+        self.self_attn_qkv_fusion_option = QKVFusionOption(
+            config.self_attn_qkv_fusion_option
+        )
+        self.cross_attn_qkv_fusion_option = QKVFusionOption(
+            config.cross_attn_qkv_fusion_option
+        )
+        self.use_fp8 = config.use_fp8
 
         # Embedding layers
         in_dim = config.in_dim + 1 if self.concat_padding_mask else config.in_dim
@@ -240,6 +259,10 @@ class WanDiTNetwork(nn.Module):
             cp_method=self.cp_method,
             attention_backend=self.attention_backend,
             sdpa_backend=self.sdpa_backend,
+            cross_attn_sdpa_backend=self.cross_attn_sdpa_backend,
+            self_attn_qkv_fusion_option=self.self_attn_qkv_fusion_option,
+            cross_attn_qkv_fusion_option=self.cross_attn_qkv_fusion_option,
+            use_fp8=self.use_fp8,
         )
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None = None) -> None:

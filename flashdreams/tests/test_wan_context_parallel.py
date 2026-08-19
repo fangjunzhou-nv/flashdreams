@@ -8,7 +8,6 @@ from typing import Any, cast
 import pytest
 import torch
 
-from flashdreams.accelerated.multi_head_attention import AttentionType
 from flashdreams.accelerated.multi_head_attention_triton import (
     QKVFusionOption,
     SDPABackend,
@@ -172,10 +171,18 @@ def test_wan21_requires_tokens_divisible_by_cp_size(monkeypatch) -> None:
 @pytest.mark.parametrize(
     "sdpa_backend", tuple(SDPABackend), ids=lambda backend: backend.value
 )
-def test_wan_network_propagates_sdpa_backend(
+@pytest.mark.parametrize("use_fp8", (False, True), ids=("bf16", "fp8"))
+@pytest.mark.parametrize(
+    "qkv_fusion_option",
+    tuple(QKVFusionOption),
+    ids=lambda option: option.value.replace("_", "-"),
+)
+def test_wan_network_propagates_attention_options(
     sdpa_backend: SDPABackend,
+    use_fp8: bool,
+    qkv_fusion_option: QKVFusionOption,
 ) -> None:
-    """Propagate the configured SDPA implementation through every DiT block."""
+    """Propagate accelerated attention options through every DiT block."""
     config = WanDiTNetworkConfig(
         dim=64,
         ffn_dim=128,
@@ -184,22 +191,26 @@ def test_wan_network_propagates_sdpa_backend(
         patch_embedding_type="linear",
         attention_backend=wan_modules.AttentionBackend.TRITON,
         sdpa_backend=sdpa_backend,
+        cross_attn_sdpa_backend=sdpa_backend,
+        self_attn_qkv_fusion_option=qkv_fusion_option,
+        cross_attn_qkv_fusion_option=qkv_fusion_option,
+        use_fp8=use_fp8,
     )
 
     network = config.setup()
     block = network.blocks[0]
 
-    assert config.sdpa_backend is sdpa_backend
     assert network.sdpa_backend is sdpa_backend
-    assert block.sdpa_backend is sdpa_backend
+    assert network.cross_attn_sdpa_backend is sdpa_backend
+    assert network.self_attn_qkv_fusion_option is qkv_fusion_option
+    assert network.cross_attn_qkv_fusion_option is qkv_fusion_option
+    assert network.use_fp8 is use_fp8
     assert isinstance(block.self_attn, TritonMultiHeadAttention)
-    assert block.self_attn.qkv_fusion_option is QKVFusionOption.FULL
-    assert block.self_attn.sdpa_backend is sdpa_backend
     assert isinstance(block.cross_attn, wan_modules.TritonCrossAttention)
-    assert block.cross_attn.attention_type is AttentionType.CROSS_ATTENTION
-    assert block.cross_attn.qkv_fusion_option is QKVFusionOption.FUSE_KV
-    assert block.cross_attn.use_fp8 is True
-    assert block.cross_attn.sdpa_backend is SDPABackend.TRITON
+    for attention in (block.self_attn, block.cross_attn):
+        assert attention.sdpa_backend is sdpa_backend
+        assert attention.qkv_fusion_option is qkv_fusion_option
+        assert attention.use_fp8 is use_fp8
 
 
 def test_triton_attention_registers_only_wan_checkpoint_names() -> None:

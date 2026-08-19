@@ -51,7 +51,7 @@ class AttentionBackend(str, Enum):
     """Use Wan's context-parallel attention implementation."""
 
     TRITON = "triton"
-    """Use FP8-projected Triton self- and text cross-attention."""
+    """Use accelerated Triton self- and text cross-attention."""
 
 
 def sinusoidal_embedding_1d(dim: int, position: Tensor) -> Tensor:
@@ -448,6 +448,8 @@ class TritonSelfAttention(TritonMultiHeadAttention):
         eps: float = 1e-6,
         apply_rope_before_kvcache: bool = True,
         cp_method: Literal["ring", "ulysses"] = "ring",
+        qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
+        use_fp8: bool = True,
         sdpa_backend: SDPABackend = SDPABackend.TRITON,
     ) -> None:
         """Initialize accelerated attention with Wan projection and RoPE policies.
@@ -462,6 +464,8 @@ class TritonSelfAttention(TritonMultiHeadAttention):
             apply_rope_before_kvcache: Whether keys receive RoPE before cache writes.
                 Triton requires ``True``.
             cp_method: Context-parallel method retained for constructor compatibility.
+            qkv_fusion_option: Projection fusion policy.
+            use_fp8: Whether projections and supported cache storage use FP8.
             sdpa_backend: Scaled-dot-product attention implementation.
 
         Raises:
@@ -486,11 +490,11 @@ class TritonSelfAttention(TritonMultiHeadAttention):
             head_dim=head_dim,
             context_dim=context_dim,
             attention_type=AttentionType.SELF_ATTENTION,
-            qkv_fusion_option=QKVFusionOption.FULL,
+            qkv_fusion_option=qkv_fusion_option,
             qk_norm_eps=eps,
             qk_norm_scope=QKNormScope.INNER,
             rope_interleaved=True,
-            use_fp8=True,
+            use_fp8=use_fp8,
             sdpa_backend=sdpa_backend,
         )
 
@@ -664,8 +668,11 @@ class TritonCrossAttention(TritonMultiHeadAttention):
         head_dim: int = 64,
         eps: float = 1e-6,
         cp_method: Literal["ring", "ulysses"] = "ring",
+        qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV,
+        use_fp8: bool = True,
+        sdpa_backend: SDPABackend = SDPABackend.TRITON,
     ) -> None:
-        """Initialize FP8 Triton FA2 cross-attention with Wan module names.
+        """Initialize accelerated cross-attention with Wan module names.
 
         Args:
             query_dim: Feature dimension of query tokens and projected output.
@@ -676,6 +683,9 @@ class TritonCrossAttention(TritonMultiHeadAttention):
             eps: Epsilon used by Q/K RMS normalization.
             cp_method: Ignored context-parallel method retained for constructor
                 compatibility with Wan attention.
+            qkv_fusion_option: Projection fusion policy.
+            use_fp8: Whether projections and supported cache storage use FP8.
+            sdpa_backend: Scaled-dot-product attention implementation.
         """
         del cp_method
         super().__init__(
@@ -684,12 +694,12 @@ class TritonCrossAttention(TritonMultiHeadAttention):
             n_heads=n_heads,
             head_dim=head_dim,
             attention_type=AttentionType.CROSS_ATTENTION,
-            qkv_fusion_option=QKVFusionOption.FUSE_KV,
+            qkv_fusion_option=qkv_fusion_option,
             qk_norm_eps=eps,
             qk_norm_scope=QKNormScope.INNER,
             rope_interleaved=False,
-            use_fp8=True,
-            sdpa_backend=SDPABackend.TRITON,
+            use_fp8=use_fp8,
+            sdpa_backend=sdpa_backend,
         )
 
         self.q = nn.Linear(self.query_dim, self.inner_dim, bias=True)
@@ -777,6 +787,10 @@ class Block(nn.Module):
         cp_method: Literal["ring", "ulysses"] = "ring",
         attention_backend: AttentionBackend = AttentionBackend.WAN,
         sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
+        cross_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV,
+        use_fp8: bool = True,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -786,6 +800,12 @@ class Block(nn.Module):
         self.eps = eps
         self.attention_backend = AttentionBackend(attention_backend)
         self.sdpa_backend = SDPABackend(sdpa_backend)
+        self.cross_attn_sdpa_backend = SDPABackend(cross_attn_sdpa_backend)
+        self.self_attn_qkv_fusion_option = QKVFusionOption(self_attn_qkv_fusion_option)
+        self.cross_attn_qkv_fusion_option = QKVFusionOption(
+            cross_attn_qkv_fusion_option
+        )
+        self.use_fp8 = use_fp8
 
         # Core submodules
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -806,6 +826,8 @@ class Block(nn.Module):
                 eps=eps,
                 apply_rope_before_kvcache=apply_rope_before_kvcache,
                 cp_method=cp_method,
+                qkv_fusion_option=self.self_attn_qkv_fusion_option,
+                use_fp8=self.use_fp8,
                 sdpa_backend=self.sdpa_backend,
             )
         self.norm3 = (
@@ -823,6 +845,9 @@ class Block(nn.Module):
                 head_dim=dim // num_heads,
                 eps=eps,
                 cp_method=cp_method,
+                qkv_fusion_option=self.cross_attn_qkv_fusion_option,
+                use_fp8=self.use_fp8,
+                sdpa_backend=self.cross_attn_sdpa_backend,
             )
         else:
             self.cross_attn = CrossAttention(
