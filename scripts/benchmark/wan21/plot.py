@@ -31,10 +31,10 @@ _MODULE_PANELS = (
     ("wan21-dit-self-attention", "Self-attention"),
     ("wan21-dit-block", "DiT block"),
 )
+_PIPELINE_GENERATE_GROUP = "wan21-full-pipeline-generate"
 _END_TO_END_PANELS = (
     ("wan21-t2v-1.3b-dit-network", "T2V 1.3B network eval"),
-    ("wan21-full-pipeline-generate", "Pipeline generate"),
-    ("wan21-full-pipeline-finalize", "Pipeline finalize"),
+    (_PIPELINE_GENERATE_GROUP, "Pipeline generate"),
 )
 _PANELS = (*_MODULE_PANELS, *_END_TO_END_PANELS)
 
@@ -161,7 +161,7 @@ def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
 
 def _subtitle(payload: dict[str, object]) -> str:
     """Build a compact benchmark-environment subtitle."""
-    parts = ["Median latency in ms (lower is faster)"]
+    parts = ["Median latency (lower is faster)"]
     commit_info = payload.get("commit_info")
     commit_id = commit_info.get("id") if isinstance(commit_info, dict) else None
     if isinstance(commit_id, str) and commit_id:
@@ -195,33 +195,35 @@ def _configuration_label(implementation: str) -> str:
 
 
 def _bar_label(
-    latency_ms: float,
-    reference_ms: float,
+    latency: float,
+    reference: float,
     *,
     is_reference: bool,
+    unit: str,
 ) -> str:
     """Format latency and relative performance against PyTorch.
 
     Args:
-        latency_ms: Bar latency in milliseconds.
-        reference_ms: PyTorch reference latency in milliseconds.
+        latency: Bar latency in the displayed unit.
+        reference: PyTorch reference latency in the displayed unit.
         is_reference: Whether the bar is the PyTorch reference.
+        unit: Displayed time unit.
 
     Returns:
         Two-line latency and relative-performance annotation.
     """
-    if latency_ms < 1:
-        latency_label = f"{latency_ms:.3f} ms"
-    elif latency_ms < 10:
-        latency_label = f"{latency_ms:.2f} ms"
+    if latency < 1:
+        latency_label = f"{latency:.3f} {unit}"
+    elif latency < 10:
+        latency_label = f"{latency:.2f} {unit}"
     else:
-        latency_label = f"{latency_ms:.1f} ms"
+        latency_label = f"{latency:.1f} {unit}"
     if is_reference:
         return f"{latency_label}\nreference"
-    if latency_ms < reference_ms:
-        return f"{latency_label}\n{(1 - latency_ms / reference_ms) * 100:.0f}% faster"
-    if latency_ms > reference_ms:
-        return f"{latency_label}\n{(latency_ms / reference_ms - 1) * 100:.0f}% slower"
+    if latency < reference:
+        return f"{latency_label}\n{(1 - latency / reference) * 100:.0f}% faster"
+    if latency > reference:
+        return f"{latency_label}\n{(latency / reference - 1) * 100:.0f}% slower"
     return f"{latency_label}\nsame as reference"
 
 
@@ -268,13 +270,15 @@ def _write_bar_figure(
     )
     axes_list = [axes] if len(panels) == 1 else list(axes)
     for axes_item, (group, panel_title) in zip(axes_list, panels, strict=True):
-        reference = values[group][_REFERENCE_IMPLEMENTATION]
+        scale = 0.001 if group == _PIPELINE_GENERATE_GROUP else 1.0
+        unit = "s" if group == _PIPELINE_GENERATE_GROUP else "ms"
+        reference = values[group][_REFERENCE_IMPLEMENTATION] * scale
         ordered_configurations = sorted(
             panel_configurations,
             key=lambda configuration: values[group].get(configuration, math.inf),
         )
         latencies = [
-            values[group].get(configuration, math.nan)
+            values[group].get(configuration, math.nan) * scale
             for configuration in ordered_configurations
         ]
         colors = [
@@ -289,7 +293,7 @@ def _write_bar_figure(
         finite_latencies = [value for value in latencies if math.isfinite(value)]
         axes_item.set_ylim(0, max(finite_latencies) * 1.2)
         axes_item.set_title(panel_title)
-        axes_item.set_ylabel("Median latency (ms)")
+        axes_item.set_ylabel(f"Median latency ({unit})")
 
         for index, (bar, latency, configuration) in enumerate(
             zip(bars, latencies, ordered_configurations, strict=True)
@@ -310,6 +314,7 @@ def _write_bar_figure(
                     latency,
                     reference,
                     is_reference=configuration == _REFERENCE_IMPLEMENTATION,
+                    unit=unit,
                 ),
                 xy=(bar.get_x() + bar.get_width() / 2, latency),
                 xytext=(0, 3),

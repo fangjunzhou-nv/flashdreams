@@ -31,7 +31,6 @@ _MODULE_PANELS = (("lingbot-camctrl-dit-block", "CamCtrl DiT block"),)
 _END_TO_END_PANELS = (
     ("lingbot-camctrl-dit-network", "Network eval"),
     ("lingbot-full-pipeline-generate", "Pipeline generate"),
-    ("lingbot-full-pipeline-finalize", "Pipeline finalize"),
 )
 _PANELS = (*_MODULE_PANELS, *_END_TO_END_PANELS)
 

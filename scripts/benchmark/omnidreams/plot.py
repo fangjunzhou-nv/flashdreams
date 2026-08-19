@@ -39,7 +39,6 @@ _PIPELINE_GENERATE_PANEL = (
 _END_TO_END_PANELS = (
     ("omnidreams-dit-network", "Network eval"),
     _PIPELINE_GENERATE_PANEL,
-    ("omnidreams-full-pipeline-finalize", "Pipeline finalize"),
 )
 _PANELS = (*_MODULE_PANELS, *_END_TO_END_PANELS)
 
