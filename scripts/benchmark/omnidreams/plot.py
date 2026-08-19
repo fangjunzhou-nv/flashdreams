@@ -113,7 +113,6 @@ def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
 
     values: BenchmarkValues = {group: {} for group, _ in _PANELS}
     configurations: list[str] = []
-    first_extra: dict[str, object] | None = None
 
     for record in payload["benchmarks"]:
         if not isinstance(record, dict):
@@ -121,14 +120,13 @@ def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
         group = record.get("group")
         if not isinstance(group, str) or group not in values:
             continue
-        extra = record.get("extra_info")
-        implementation = (
-            extra.get("implementation") if isinstance(extra, dict) else None
-        )
-        if not isinstance(implementation, str) or not implementation:
+        param = record.get("param")
+        if not isinstance(param, str) or not param:
             raise SystemExit(
-                f"Benchmark {record.get('name', '<unnamed>')} has no implementation"
+                f"Benchmark {record.get('name', '<unnamed>')} has no parameter ID"
             )
+
+        implementation = param.replace("-", "_")
 
         stats = record.get("stats")
         median = stats.get("median") if isinstance(stats, dict) else None
@@ -147,27 +145,18 @@ def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
         values[group][implementation] = median * 1000.0
         if implementation not in configurations:
             configurations.append(implementation)
-        if first_extra is None:
-            first_extra = extra
 
     missing = [group for group, results in values.items() if not results]
-    if missing or first_extra is None:
+    if missing:
         raise SystemExit(
             f"Benchmark JSON {input_path} lacks groups: {', '.join(missing)}"
         )
-    return values, configurations, _subtitle(payload, first_extra)
+    return values, configurations, _subtitle(payload)
 
 
-def _subtitle(payload: dict[str, object], extra: dict[str, object]) -> str:
+def _subtitle(payload: dict[str, object]) -> str:
     """Build a compact benchmark-environment subtitle."""
     parts = ["Median latency in ms (lower is faster)"]
-    gpu = extra.get("gpu")
-    if isinstance(gpu, str) and gpu:
-        parts.append(gpu)
-    warmups = extra.get("warmup_rounds")
-    rounds = extra.get("benchmark_rounds")
-    if isinstance(warmups, int) and isinstance(rounds, int):
-        parts.append(f"{warmups} warmups / {rounds} rounds")
     commit_info = payload.get("commit_info")
     commit_id = commit_info.get("id") if isinstance(commit_info, dict) else None
     if isinstance(commit_id, str) and commit_id:

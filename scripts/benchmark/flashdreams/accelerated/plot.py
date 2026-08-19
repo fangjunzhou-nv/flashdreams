@@ -20,12 +20,21 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import CenteredNorm
+from matplotlib.patches import Rectangle
 
 _DEFAULT_INPUT = Path("artifacts/benchmark/flashdreams/accelerated/benchmark.json")
 _DEFAULT_OUTPUT_DIR = Path("artifacts/benchmark/flashdreams/accelerated")
+_FASTEST_IMPLEMENTATION_COLUMN = "fastest-implementation-config"
+_HIGHLIGHTED_ROWS = {
+    ("head", False, False): "Cosmos",
+    ("inner", True, True): "Wan",
+}
+_REFERENCE_IMPLEMENTATION = "reference-torch"
 
 RowKey = tuple[str, str, bool, bool]
 CellKey = tuple[RowKey, str]
@@ -91,34 +100,30 @@ def _load_matrix(
     rows: list[RowKey] = []
     columns: list[str] = []
     values_ms: dict[CellKey, float] = {}
-    first_extra: dict[str, object] | None = None
 
     for record in payload["benchmarks"]:
         if not isinstance(record, dict):
             continue
-        extra = record.get("extra_info")
-        if not isinstance(extra, dict) or not {
-            "attention_type",
-            "implementation_case",
-            "qk_norm_scope",
-            "rope_interleaved",
-            "bias",
-        }.issubset(extra):
+        group = record.get("group")
+        param = record.get("param")
+        if not isinstance(group, str) or not isinstance(param, str):
             continue
-
-        attention_type = extra["attention_type"]
-        implementation = extra["implementation_case"]
-        norm = extra["qk_norm_scope"]
-        rope_interleaved = extra["rope_interleaved"]
-        bias = extra["bias"]
-        if not all(
-            isinstance(value, str) for value in (attention_type, implementation, norm)
-        ):
-            raise SystemExit("Attention labels in benchmark JSON must be strings")
-        if attention_type not in {"self_attention", "cross_attention"}:
-            raise SystemExit(f"Unsupported attention type {attention_type!r}")
-        if not isinstance(rope_interleaved, bool) or not isinstance(bias, bool):
-            raise SystemExit("Attention RoPE and bias settings must be booleans")
+        match = re.fullmatch(
+            r"multi-head-attention-(self|cross)-norm-(.+)-rope-"
+            r"(interleaved|split)-bias-(on|off)",
+            group,
+        )
+        if match is None:
+            continue
+        attention, norm, rope, bias_state = match.groups()
+        attention_type = f"{attention}_attention"
+        rope_interleaved = rope == "interleaved"
+        bias = bias_state == "on"
+        shared_id = group.removeprefix(f"multi-head-attention-{attention}-")
+        implementation_prefix = f"{shared_id}-"
+        if not param.startswith(implementation_prefix):
+            raise SystemExit(f"Unsupported attention parameter {param!r}")
+        implementation = param.removeprefix(implementation_prefix)
 
         stats = record.get("stats")
         median = stats.get("median") if isinstance(stats, dict) else None
@@ -141,18 +146,13 @@ def _load_matrix(
         if implementation not in columns:
             columns.append(implementation)
         values_ms[cell] = median * 1000.0
-        if first_extra is None:
-            first_extra = extra
 
-    if not values_ms or first_extra is None:
+    if not values_ms:
         raise SystemExit(
             f"Benchmark JSON {input_path} contains no accelerated attention results"
         )
 
     subtitle_parts = ["Median latency in ms (lower is faster)"]
-    gpu = first_extra.get("gpu")
-    if isinstance(gpu, str) and gpu:
-        subtitle_parts.append(gpu)
     commit_info = payload.get("commit_info")
     commit_id = commit_info.get("id") if isinstance(commit_info, dict) else None
     if isinstance(commit_id, str) and commit_id:
@@ -166,10 +166,14 @@ def _load_matrix(
 def _row_label(row: RowKey) -> str:
     _, norm, rope_interleaved, bias = row
     rope = "interleaved" if rope_interleaved else "split"
-    return f"norm {norm} | rope {rope} | bias {'on' if bias else 'off'}"
+    label = f"norm {norm} | rope {rope} | bias {'on' if bias else 'off'}"
+    highlight = _HIGHLIGHTED_ROWS.get((norm, rope_interleaved, bias))
+    return f"{label} | {highlight}" if highlight is not None else label
 
 
 def _column_label(column: str) -> str:
+    if column == _FASTEST_IMPLEMENTATION_COLUMN:
+        return "fastest implementation config"
     return " ".join(
         "fuse qkv" if token == "full" else token for token in column.split("-")
     )
@@ -182,9 +186,9 @@ def _cell_label(
 
     Args:
         value: Cell latency in milliseconds; ``None`` marks a missing result.
-        reference: First-column latency in milliseconds; ``None`` marks a
+        reference: Torch-reference latency in milliseconds; ``None`` marks a
             missing reference.
-        is_reference: Whether the cell is the first column in its row.
+        is_reference: Whether the cell is the torch reference in its row.
 
     Returns:
         Two-line latency and relative-performance annotation.
@@ -221,36 +225,106 @@ def _write_png(
         subtitle: Benchmark environment summary.
     """
     attention_label = attention_type.replace("_", " ").title()
-    matrix = [
-        [values_ms.get((row, column), math.nan) for column in columns] for row in rows
-    ]
+    if _REFERENCE_IMPLEMENTATION not in columns:
+        raise SystemExit("Benchmark results have no reference-torch implementation")
+    display_columns = [*columns, _FASTEST_IMPLEMENTATION_COLUMN]
+    fastest_implementations: dict[RowKey, str | None] = {}
+    matrix = []
+    for row in rows:
+        reference = values_ms.get((row, _REFERENCE_IMPLEMENTATION))
+        fastest = min(
+            (
+                column
+                for column in columns
+                if column != _REFERENCE_IMPLEMENTATION and (row, column) in values_ms
+            ),
+            key=lambda column: values_ms[(row, column)],
+            default=None,
+        )
+        fastest_implementations[row] = fastest
+        relative_values = [
+            values_ms.get((row, column), math.nan) / reference
+            if reference is not None
+            else math.nan
+            for column in columns
+        ]
+        relative_values.append(
+            values_ms[(row, fastest)] / reference
+            if reference is not None and fastest is not None
+            else math.nan
+        )
+        matrix.append(relative_values)
     figure, axes = plt.subplots()
     default_width, default_height = figure.get_size_inches()
     # ponytail: Linear sizing assumes current short labels; measure rendered
     # text extents if benchmark labels become substantially longer.
     figure.set_size_inches(
-        max(default_width, len(columns) * 2.0),
+        max(default_width, len(display_columns) * 2.0),
         max(default_height, len(rows) * 0.75),
     )
-    image = axes.imshow(matrix, aspect="auto", cmap="Blues")
+    image = axes.imshow(
+        matrix,
+        aspect="auto",
+        cmap="RdYlGn_r",
+        norm=CenteredNorm(vcenter=1.0),
+    )
     axes.set_xticks(
-        range(len(columns)),
-        labels=[_column_label(column) for column in columns],
+        range(len(display_columns)),
+        labels=[_column_label(column) for column in display_columns],
         rotation=45,
         ha="right",
         rotation_mode="anchor",
     )
+    axes.axvline(len(columns) - 0.5, color="black", linewidth=1.5)
     axes.set_yticks(range(len(rows)), labels=[_row_label(row) for row in rows])
+    for row_index, (_, norm, rope_interleaved, bias) in enumerate(rows):
+        if (norm, rope_interleaved, bias) in _HIGHLIGHTED_ROWS:
+            axes.add_patch(
+                Rectangle(
+                    (-0.5, row_index - 0.5),
+                    len(display_columns),
+                    1,
+                    fill=False,
+                    edgecolor="black",
+                    linewidth=2.5,
+                    clip_on=False,
+                    zorder=3,
+                )
+            )
     axes.set_xlabel("Implementation configuration")
-    axes.set_ylabel("Attention policy")
+    axes.set_ylabel("Attention configuration")
     axes.set_title(f"{attention_label} performance\n{subtitle}")
     for row_index, row in enumerate(rows):
-        reference = values_ms.get((row, columns[0]))
-        for column_index, column in enumerate(columns):
-            value = values_ms.get((row, column))
+        reference = values_ms.get((row, _REFERENCE_IMPLEMENTATION))
+        for column_index, column in enumerate(display_columns):
+            if column == _FASTEST_IMPLEMENTATION_COLUMN:
+                fastest = fastest_implementations[row]
+                if fastest is None:
+                    value = None
+                    label = "N/A"
+                else:
+                    value = values_ms[(row, fastest)]
+                    relative_label = _cell_label(
+                        value, reference, is_reference=False
+                    ).splitlines()[1]
+                    implementation, backend, precision, fuse_option = _column_label(
+                        fastest
+                    ).split(maxsplit=3)
+                    label = (
+                        f"{implementation} {backend} {precision}\n"
+                        f"{fuse_option}\n{relative_label}"
+                    )
+            else:
+                value = values_ms.get((row, column))
+                label = _cell_label(
+                    value,
+                    reference,
+                    is_reference=column == _REFERENCE_IMPLEMENTATION,
+                )
             text_color = "black"
-            if value is not None:
-                red, green, blue, _ = image.cmap(image.norm(value))
+            relative_value = matrix[row_index][column_index]
+            if math.isfinite(relative_value):
+                red, green, blue, _ = image.cmap(image.norm(relative_value))
                 channels = (red, green, blue)
                 linear = tuple(
                     channel / 12.92
@@ -263,13 +337,17 @@ def _write_png(
             axes.text(
                 column_index,
                 row_index,
-                _cell_label(value, reference, is_reference=column_index == 0),
+                label,
                 ha="center",
                 va="center",
                 color=text_color,
             )
-    colorbar = figure.colorbar(image, ax=axes, label="Median latency (ms)")
-    colorbar.ax.text(0.5, 1.02, "Slower ↑", ha="center", transform=colorbar.ax.transAxes)
+    colorbar = figure.colorbar(
+        image, ax=axes, label="Runtime relative to torch reference (×)"
+    )
+    colorbar.ax.text(
+        0.5, 1.02, "Slower ↑", ha="center", transform=colorbar.ax.transAxes
+    )
     colorbar.ax.text(
         0.5,
         -0.04,
