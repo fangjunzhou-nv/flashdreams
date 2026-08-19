@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bar plots for Omnidreams module and end-to-end benchmark results."""
+"""Bar plots for LingBot module and end-to-end benchmark results."""
 
 from __future__ import annotations
 
@@ -24,31 +24,21 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-_DEFAULT_INPUT = Path("artifacts/benchmark/omnidreams/benchmark.json")
-_DEFAULT_OUTPUT_DIR = Path("artifacts/benchmark/omnidreams")
+_DEFAULT_INPUT = Path("artifacts/benchmark/lingbot/benchmark.json")
+_DEFAULT_OUTPUT_DIR = Path("artifacts/benchmark/lingbot")
 
-_MODULE_PANELS = (
-    ("omnidreams-dit-self-attention", "Self-attention"),
-    ("omnidreams-dit-cross-attention", "Cross-attention"),
-    ("omnidreams-dit-block", "DiT block"),
-)
-_PIPELINE_GENERATE_PANEL = (
-    "omnidreams-full-pipeline-generate",
-    "Pipeline generate",
-)
+_MODULE_PANELS = (("lingbot-camctrl-dit-block", "CamCtrl DiT block"),)
 _END_TO_END_PANELS = (
-    ("omnidreams-dit-network", "Network eval"),
-    _PIPELINE_GENERATE_PANEL,
-    ("omnidreams-full-pipeline-finalize", "Pipeline finalize"),
+    ("lingbot-camctrl-dit-network", "Network eval"),
+    ("lingbot-full-pipeline-generate", "Pipeline generate"),
+    ("lingbot-full-pipeline-finalize", "Pipeline finalize"),
 )
 _PANELS = (*_MODULE_PANELS, *_END_TO_END_PANELS)
 
+_REFERENCE_IMPLEMENTATION = "wan_torch"
+
 _NATIVE_LABELS = {
-    "omnidreams_torch": "PyTorch Omnidreams BF16",
-    "cuda": "CUDA cuDNN FP8",
-    "cuda_sparge": "CUDA Sparge FP8",
-    "cuda_sage3": "CUDA Sage3 BF16",
-    "cuda_sage3_fp8": "CUDA Sage3 FP8",
+    _REFERENCE_IMPLEMENTATION: "PyTorch Wan BF16",
 }
 """Implementation labels for configurations without parseable Triton IDs."""
 
@@ -56,7 +46,7 @@ _FUSION_LABELS = {
     "none": ("None", "None"),
     "fuse_kv": ("Fuse KV", "Fuse KV"),
     "full": ("Fuse QKV", "Fuse KV"),
-    "full_omnidreams_cross": ("Fuse QKV", "None"),
+    "full_wan_cross": ("Fuse QKV", "None"),
 }
 """Self- and cross-attention labels by stable fusion ID."""
 
@@ -74,7 +64,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         Parsed command-line arguments.
     """
     parser = argparse.ArgumentParser(
-        description="Plot Omnidreams median benchmark latency as bar charts."
+        description="Plot LingBot median benchmark latency as bar charts."
     )
     parser.add_argument(
         "input",
@@ -90,16 +80,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_DEFAULT_OUTPUT_DIR,
         help=f"output directory (default: {_DEFAULT_OUTPUT_DIR})",
     )
-    parser.add_argument(
-        "--pipeline-generate-only",
-        action="store_true",
-        help="write only the pipeline generate benchmark figure",
-    )
     return parser.parse_args(argv)
 
 
 def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
-    """Load Omnidreams median timings and environment metadata.
+    """Load LingBot median timings and environment metadata.
 
     Args:
         input_path: Pytest-benchmark JSON file to parse.
@@ -109,7 +94,7 @@ def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
         and plot subtitle.
 
     Raises:
-        SystemExit: The input cannot be read or lacks complete Omnidreams data.
+        SystemExit: The input cannot be read or lacks complete LingBot data.
     """
     try:
         payload = json.loads(input_path.read_text(encoding="utf-8"))
@@ -158,10 +143,15 @@ def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
         if implementation not in configurations:
             configurations.append(implementation)
 
-    missing = [group for group, results in values.items() if not results]
+    missing = [
+        group
+        for group, results in values.items()
+        if _REFERENCE_IMPLEMENTATION not in results
+    ]
     if missing:
         raise SystemExit(
-            f"Benchmark JSON {input_path} lacks groups: {', '.join(missing)}"
+            f"Benchmark JSON {input_path} lacks {_REFERENCE_IMPLEMENTATION} results "
+            f"for groups: {', '.join(missing)}"
         )
     return values, configurations, _subtitle(payload)
 
@@ -198,11 +188,7 @@ def _configuration_label(implementation: str) -> str:
             implementation_label = f"Triton {backend_label} {precision.upper()}"
     self_fusion, cross_fusion = _FUSION_LABELS.get(fusion, ("None", "None"))
     implementation_label = implementation_label or implementation.replace("_", " ")
-    return (
-        f"{implementation_label}\n"
-        f"Self Attn {self_fusion}\n"
-        f"Cross Attn {cross_fusion}"
-    )
+    return f"{implementation_label}\nSelf Attn {self_fusion}\nCross Attn {cross_fusion}"
 
 
 def _bar_label(
@@ -279,7 +265,7 @@ def _write_bar_figure(
     )
     axes_list = [axes] if len(panels) == 1 else list(axes)
     for axes_item, (group, panel_title) in zip(axes_list, panels, strict=True):
-        reference = values[group]["omnidreams_torch"]
+        reference = values[group][_REFERENCE_IMPLEMENTATION]
         ordered_configurations = sorted(
             panel_configurations,
             key=lambda configuration: values[group].get(configuration, math.inf),
@@ -289,11 +275,7 @@ def _write_bar_figure(
             for configuration in ordered_configurations
         ]
         colors = [
-            "C2"
-            if configuration == "omnidreams_torch"
-            else "C1"
-            if configuration.startswith("cuda")
-            else "C0"
+            "C2" if configuration == _REFERENCE_IMPLEMENTATION else "C0"
             for configuration in ordered_configurations
         ]
         bars = axes_item.bar(
@@ -324,7 +306,7 @@ def _write_bar_figure(
                 _bar_label(
                     latency,
                     reference,
-                    is_reference=configuration == "omnidreams_torch",
+                    is_reference=configuration == _REFERENCE_IMPLEMENTATION,
                 ),
                 xy=(bar.get_x() + bar.get_width() / 2, latency),
                 xytext=(0, 3),
@@ -355,30 +337,21 @@ def _write_bar_figure(
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Generate module and end-to-end Omnidreams benchmark figures."""
+    """Generate module and end-to-end LingBot benchmark figures."""
     args = _parse_args(argv)
     values, configurations, subtitle = _load_results(args.input)
-    if args.pipeline_generate_only:
-        outputs = (
-            (
-                args.output_dir / "pipeline_generate.png",
-                "Omnidreams pipeline generate benchmark",
-                (_PIPELINE_GENERATE_PANEL,),
-            ),
-        )
-    else:
-        outputs = (
-            (
-                args.output_dir / "modules.png",
-                "Omnidreams module benchmarks",
-                _MODULE_PANELS,
-            ),
-            (
-                args.output_dir / "network_pipeline.png",
-                "Omnidreams network and pipeline benchmarks",
-                _END_TO_END_PANELS,
-            ),
-        )
+    outputs = (
+        (
+            args.output_dir / "modules.png",
+            "LingBot module benchmarks",
+            _MODULE_PANELS,
+        ),
+        (
+            args.output_dir / "network_pipeline.png",
+            "LingBot network and pipeline benchmarks",
+            _END_TO_END_PANELS,
+        ),
+    )
     for output_path, title, panels in outputs:
         _write_bar_figure(
             output_path,

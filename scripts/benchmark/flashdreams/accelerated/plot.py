@@ -200,7 +200,7 @@ def _cell_label(
     if reference is None:
         return f"{value:.2f} ms\nreference unavailable"
     if value < reference:
-        return f"{value:.2f} ms\n{(reference / value - 1) * 100:.0f}% faster"
+        return f"{value:.2f} ms\n{(1 - value / reference) * 100:.0f}% faster"
     if value > reference:
         return f"{value:.2f} ms\n{(value / reference - 1) * 100:.0f}% slower"
     return f"{value:.2f} ms\nsame as reference"
