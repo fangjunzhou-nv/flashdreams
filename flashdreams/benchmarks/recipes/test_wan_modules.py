@@ -24,17 +24,20 @@ Run the manual GPU benchmarks with::
 
 from __future__ import annotations
 
-from enum import Enum
-
 import pytest
 import torch
 from pytest_benchmark.fixture import BenchmarkFixture
 
-from flashdreams.accelerated.multi_head_attention_triton import SDPABackend
+from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
+    SDPABackend,
+)
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from flashdreams.recipes.wan.transformer.impl.modules import (
     AttentionBackend,
     Block,
+    TritonCrossAttention,
+    TritonSelfAttention,
 )
 from flashdreams.recipes.wan.transformer.impl.network import (
     WanDiTNetwork1pt3BConfig,
@@ -67,50 +70,32 @@ _BENCHMARK_ROUNDS = 20
 _SEED = 42
 
 
-class _Implementation(str, Enum):
-    """Wan attention implementations covered by the benchmark."""
-
-    WAN_TORCH = "wan_torch"
-    TRITON_CUDNN = "triton_cudnn"
-    TRITON_FA2 = "triton_fa2"
-
-    @property
-    def attention_backend(self) -> AttentionBackend:
-        """Return the DiT attention implementation."""
-        if self is self.WAN_TORCH:
-            return AttentionBackend.WAN
-        return AttentionBackend.TRITON
-
-    @property
-    def sdpa_backend(self) -> SDPABackend:
-        """Return the configured self-attention SDPA implementation."""
-        if self is self.TRITON_FA2:
-            return SDPABackend.TRITON
-        return SDPABackend.CUDNN
-
-    @property
-    def self_attention_operator(self) -> str:
-        """Return the concrete self-attention operator name."""
-        if self is self.WAN_TORCH:
-            return "cudnn"
-        if self is self.TRITON_CUDNN:
-            return "torch_cudnn_sdpa"
-        return "triton_fa2"
-
-    @property
-    def cross_attention_operator(self) -> str:
-        """Return the concrete cross-attention operator name."""
-        if self is self.WAN_TORCH:
-            return "cudnn"
-        return "triton_fa2"
-
-
-assert {case.attention_backend for case in _Implementation} == set(AttentionBackend)
-assert {
-    case.sdpa_backend
-    for case in _Implementation
-    if case.attention_backend is AttentionBackend.TRITON
-} == set(SDPABackend)
+_BENCHMARK_CASES = (
+    pytest.param(
+        AttentionBackend.WAN,
+        SDPABackend.CUDNN,
+        False,
+        QKVFusionOption.NONE,
+        id="wan-torch",
+    ),
+    *(
+        pytest.param(
+            AttentionBackend.TRITON,
+            sdpa_backend,
+            use_fp8,
+            qkv_fusion_option,
+            id=(
+                f"triton-"
+                f"{'fa2' if sdpa_backend is SDPABackend.TRITON else 'cudnn'}-"
+                f"{'fp8' if use_fp8 else 'bf16'}-"
+                f"{qkv_fusion_option.value.replace('_', '-')}"
+            ),
+        )
+        for sdpa_backend in SDPABackend
+        for use_fp8 in (False, True)
+        for qkv_fusion_option in QKVFusionOption
+    ),
+)
 
 
 def _skip_unsupported_device(
@@ -142,6 +127,10 @@ def _make_block(
             cp_method=config.cp_method,
             attention_backend=selected_backend,
             sdpa_backend=config.sdpa_backend,
+            cross_attn_sdpa_backend=config.cross_attn_sdpa_backend,
+            self_attn_qkv_fusion_option=config.self_attn_qkv_fusion_option,
+            cross_attn_qkv_fusion_option=config.cross_attn_qkv_fusion_option,
+            use_fp8=config.use_fp8,
         )
 
     torch.manual_seed(_SEED)
@@ -154,28 +143,54 @@ def _make_block(
     return block
 
 
+def _assert_benchmark_case(
+    block: Block,
+    backend: AttentionBackend,
+    sdpa_backend: SDPABackend,
+    use_fp8: bool,
+    qkv_fusion_option: QKVFusionOption,
+) -> None:
+    assert block.attention_backend is backend
+    if backend is AttentionBackend.WAN:
+        return
+
+    assert isinstance(block.self_attn, TritonSelfAttention)
+    assert isinstance(block.cross_attn, TritonCrossAttention)
+    for attention in (block.self_attn, block.cross_attn):
+        assert attention.sdpa_backend is sdpa_backend
+        assert attention.use_fp8 is use_fp8
+        assert attention.qkv_fusion_option is qkv_fusion_option
+
+
 @pytest.mark.parametrize(
-    "implementation",
-    tuple(_Implementation),
-    ids=lambda implementation: implementation.value.replace("_", "-"),
+    "backend,sdpa_backend,use_fp8,qkv_fusion_option",
+    _BENCHMARK_CASES,
 )
 @torch.inference_mode()
 def test_self_attention_benchmark(
     benchmark: BenchmarkFixture,
-    implementation: _Implementation,
+    backend: AttentionBackend,
+    sdpa_backend: SDPABackend,
+    use_fp8: bool,
+    qkv_fusion_option: QKVFusionOption,
 ) -> None:
     """Benchmark Wan self-attention against a full production KV window."""
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Wan self-attention benchmark requires bfloat16 support.")
 
     device = torch.device("cuda")
-    backend = implementation.attention_backend
     _skip_unsupported_device(backend, device)
     dtype = torch.bfloat16
-    config = WanDiTNetwork1pt3BConfig(sdpa_backend=implementation.sdpa_backend)
+    config = WanDiTNetwork1pt3BConfig(
+        attention_backend=backend,
+        sdpa_backend=sdpa_backend,
+        cross_attn_sdpa_backend=sdpa_backend,
+        self_attn_qkv_fusion_option=qkv_fusion_option,
+        cross_attn_qkv_fusion_option=qkv_fusion_option,
+        use_fp8=use_fp8,
+    )
     block = _make_block(config, backend)
-    assert block.attention_backend is backend
-    assert block.sdpa_backend is implementation.sdpa_backend
+    _assert_benchmark_case(block, backend, sdpa_backend, use_fp8, qkv_fusion_option)
     attention = block.self_attn
     attention.to(device=device, dtype=dtype).eval()
     generator = torch.Generator(device=device).manual_seed(_SEED)
@@ -214,66 +229,11 @@ def test_self_attention_benchmark(
     torch.cuda.synchronize(device)
 
     benchmark.group = "wan-dit-self-attention"
-    benchmark.extra_info.update(
-        {
-            "module": "self_attention",
-            "model_family": "wan",
-            "model_variant": "wan2.1-1.3b",
-            "implementation": implementation.value,
-            "attention_backend": backend.value,
-            "sdpa_backend": implementation.sdpa_backend.value,
-            "self_attention_operator": implementation.self_attention_operator,
-            "projection_backend": (
-                "separate_qkv"
-                if backend is AttentionBackend.WAN
-                else "row_scaled_fp8_fused_qkv_output"
-            ),
-            "batch_shape": [],
-            "flattened_batch_size": 1,
-            "pixel_resolution": [_PIXEL_HEIGHT, _PIXEL_WIDTH],
-            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
-            "attention_grid": [
-                _CHUNK_SIZE_T,
-                _ATTENTION_HEIGHT,
-                _ATTENTION_WIDTH,
-            ],
-            "chunk_tokens": _CHUNK_TOKENS,
-            "window_chunks": _WINDOW_CHUNKS,
-            "window_tokens": _WINDOW_TOKENS,
-            "sink_tokens": _SINK_TOKENS,
-            "model_channels": config.dim,
-            "num_heads": config.num_heads,
-            "head_dim": config.dim // config.num_heads,
-            "parameter_count": sum(
-                parameter.numel() for parameter in attention.parameters()
-            ),
-            "checkpoint": "random_init_shared_weights",
-            "dtype": str(dtype),
-            "cache_dtype": str(cache.dtype),
-            "cache_state": "full_window",
-            "cache_prefill_chunks": _WINDOW_CHUNKS,
-            "benchmark_chunk_idx": benchmark_chunk_idx,
-            "cache_update_bookkeeping": "excluded_from_timing",
-            "rope_interleaved": True,
-            "context_parallel_size": 1,
-            "compiled": False,
-            "cuda_graph": False,
-            "gpu": torch.cuda.get_device_name(device),
-            "compute_capability": list(torch.cuda.get_device_capability(device)),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "seed": _SEED,
-        }
-    )
 
     # Roll outside timing, then repeatedly overwrite the same slot to mirror
     # multiple denoising evaluations at one autoregressive position.
     cache.before_update(benchmark_chunk_idx)
     torch.cuda.synchronize(device)
-    torch.cuda.reset_peak_memory_stats(device)
 
     def synchronized_forward() -> torch.Tensor:
         result = attention(x, cache, rope_freqs[benchmark_chunk_idx])
@@ -287,36 +247,40 @@ def test_self_attention_benchmark(
         warmup_rounds=_WARMUP_ROUNDS,
     )
     cache.after_update(benchmark_chunk_idx)
-    benchmark.extra_info["peak_cuda_memory_bytes"] = torch.cuda.max_memory_allocated(
-        device
-    )
 
     assert output.shape == x.shape
     assert torch.isfinite(output).all()
 
 
 @pytest.mark.parametrize(
-    "implementation",
-    tuple(_Implementation),
-    ids=lambda implementation: implementation.value.replace("_", "-"),
+    "backend,sdpa_backend,use_fp8,qkv_fusion_option",
+    _BENCHMARK_CASES,
 )
 @torch.inference_mode()
 def test_dit_block_benchmark(
     benchmark: BenchmarkFixture,
-    implementation: _Implementation,
+    backend: AttentionBackend,
+    sdpa_backend: SDPABackend,
+    use_fp8: bool,
+    qkv_fusion_option: QKVFusionOption,
 ) -> None:
     """Benchmark a production-configured Wan DiT block at steady state."""
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Wan DiT block benchmark requires bfloat16 support.")
 
     device = torch.device("cuda")
-    backend = implementation.attention_backend
     _skip_unsupported_device(backend, device)
     dtype = torch.bfloat16
-    config = WanDiTNetwork1pt3BConfig(sdpa_backend=implementation.sdpa_backend)
+    config = WanDiTNetwork1pt3BConfig(
+        attention_backend=backend,
+        sdpa_backend=sdpa_backend,
+        cross_attn_sdpa_backend=sdpa_backend,
+        self_attn_qkv_fusion_option=qkv_fusion_option,
+        cross_attn_qkv_fusion_option=qkv_fusion_option,
+        use_fp8=use_fp8,
+    )
     block = _make_block(config, backend).to(device=device, dtype=dtype).eval()
-    assert block.attention_backend is backend
-    assert block.sdpa_backend is implementation.sdpa_backend
+    _assert_benchmark_case(block, backend, sdpa_backend, use_fp8, qkv_fusion_option)
     block.update_parameters_after_loading_checkpoint()
     generator = torch.Generator(device=device).manual_seed(_SEED)
 
@@ -373,68 +337,9 @@ def test_dit_block_benchmark(
     torch.cuda.synchronize(device)
 
     benchmark.group = "wan-dit-block"
-    benchmark.extra_info.update(
-        {
-            "module": "Block",
-            "model_family": "wan",
-            "model_variant": "wan2.1-1.3b",
-            "implementation": implementation.value,
-            "attention_backend": backend.value,
-            "sdpa_backend": implementation.sdpa_backend.value,
-            "self_attention_operator": implementation.self_attention_operator,
-            "cross_attention_operator": implementation.cross_attention_operator,
-            "projection_backend": (
-                "separate_qkv"
-                if backend is AttentionBackend.WAN
-                else "row_scaled_fp8_fused_qkv_output"
-            ),
-            "batch_shape": [],
-            "flattened_batch_size": 1,
-            "pixel_resolution": [_PIXEL_HEIGHT, _PIXEL_WIDTH],
-            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
-            "attention_grid": [
-                _CHUNK_SIZE_T,
-                _ATTENTION_HEIGHT,
-                _ATTENTION_WIDTH,
-            ],
-            "chunk_tokens": _CHUNK_TOKENS,
-            "window_chunks": _WINDOW_CHUNKS,
-            "window_tokens": _WINDOW_TOKENS,
-            "sink_tokens": _SINK_TOKENS,
-            "text_tokens": _TEXT_TOKENS,
-            "model_channels": config.dim,
-            "ffn_channels": config.ffn_dim,
-            "num_heads": config.num_heads,
-            "head_dim": config.dim // config.num_heads,
-            "parameter_count": sum(
-                parameter.numel() for parameter in block.parameters()
-            ),
-            "checkpoint": "random_init_shared_weights",
-            "dtype": str(dtype),
-            "self_attention_cache_dtype": str(cache.self_attn.dtype),
-            "cross_attention_cache_dtype": str(cache.cross_attn.text.dtype),
-            "cache_state": "full_window_static_text",
-            "cache_prefill_chunks": _WINDOW_CHUNKS,
-            "benchmark_chunk_idx": benchmark_chunk_idx,
-            "cache_update_bookkeeping": "excluded_from_timing",
-            "rope_interleaved": True,
-            "context_parallel_size": 1,
-            "compiled": False,
-            "cuda_graph": False,
-            "gpu": torch.cuda.get_device_name(device),
-            "compute_capability": list(torch.cuda.get_device_capability(device)),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "seed": _SEED,
-        }
-    )
 
     cache.before_update(benchmark_chunk_idx)
     torch.cuda.synchronize(device)
-    torch.cuda.reset_peak_memory_stats(device)
 
     def synchronized_forward() -> torch.Tensor:
         result = block(
@@ -453,9 +358,6 @@ def test_dit_block_benchmark(
         warmup_rounds=_WARMUP_ROUNDS,
     )
     cache.after_update(benchmark_chunk_idx)
-    benchmark.extra_info["peak_cuda_memory_bytes"] = torch.cuda.max_memory_allocated(
-        device
-    )
 
     assert output.shape == x.shape
     assert torch.isfinite(output).all()

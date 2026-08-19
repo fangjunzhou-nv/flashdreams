@@ -322,60 +322,6 @@ def _benchmark_multi_head_attention(
         )
     )
 
-    cache_dtype = (
-        torch.float8_e4m3fn
-        if case.use_fp8 and case.sdpa_backend is SDPABackend.TRITON
-        else _DTYPE
-    )
-    benchmark.extra_info.update(
-        {
-            "implementation": "triton",
-            "implementation_case": case.id,
-            "attention_type": attention_type.value,
-            "timed_region": (
-                "forward"
-                if attention_type is AttentionType.SELF_ATTENTION
-                else "compute_kv_and_forward"
-            ),
-            "batch_size": _BATCH_SIZE,
-            "query_tokens": _CHUNK_SIZE,
-            "context_tokens": _WINDOW_SIZE,
-            "query_dim": _QUERY_DIM,
-            "context_dim": _QUERY_DIM,
-            "num_heads": _N_HEADS,
-            "head_dim": _HEAD_DIM,
-            "parameter_count": sum(
-                parameter.numel() for parameter in attention.parameters()
-            ),
-            "checkpoint": "random_init_shared_weights",
-            "dtype": str(_DTYPE),
-            "cache_dtype": str(cache_dtype),
-            "bias": bias,
-            "qkv_bias": bias,
-            "output_bias": bias,
-            "qk_norm_scope": qk_norm_scope.value,
-            "rope_interleaved": rope_interleaved,
-            "sdpa_backend": case.sdpa_backend.value,
-            "qkv_fusion_option": case.qkv_fusion_option.value,
-            "use_fp8": case.use_fp8,
-            "cache_state": (
-                "full_rolling_window"
-                if attention_type is AttentionType.SELF_ATTENTION
-                else "rebuilt_static_context"
-            ),
-            "cache_prefill_chunks": (
-                _WINDOW_CHUNKS if attention_type is AttentionType.SELF_ATTENTION else 0
-            ),
-            "gpu": torch.cuda.get_device_name(device),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "seed": _SEED,
-        }
-    )
-
     query = inputs[_WINDOW_CHUNKS]
     query_rope = rope_freqs[_WINDOW_CHUNKS]
     if attention_type is AttentionType.SELF_ATTENTION:
