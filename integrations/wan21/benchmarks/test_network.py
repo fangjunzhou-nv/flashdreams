@@ -38,7 +38,7 @@ from flashdreams.recipes.wan.transformer.impl.network import (
     WanDiTNetwork1pt3BConfig,
 )
 from integrations.wan21.benchmarks.cases import (
-    ATTENTION_CASES,
+    BENCHMARK_CASES,
     AttentionBenchmarkCase,
     skip_unsupported_device,
 )
@@ -92,7 +92,7 @@ def _skip_unsupported_case(
 ) -> None:
     """Skip a case where its hardware or execution mode is unsupported."""
     skip_unsupported_device(case, device)
-    if case.attention_backend is not AttentionBackend.TRITON:
+    if case.self_attention_backend is not AttentionBackend.TRITON:
         return
     if dist.is_initialized() and dist.get_world_size() > 1:
         pytest.skip("Triton attention does not support context parallelism")
@@ -100,7 +100,7 @@ def _skip_unsupported_case(
 
 @pytest.mark.parametrize(
     "case",
-    ATTENTION_CASES,
+    BENCHMARK_CASES,
     ids=lambda case: case.pytest_id,
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
@@ -117,12 +117,16 @@ def test_dit_network_benchmark(
     dtype = torch.bfloat16
     torch.manual_seed(_SEED)
     _skip_unsupported_case(case, device)
-    backend = case.attention_backend
     config = WanDiTNetwork1pt3BConfig(
         patch_embedding_type="conv3d",
         cp_method="ring",
-        attention_backend=backend,
+        self_attention_backend=case.self_attention_backend,
+        cross_attention_backend=case.cross_attention_backend,
         sdpa_backend=case.sdpa_backend,
+        cross_attn_sdpa_backend=case.sdpa_backend,
+        self_attn_qkv_fusion_option=case.self_attn_qkv_fusion_option,
+        cross_attn_qkv_fusion_option=case.cross_attn_qkv_fusion_option,
+        use_fp8=case.use_fp8,
     )
 
     # Avoid materializing the 1.3B random initialization as fp32 CPU weights.
@@ -135,13 +139,18 @@ def test_dit_network_benchmark(
         torch.set_default_dtype(previous_dtype)
     network.eval()
     network.update_parameters_after_loading_checkpoint()
-    parameter_count = sum(parameter.numel() for parameter in network.parameters())
 
     cp_size = dist.get_world_size() if dist.is_initialized() else 1
     cp_group = dist.group.WORLD if cp_size > 1 else None
     network.set_context_parallel_group(cp_group)
     assert all(
-        block.attention_backend is backend and block.sdpa_backend is case.sdpa_backend
+        block.self_attention_backend is case.self_attention_backend
+        and block.cross_attention_backend is case.cross_attention_backend
+        and block.sdpa_backend is case.sdpa_backend
+        and block.cross_attn_sdpa_backend is case.sdpa_backend
+        and block.self_attn_qkv_fusion_option is case.self_attn_qkv_fusion_option
+        and block.cross_attn_qkv_fusion_option is case.cross_attn_qkv_fusion_option
+        and block.use_fp8 is case.use_fp8
         for block in network.blocks
     )
     attention_modules = [
@@ -150,18 +159,16 @@ def test_dit_network_benchmark(
         if isinstance(module, ContextParallelAttention)
     ]
     assert {attention.backend for attention in attention_modules} == (
-        {"cudnn"} if backend is AttentionBackend.WAN else set()
+        {"cudnn"}
+        if AttentionBackend.WAN
+        in (case.self_attention_backend, case.cross_attention_backend)
+        else set()
     )
     cp_enabled_attention_modules = [
         attention
         for attention in attention_modules
         if attention.is_context_parallel_enabled()
     ]
-    local_attention_methods = {
-        attention.method
-        for attention in attention_modules
-        if not attention.is_context_parallel_enabled()
-    }
     assert all(
         attention.context_parallel_size() == cp_size
         for attention in cp_enabled_attention_modules
@@ -170,7 +177,9 @@ def test_dit_network_benchmark(
         attention.method == config.cp_method
         for attention in cp_enabled_attention_modules
     )
-    assert bool(cp_enabled_attention_modules) == (cp_size > 1)
+    assert bool(cp_enabled_attention_modules) == (
+        case.self_attention_backend is AttentionBackend.WAN and cp_size > 1
+    )
 
     assert _GLOBAL_CHUNK_TOKENS % cp_size == 0
     assert _GLOBAL_WINDOW_TOKENS % cp_size == 0
@@ -241,92 +250,6 @@ def test_dit_network_benchmark(
     del output
 
     benchmark.group = "wan21-t2v-1.3b-dit-network"
-    benchmark.extra_info.update(
-        {
-            "network": "WanDiTNetwork1pt3B",
-            "integration": "wan21",
-            "model_family": "wan",
-            "model_variant": "wan21-t2v-1.3b-480p",
-            "implementation": case.implementation,
-            "execution_backend": "pytorch",
-            "attention_backend": backend.value,
-            "sdpa_backend": case.sdpa_backend.value,
-            "self_attention_operator": case.self_attention_operator,
-            "cross_attention_operator": case.cross_attention_operator,
-            "projection_backend": (
-                "separate_qkv"
-                if backend is AttentionBackend.WAN
-                else "row_scaled_fp8_fused_qkv_output"
-            ),
-            "batch_shape": [],
-            "flattened_batch_size": 1,
-            "pixel_resolution": [_PIXEL_HEIGHT, _PIXEL_WIDTH],
-            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
-            "attention_grid": [
-                _CHUNK_SIZE_T,
-                _ATTENTION_HEIGHT,
-                _ATTENTION_WIDTH,
-            ],
-            "global_chunk_tokens": _GLOBAL_CHUNK_TOKENS,
-            "local_chunk_tokens": chunk_tokens,
-            "global_window_tokens": _GLOBAL_WINDOW_TOKENS,
-            "local_window_tokens": window_tokens,
-            "global_sink_tokens": 0,
-            "local_sink_tokens": 0,
-            "text_tokens": _TEXT_TOKENS,
-            "input_patch_channels": config.in_dim * patch_volume,
-            "output_patch_channels": config.out_dim * patch_volume,
-            "model_channels": config.dim,
-            "ffn_channels": config.ffn_dim,
-            "num_blocks": config.num_layers,
-            "num_heads": config.num_heads,
-            "head_dim": config.dim // config.num_heads,
-            "parameter_count": parameter_count,
-            "checkpoint": "random_init_seed_matched",
-            "dtype": str(dtype),
-            "self_attention_cache_dtype": str(cache[0].self_attn.dtype),
-            "cross_attention_cache_dtype": str(cache[0].cross_attn.text.dtype),
-            "self_attention_context_parallel_method": (
-                config.cp_method if backend is AttentionBackend.WAN else None
-            ),
-            "local_attention_methods": sorted(local_attention_methods),
-            "context_parallel_size": cp_size,
-            "context_parallel_attention_modules": len(cp_enabled_attention_modules),
-            "local_attention_modules": (
-                len(attention_modules) - len(cp_enabled_attention_modules)
-            ),
-            "distributed_sample_alignment": "barrier_before_each_round",
-            "compiled": True,
-            "compile_mode": "max-autotune-no-cudagraphs",
-            "cuda_graph_configured": True,
-            "cuda_graph_selected": False,
-            "cuda_graph_dispatch": "drain",
-            "cuda_graph_capture_ar_index": capture_ar_index,
-            "cuda_graph_warmup_iters": _CUDA_GRAPH_WARMUP_ITERS,
-            "cache_state": "single_full_chunk_repeated_scheduler_slot",
-            "benchmark_ar_index": 0,
-            "cache_update_bookkeeping": "excluded_from_timing",
-            "diffusion_timestep": _DIFFUSION_TIMESTEP,
-            "pipeline_guidance_scale": _PIPELINE_GUIDANCE_SCALE,
-            "classifier_free_guidance_branch": "conditional",
-            "rope_interleaved": True,
-            "global_rank": dist.get_rank() if dist.is_initialized() else 0,
-            "gpu": torch.cuda.get_device_name(device),
-            "compute_capability": list(torch.cuda.get_device_capability(device)),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "autotune_drain_rounds": _AUTOTUNE_DRAIN_ROUNDS,
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "compiler_cache_state": (
-                "host-dependent; compile and autotune excluded from measured rounds"
-            ),
-            "seed": _SEED,
-        }
-    )
-
-    torch.cuda.reset_peak_memory_stats(device)
 
     def synchronized_forward() -> torch.Tensor:
         result = forward()
@@ -341,9 +264,6 @@ def test_dit_network_benchmark(
         warmup_rounds=_WARMUP_ROUNDS,
     )
     cache.after_update(0)
-    benchmark.extra_info["peak_cuda_memory_bytes"] = torch.cuda.max_memory_allocated(
-        device
-    )
 
     expected_output_shape = (chunk_tokens, config.out_dim * patch_volume)
     assert output.shape == expected_output_shape

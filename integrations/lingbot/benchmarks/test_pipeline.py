@@ -25,7 +25,6 @@ Run the manual GPU benchmarks with::
 from __future__ import annotations
 
 import os
-from typing import Literal
 
 import pytest
 import torch
@@ -115,21 +114,7 @@ def test_full_pipeline_generate_benchmark(
     case: AttentionBenchmarkCase,
 ) -> None:
     """Benchmark steady-state LingBot encode, diffuse, and decode."""
-    _run_full_pipeline_benchmark(benchmark, case=case, stage="generate")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-@pytest.mark.parametrize(
-    "case",
-    BENCHMARK_CASES,
-    ids=lambda case: case.pytest_id,
-)
-def test_full_pipeline_finalize_benchmark(
-    benchmark: BenchmarkFixture,
-    case: AttentionBenchmarkCase,
-) -> None:
-    """Benchmark the LingBot DiT cache-finalization update."""
-    _run_full_pipeline_benchmark(benchmark, case=case, stage="finalize")
+    _run_full_pipeline_benchmark(benchmark, case=case)
 
 
 @torch.inference_mode()
@@ -137,9 +122,8 @@ def _run_full_pipeline_benchmark(
     benchmark: BenchmarkFixture,
     *,
     case: AttentionBenchmarkCase,
-    stage: Literal["generate", "finalize"],
 ) -> None:
-    """Run one full-pipeline lifecycle-stage benchmark."""
+    """Run one full-pipeline benchmark."""
     device = _benchmark_device()
     if not torch.cuda.is_bf16_supported():
         pytest.skip("LingBot full-pipeline benchmark requires bfloat16 support")
@@ -344,75 +328,41 @@ def _run_full_pipeline_benchmark(
         output = run_chunk(autoregressive_index, chunk_input)
     torch.cuda.synchronize(device)
 
-    benchmark.group = f"lingbot-full-pipeline-{stage}"
+    benchmark.group = "lingbot-full-pipeline-generate"
 
     next_chunk_index = cache_prefill_chunks
     latest_output: torch.Tensor | None = None
-    if stage == "generate":
 
-        def setup_generate() -> None:
-            _synchronize_ranks()
+    def setup_generate() -> None:
+        _synchronize_ranks()
 
-        def synchronized_generate() -> torch.Tensor:
-            nonlocal latest_output
-            latest_output = pipeline.generate(
-                autoregressive_index=next_chunk_index,
-                cache=cache,
-                input=steady_camera_input,
-            )
-            torch.cuda.synchronize(device)
-            return latest_output
-
-        def teardown_generate() -> None:
-            nonlocal next_chunk_index
-            pipeline.finalize(
-                autoregressive_index=next_chunk_index,
-                cache=cache,
-            )
-            torch.cuda.synchronize(device)
-            next_chunk_index += 1
-
-        output = benchmark.pedantic(
-            synchronized_generate,
-            setup=setup_generate,
-            teardown=teardown_generate,
-            iterations=1,
-            rounds=_BENCHMARK_ROUNDS,
-            warmup_rounds=_WARMUP_ROUNDS,
+    def synchronized_generate() -> torch.Tensor:
+        nonlocal latest_output
+        latest_output = pipeline.generate(
+            autoregressive_index=next_chunk_index,
+            cache=cache,
+            input=steady_camera_input,
         )
-    else:
+        torch.cuda.synchronize(device)
+        return latest_output
 
-        def setup_finalize() -> None:
-            nonlocal latest_output
-            _synchronize_ranks()
-            latest_output = pipeline.generate(
-                autoregressive_index=next_chunk_index,
-                cache=cache,
-                input=steady_camera_input,
-            )
-            torch.cuda.synchronize(device)
-            _synchronize_ranks()
-
-        def synchronized_finalize() -> None:
-            pipeline.finalize(
-                autoregressive_index=next_chunk_index,
-                cache=cache,
-            )
-            torch.cuda.synchronize(device)
-
-        def teardown_finalize() -> None:
-            nonlocal next_chunk_index
-            next_chunk_index += 1
-
-        benchmark.pedantic(
-            synchronized_finalize,
-            setup=setup_finalize,
-            teardown=teardown_finalize,
-            iterations=1,
-            rounds=_BENCHMARK_ROUNDS,
-            warmup_rounds=_WARMUP_ROUNDS,
+    def teardown_generate() -> None:
+        nonlocal next_chunk_index
+        pipeline.finalize(
+            autoregressive_index=next_chunk_index,
+            cache=cache,
         )
-        output = latest_output
+        torch.cuda.synchronize(device)
+        next_chunk_index += 1
+
+    output = benchmark.pedantic(
+        synchronized_generate,
+        setup=setup_generate,
+        teardown=teardown_generate,
+        iterations=1,
+        rounds=_BENCHMARK_ROUNDS,
+        warmup_rounds=_WARMUP_ROUNDS,
+    )
 
     assert output is not None
     assert output.shape == (

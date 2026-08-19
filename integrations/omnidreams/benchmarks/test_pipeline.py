@@ -24,8 +24,6 @@ Run the benchmark with::
 
 from __future__ import annotations
 
-from typing import Literal
-
 import pytest
 import torch
 from omnidreams.config import SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF
@@ -68,21 +66,6 @@ def test_full_pipeline_generate_benchmark(
     _run_full_pipeline_benchmark(
         benchmark,
         case=case,
-        stage="generate",
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-@pytest.mark.parametrize("case", BENCHMARK_CASES, ids=lambda case: case.pytest_id)
-def test_full_pipeline_finalize_benchmark(
-    benchmark: BenchmarkFixture,
-    case: AttentionBenchmarkCase,
-) -> None:
-    """Benchmark pipeline finalization for one DiT implementation."""
-    _run_full_pipeline_benchmark(
-        benchmark,
-        case=case,
-        stage="finalize",
     )
 
 
@@ -91,9 +74,8 @@ def _run_full_pipeline_benchmark(
     benchmark: BenchmarkFixture,
     *,
     case: AttentionBenchmarkCase,
-    stage: Literal["generate", "finalize"],
 ) -> None:
-    """Run one DiT backend and pipeline-stage benchmark variant."""
+    """Run one DiT backend full-pipeline benchmark variant."""
     if not torch.cuda.is_bf16_supported():
         pytest.skip("OmniDreams full-pipeline benchmark requires bfloat16 support")
 
@@ -288,69 +270,37 @@ def _run_full_pipeline_benchmark(
         assert native_selection is None
         assert native_executor is None
 
-    benchmark.group = f"omnidreams-full-pipeline-{stage}"
+    benchmark.group = "omnidreams-full-pipeline-generate"
 
     next_chunk_index = cache_prefill_chunks
     latest_output: torch.Tensor | None = None
-    if stage == "generate":
 
-        def synchronized_generate() -> torch.Tensor:
-            nonlocal latest_output
-            latest_output = pipeline.generate(
-                autoregressive_index=next_chunk_index,
-                cache=cache,
-                hdmap=hdmap_steady,
-            )
-            torch.cuda.synchronize()
-            return latest_output
-
-        def teardown_generate() -> None:
-            nonlocal next_chunk_index
-            pipeline.finalize(
-                autoregressive_index=next_chunk_index,
-                cache=cache,
-            )
-            torch.cuda.synchronize()
-            next_chunk_index += 1
-
-        output = benchmark.pedantic(
-            synchronized_generate,
-            teardown=teardown_generate,
-            iterations=1,
-            rounds=_BENCHMARK_ROUNDS,
-            warmup_rounds=_WARMUP_ROUNDS,
+    def synchronized_generate() -> torch.Tensor:
+        nonlocal latest_output
+        latest_output = pipeline.generate(
+            autoregressive_index=next_chunk_index,
+            cache=cache,
+            hdmap=hdmap_steady,
         )
-    else:
+        torch.cuda.synchronize()
+        return latest_output
 
-        def setup_finalize() -> None:
-            nonlocal latest_output
-            latest_output = pipeline.generate(
-                autoregressive_index=next_chunk_index,
-                cache=cache,
-                hdmap=hdmap_steady,
-            )
-            torch.cuda.synchronize()
-
-        def synchronized_finalize() -> None:
-            pipeline.finalize(
-                autoregressive_index=next_chunk_index,
-                cache=cache,
-            )
-            torch.cuda.synchronize()
-
-        def teardown_finalize() -> None:
-            nonlocal next_chunk_index
-            next_chunk_index += 1
-
-        benchmark.pedantic(
-            synchronized_finalize,
-            setup=setup_finalize,
-            teardown=teardown_finalize,
-            iterations=1,
-            rounds=_BENCHMARK_ROUNDS,
-            warmup_rounds=_WARMUP_ROUNDS,
+    def teardown_generate() -> None:
+        nonlocal next_chunk_index
+        pipeline.finalize(
+            autoregressive_index=next_chunk_index,
+            cache=cache,
         )
-        output = latest_output
+        torch.cuda.synchronize()
+        next_chunk_index += 1
+
+    output = benchmark.pedantic(
+        synchronized_generate,
+        teardown=teardown_generate,
+        iterations=1,
+        rounds=_BENCHMARK_ROUNDS,
+        warmup_rounds=_WARMUP_ROUNDS,
+    )
 
     assert output is not None
     assert output.shape == (
