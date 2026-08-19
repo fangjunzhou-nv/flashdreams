@@ -114,7 +114,11 @@ class WanDiTNetworkConfig(InstantiateConfig):
     cp_method: Literal["ring", "ulysses"] = "ring"
     """Context-parallel attention method for transformer attention ops."""
     attention_backend: AttentionBackend = AttentionBackend.WAN
-    """Self- and text cross-attention implementation used by every block."""
+    """Fallback attention implementation used when a branch override is ``None``."""
+    self_attention_backend: AttentionBackend | None = None
+    """Self-attention implementation; ``None`` uses ``attention_backend``."""
+    cross_attention_backend: AttentionBackend | None = None
+    """Text cross-attention implementation; ``None`` uses ``attention_backend``."""
     sdpa_backend: SDPABackend = SDPABackend.TRITON
     """SDPA implementation used by accelerated self-attention."""
     cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON
@@ -192,7 +196,18 @@ class WanDiTNetwork(nn.Module):
         self.patch_embedding_type = config.patch_embedding_type
         self.apply_rope_before_kvcache = config.apply_rope_before_kvcache
         self.cp_method = config.cp_method
-        self.attention_backend = AttentionBackend(config.attention_backend)
+        fallback_attention_backend = AttentionBackend(config.attention_backend)
+        self.self_attention_backend = (
+            fallback_attention_backend
+            if config.self_attention_backend is None
+            else AttentionBackend(config.self_attention_backend)
+        )
+        self.cross_attention_backend = (
+            fallback_attention_backend
+            if config.cross_attention_backend is None
+            else AttentionBackend(config.cross_attention_backend)
+        )
+        self.attention_backend = self.self_attention_backend
         self.sdpa_backend = SDPABackend(config.sdpa_backend)
         self.cross_attn_sdpa_backend = SDPABackend(config.cross_attn_sdpa_backend)
         self.self_attn_qkv_fusion_option = QKVFusionOption(
@@ -258,6 +273,8 @@ class WanDiTNetwork(nn.Module):
             apply_rope_before_kvcache=self.apply_rope_before_kvcache,
             cp_method=self.cp_method,
             attention_backend=self.attention_backend,
+            self_attention_backend=self.self_attention_backend,
+            cross_attention_backend=self.cross_attention_backend,
             sdpa_backend=self.sdpa_backend,
             cross_attn_sdpa_backend=self.cross_attn_sdpa_backend,
             self_attn_qkv_fusion_option=self.self_attn_qkv_fusion_option,

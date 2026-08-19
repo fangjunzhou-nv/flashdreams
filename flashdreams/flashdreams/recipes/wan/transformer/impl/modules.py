@@ -786,6 +786,8 @@ class Block(nn.Module):
         apply_rope_before_kvcache: bool = True,
         cp_method: Literal["ring", "ulysses"] = "ring",
         attention_backend: AttentionBackend = AttentionBackend.WAN,
+        self_attention_backend: AttentionBackend | None = None,
+        cross_attention_backend: AttentionBackend | None = None,
         sdpa_backend: SDPABackend = SDPABackend.TRITON,
         cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON,
         self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
@@ -798,7 +800,18 @@ class Block(nn.Module):
         self.num_heads = num_heads
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
-        self.attention_backend = AttentionBackend(attention_backend)
+        fallback_attention_backend = AttentionBackend(attention_backend)
+        self.self_attention_backend = (
+            fallback_attention_backend
+            if self_attention_backend is None
+            else AttentionBackend(self_attention_backend)
+        )
+        self.cross_attention_backend = (
+            fallback_attention_backend
+            if cross_attention_backend is None
+            else AttentionBackend(cross_attention_backend)
+        )
+        self.attention_backend = self.self_attention_backend
         self.sdpa_backend = SDPABackend(sdpa_backend)
         self.cross_attn_sdpa_backend = SDPABackend(cross_attn_sdpa_backend)
         self.self_attn_qkv_fusion_option = QKVFusionOption(self_attn_qkv_fusion_option)
@@ -809,7 +822,7 @@ class Block(nn.Module):
 
         # Core submodules
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        if self.attention_backend is AttentionBackend.WAN:
+        if self.self_attention_backend is AttentionBackend.WAN:
             self.self_attn = SelfAttention(
                 query_dim=dim,
                 n_heads=num_heads,
@@ -838,7 +851,7 @@ class Block(nn.Module):
         # ponytail: Wan I2V has independent text/image softmax branches summed
         # before one output projection; keep it native until a dual-cache Triton
         # adapter can preserve that ordering.
-        if self.attention_backend is AttentionBackend.TRITON and not i2v:
+        if self.cross_attention_backend is AttentionBackend.TRITON and not i2v:
             self.cross_attn = TritonCrossAttention(
                 query_dim=dim,
                 n_heads=num_heads,
