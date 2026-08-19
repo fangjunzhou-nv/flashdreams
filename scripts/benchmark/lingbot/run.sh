@@ -11,3 +11,5 @@ uv run --project integrations/lingbot --group test pytest \
     integrations/lingbot/benchmarks \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json=artifacts/benchmark/lingbot/benchmark.json
+
+uv run python scripts/benchmark/lingbot/plot.py

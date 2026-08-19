@@ -11,3 +11,5 @@ uv run --project flashdreams --group test pytest \
     flashdreams/benchmarks/accelerated \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json=artifacts/benchmark/flashdreams/accelerated/benchmark.json
+
+uv run python scripts/benchmark/flashdreams/accelerated/plot.py

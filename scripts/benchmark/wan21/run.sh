@@ -11,3 +11,5 @@ uv run --project integrations/wan21 --group test pytest \
     integrations/wan21/benchmarks \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json=artifacts/benchmark/wan21/benchmark.json
+
+uv run python scripts/benchmark/wan21/plot.py

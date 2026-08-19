@@ -11,3 +11,5 @@ uv run --project integrations/omnidreams --group test pytest \
     integrations/omnidreams/benchmarks \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json=artifacts/benchmark/omnidreams/benchmark.json
+
+uv run python scripts/benchmark/omnidreams/plot.py

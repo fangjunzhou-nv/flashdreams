@@ -10,3 +10,5 @@ mkdir -p artifacts/benchmark/flashdreams/recipes
 uv run --project flashdreams --group test pytest flashdreams/benchmarks/recipes \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json=artifacts/benchmark/flashdreams/recipes/benchmark.json
+
+uv run python scripts/benchmark/flashdreams/recipes/plot.py
