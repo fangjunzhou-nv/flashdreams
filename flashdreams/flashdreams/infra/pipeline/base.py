@@ -20,7 +20,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Generic
 
-import nvtx
 import torch
 import torch.nn as nn
 from loguru import logger
@@ -148,7 +147,6 @@ class StreamInferencePipeline(
     def device(self) -> torch.device:
         return self.diffusion_model.device
 
-    @nvtx.annotate("flashdreams.pipeline.initialize_cache")
     def initialize_cache(
         self,
         transformer_context: dict[str, Any] | None = None,
@@ -193,7 +191,6 @@ class StreamInferencePipeline(
         )
 
     @torch.no_grad()
-    @nvtx.annotate("flashdreams.pipeline.generate")
     def generate(
         self,
         autoregressive_index: int,
@@ -237,22 +234,20 @@ class StreamInferencePipeline(
                 "NullEncoderConfig() for an identity passthrough)."
             )
             assert cache.encoder_cache is not None  # invariant: paired with encoder
-            with nvtx.annotate("flashdreams.pipeline.encode"):
-                input = self.encoder(
-                    input=input,
-                    autoregressive_index=autoregressive_index,
-                    cache=cache.encoder_cache,
-                )
+            input = self.encoder(
+                input=input,
+                autoregressive_index=autoregressive_index,
+                cache=cache.encoder_cache,
+            )
 
         if events is not None:
             events.record("encode")
 
-        with nvtx.annotate("flashdreams.pipeline.diffuse"):
-            clean_latent, final_state = self.diffusion_model.generate(
-                autoregressive_index=autoregressive_index,
-                cache=cache.transformer_cache,
-                input=input,
-            )
+        clean_latent, final_state = self.diffusion_model.generate(
+            autoregressive_index=autoregressive_index,
+            cache=cache.transformer_cache,
+            input=input,
+        )
         cache.final_state = final_state
 
         if events is not None:
@@ -260,12 +255,11 @@ class StreamInferencePipeline(
 
         if self.decoder is not None:
             assert cache.decoder_cache is not None  # invariant: paired with decoder
-            with nvtx.annotate("flashdreams.pipeline.decode"):
-                output = self.decoder(
-                    input=clean_latent,
-                    autoregressive_index=autoregressive_index,
-                    cache=cache.decoder_cache,
-                )
+            output = self.decoder(
+                input=clean_latent,
+                autoregressive_index=autoregressive_index,
+                cache=cache.decoder_cache,
+            )
         else:
             output = clean_latent
 
@@ -275,7 +269,6 @@ class StreamInferencePipeline(
         return output
 
     @torch.no_grad()
-    @nvtx.annotate("flashdreams.pipeline.finalize")
     def finalize(
         self,
         autoregressive_index: int,

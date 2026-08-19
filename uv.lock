@@ -1002,7 +1002,6 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-11-flashdreams-dev' and extra == 'group-11-flashdreams-cuda12') or (extra == 'group-11-flashdreams-cuda12' and extra == 'group-11-flashdreams-cuda13')" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' or (extra == 'extra-11-flashdreams-dev' and extra == 'group-11-flashdreams-cuda12') or (extra == 'group-11-flashdreams-cuda12' and extra == 'group-11-flashdreams-cuda13')" },
     { name = "nvidia-ml-py" },
-    { name = "nvtx" },
     { name = "psutil" },
     { name = "pyyaml" },
     { name = "safetensors" },
@@ -1080,7 +1079,6 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24,<2.5" },
     { name = "nvidia-ml-py", specifier = ">=12.0" },
     { name = "nvidia-vfx", marker = "extra == 'rtx-postprocess'", specifier = "==0.1.0.1" },
-    { name = "nvtx", specifier = ">=0.2.15" },
     { name = "opencv-python-headless", marker = "extra == 'examples'", specifier = ">=4.5" },
     { name = "opencv-python-headless", marker = "extra == 'runners'", specifier = ">=4.5" },
     { name = "psutil", specifier = ">=7.0" },
@@ -3098,29 +3096,6 @@ name = "nvidia-vfx"
 version = "0.1.0.1"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/37/b4/58e1bbb8d6fc9ed786564d0878314ea2f2cd458c84861a5130927e431ff6/nvidia_vfx-0.1.0.1.tar.gz", hash = "sha256:8a26bae3a967a2ce29040f17ba9d75e106f3d0c68016d440a77ed9c7eb05daae", size = 2673, upload-time = "2026-03-09T19:29:40.556Z" }
-
-[[package]]
-name = "nvtx"
-version = "0.2.15"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/92/dd/692765e87de30bae1522cdffaa0f2b52949658a92a0fa6d96b1a01eae9d2/nvtx-0.2.15.tar.gz", hash = "sha256:2287d3be05b85661deb386f878d1f536c2e532774aa9ec7a50c434942ed81ae5", size = 121230, upload-time = "2026-03-18T10:01:25.547Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/9d/ef/ea1e9d92afd07fdf2a2390e508f1d214e5ba890561d7849d6ca708534b9d/nvtx-0.2.15-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a4f50832fd90a1b480a9deef6e4cd48015b61869095b54dd1a7afe87b4138c6a", size = 768543, upload-time = "2026-03-18T10:07:21.819Z" },
-    { url = "https://files.pythonhosted.org/packages/32/8e/b42c05cf3cc43c51f21fdda6f7c4fe28a595c6d2bdb0cfbf0477dc5805f2/nvtx-0.2.15-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5f3362f0db4252514719326c9d5662b0f93d254659ba97b9c8dbe556286e0e3e", size = 771975, upload-time = "2026-03-18T10:12:23.772Z" },
-    { url = "https://files.pythonhosted.org/packages/60/77/fc000055b5bb1651cdd772f0fe1fd9a16c7773b28dfc5624eea331d1415d/nvtx-0.2.15-cp310-cp310-win_amd64.whl", hash = "sha256:d71f934e580d4572f382712b6da464ab69e4c212981506f781f927d5c6d935d6", size = 134503, upload-time = "2026-03-18T10:04:05.773Z" },
-    { url = "https://files.pythonhosted.org/packages/80/65/435d10b2041ee082c07d5aed129afd504012c8908796d695f10e66bcc716/nvtx-0.2.15-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:157b80ea9b4db6c8f47f8dbe2fa2e81e7a7f1445bb87f8268f43dec9210b78a1", size = 806443, upload-time = "2026-03-18T10:05:49.308Z" },
-    { url = "https://files.pythonhosted.org/packages/47/bc/be94576ba33af75bcc68a857daade64cb86481764d4fb0f36308b1f6fc85/nvtx-0.2.15-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:02bca69ee55e0be41eabf908de9dbcdd18e702c7f49f9aa63fd396ce684ff5d5", size = 808183, upload-time = "2026-03-18T10:11:16.262Z" },
-    { url = "https://files.pythonhosted.org/packages/f6/7a/42109f1cfb1ff9913201cb2b804956a4f003db4c018c2522a3c8066b3a1c/nvtx-0.2.15-cp311-cp311-win_amd64.whl", hash = "sha256:dbe41f78f5a811bd4cdad0a237e5b41a4937d8c2c6c9abdd161091671a598bc0", size = 134631, upload-time = "2026-03-18T10:02:11.247Z" },
-    { url = "https://files.pythonhosted.org/packages/c2/07/698355285a03a366ef63ea9762fc1feef3f9f25483e1655408f72d827090/nvtx-0.2.15-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2cc530cd0f1a2c14a3a7e683833db509888ac5ed4ead94e5c9e2c7317c6937a7", size = 807159, upload-time = "2026-03-18T10:09:49.232Z" },
-    { url = "https://files.pythonhosted.org/packages/c0/d1/08f22448d83481408d663065764ba583df091a7de629ed38fc97e522f1af/nvtx-0.2.15-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3ca8030a6d197952318013dd1c12c22da1d4b9feb76ba72e0fcd449961183c2c", size = 806187, upload-time = "2026-03-18T10:13:32.972Z" },
-    { url = "https://files.pythonhosted.org/packages/54/23/c97c39e3b7ba256aa343cb828ca0d1c8421f705ca84795658ecd14ca95ed/nvtx-0.2.15-cp312-cp312-win_amd64.whl", hash = "sha256:70a1e768964e0520b68ccabc4df391cc227537c45936a7eba6507bc65e617e00", size = 129178, upload-time = "2026-03-18T10:02:55.299Z" },
-    { url = "https://files.pythonhosted.org/packages/05/c9/8341224b8284f7deb6a634119939de5885adc421e64b6743693b30da2186/nvtx-0.2.15-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d28660d9c46f8ba750d781572b6aa5a1e6221abba224ab32d7fb32c2d0fd67df", size = 780787, upload-time = "2026-03-18T10:10:40.634Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/c0/4a5bb7897918de7c7e0191d9342df8ae4cb797ff07276e0f20d13e497ce7/nvtx-0.2.15-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:10749686633f880ad53dcdbb2179fad41b45dcf5b7631d4a1070a577577bd386", size = 782575, upload-time = "2026-03-18T10:13:57.3Z" },
-    { url = "https://files.pythonhosted.org/packages/38/b9/6b381ac7c5a3ded331aebbf25f8959d19b51d320fb2514c76c6b6edddaaa/nvtx-0.2.15-cp313-cp313-win_amd64.whl", hash = "sha256:a6650b029263d12f8427a4dee8bd59cb9c91bccb60543bfcb20bc2b00fdcd672", size = 128764, upload-time = "2026-03-18T10:02:33.343Z" },
-    { url = "https://files.pythonhosted.org/packages/75/69/a9acb6d95d2e0e381b2956544768528dd8d7a9e827af8c2014169d838284/nvtx-0.2.15-cp313-cp313t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:25813ead4fff4d3a6e04f69a72507b096a6bdbecefa369f1100b0e584767bca8", size = 833375, upload-time = "2026-03-18T10:06:31.955Z" },
-    { url = "https://files.pythonhosted.org/packages/38/56/c7e8645061cc2fc23f3a54f33e1e340df59216f07dcfb97d46b8ae7dd26c/nvtx-0.2.15-cp313-cp313t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3741edac4678b92f03d22a3f0a2dfd469f422f85e63db71b038e02525b2404ad", size = 788639, upload-time = "2026-03-18T10:12:01.69Z" },
-    { url = "https://files.pythonhosted.org/packages/96/03/fadd82acdbca6d1c49ac517081a0c3714346f52f4c7e1d4449d77605b4aa/nvtx-0.2.15-cp313-cp313t-win_amd64.whl", hash = "sha256:8be06c3c8c267eba56a0396366b9593092e0b75ea8d3702b303d48c0a1662f0e", size = 142609, upload-time = "2026-03-18T10:01:48.832Z" },
-]
 
 [[package]]
 name = "onnx"
