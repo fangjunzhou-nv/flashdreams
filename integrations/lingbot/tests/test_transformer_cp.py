@@ -28,11 +28,16 @@ from lingbot.transformer.impl.network import (
 )
 
 from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
     SDPABackend,
     TritonMultiHeadAttention,
 )
 from flashdreams.recipes.wan.autoencoder.i2v import I2VCtrl
-from flashdreams.recipes.wan.transformer.impl.modules import AttentionBackend
+from flashdreams.recipes.wan.transformer.impl.modules import (
+    AttentionBackend,
+    CrossAttention,
+    SelfAttention,
+)
 
 pytestmark = pytest.mark.ci_cpu
 
@@ -78,18 +83,46 @@ def test_lingbot_patchify_marks_i2v_and_plucker_as_patchified() -> None:
 
 
 @pytest.mark.parametrize(
-    ("backend", "sdpa_backend"),
+    ("self_backend", "cross_backend", "sdpa_backend"),
     [
-        pytest.param(AttentionBackend.WAN, SDPABackend.CUDNN, id="wan"),
-        pytest.param(AttentionBackend.TRITON, SDPABackend.CUDNN, id="triton-cudnn"),
-        pytest.param(AttentionBackend.TRITON, SDPABackend.TRITON, id="triton-fa2"),
+        pytest.param(
+            AttentionBackend.WAN,
+            AttentionBackend.WAN,
+            SDPABackend.CUDNN,
+            id="wan",
+        ),
+        pytest.param(
+            AttentionBackend.TRITON,
+            AttentionBackend.TRITON,
+            SDPABackend.CUDNN,
+            id="triton-cudnn",
+        ),
+        pytest.param(
+            AttentionBackend.TRITON,
+            AttentionBackend.TRITON,
+            SDPABackend.TRITON,
+            id="triton-fa2",
+        ),
+        pytest.param(
+            AttentionBackend.TRITON,
+            AttentionBackend.WAN,
+            SDPABackend.CUDNN,
+            id="triton-self-wan-cross",
+        ),
+        pytest.param(
+            AttentionBackend.WAN,
+            AttentionBackend.TRITON,
+            SDPABackend.CUDNN,
+            id="wan-self-triton-cross",
+        ),
     ],
 )
-def test_lingbot_network_propagates_attention_backend(
-    backend: AttentionBackend,
+def test_lingbot_network_propagates_attention_backends(
+    self_backend: AttentionBackend,
+    cross_backend: AttentionBackend,
     sdpa_backend: SDPABackend,
 ) -> None:
-    """Propagate the configured attention backend into camera-control blocks."""
+    """Propagate configured attention backends into camera-control blocks."""
     network = LingbotWorldDiTNetwork(
         LingbotWorldDiTNetworkConfig(
             dim=64,
@@ -98,18 +131,35 @@ def test_lingbot_network_propagates_attention_backend(
             num_layers=1,
             patch_embedding_type="linear",
             control_type="cam",
-            attention_backend=backend,
+            self_attention_backend=self_backend,
+            cross_attention_backend=cross_backend,
             sdpa_backend=sdpa_backend,
         )
     )
 
-    assert network.attention_backend is backend
+    assert network.attention_backend is self_backend
+    assert network.self_attention_backend is self_backend
+    assert network.cross_attention_backend is cross_backend
     assert network.sdpa_backend is sdpa_backend
     assert len(network.blocks) == 1
     block = network.blocks[0]
-    assert block.attention_backend is backend
+    assert block.attention_backend is self_backend
+    assert block.self_attention_backend is self_backend
+    assert block.cross_attention_backend is cross_backend
     assert block.sdpa_backend is sdpa_backend
-    if backend is AttentionBackend.TRITON:
+    assert isinstance(
+        block.self_attn,
+        TritonMultiHeadAttention
+        if self_backend is AttentionBackend.TRITON
+        else SelfAttention,
+    )
+    assert isinstance(
+        block.cross_attn,
+        TritonMultiHeadAttention
+        if cross_backend is AttentionBackend.TRITON
+        else CrossAttention,
+    )
+    if self_backend is AttentionBackend.TRITON:
         assert isinstance(block.self_attn, TritonMultiHeadAttention)
         assert block.self_attn.sdpa_backend is sdpa_backend
         cache = block.self_attn.allocate_kv_cache(
@@ -125,3 +175,54 @@ def test_lingbot_network_propagates_attention_backend(
             if sdpa_backend is SDPABackend.TRITON
             else torch.bfloat16
         )
+
+
+@pytest.mark.parametrize(
+    "sdpa_backend", tuple(SDPABackend), ids=lambda backend: backend.value
+)
+@pytest.mark.parametrize("use_fp8", (False, True), ids=("bf16", "fp8"))
+@pytest.mark.parametrize(
+    "qkv_fusion_option",
+    tuple(QKVFusionOption),
+    ids=lambda option: option.value.replace("_", "-"),
+)
+def test_lingbot_network_propagates_attention_options(
+    sdpa_backend: SDPABackend,
+    use_fp8: bool,
+    qkv_fusion_option: QKVFusionOption,
+) -> None:
+    """Propagate accelerated attention options into camera-control blocks."""
+    cross_attn_qkv_fusion_option = (
+        qkv_fusion_option
+        if qkv_fusion_option is not QKVFusionOption.FULL
+        else QKVFusionOption.FUSE_KV
+    )
+    network = LingbotWorldDiTNetwork(
+        LingbotWorldDiTNetworkConfig(
+            dim=64,
+            ffn_dim=128,
+            num_heads=4,
+            num_layers=1,
+            patch_embedding_type="linear",
+            control_type="cam",
+            self_attention_backend=AttentionBackend.TRITON,
+            cross_attention_backend=AttentionBackend.TRITON,
+            sdpa_backend=sdpa_backend,
+            cross_attn_sdpa_backend=sdpa_backend,
+            self_attn_qkv_fusion_option=qkv_fusion_option,
+            cross_attn_qkv_fusion_option=cross_attn_qkv_fusion_option,
+            use_fp8=use_fp8,
+        )
+    )
+
+    block = network.blocks[0]
+    assert block.sdpa_backend is sdpa_backend
+    assert block.cross_attn_sdpa_backend is sdpa_backend
+    assert block.self_attn_qkv_fusion_option is qkv_fusion_option
+    assert block.cross_attn_qkv_fusion_option is cross_attn_qkv_fusion_option
+    assert block.use_fp8 is use_fp8
+    assert isinstance(block.self_attn, TritonMultiHeadAttention)
+    assert isinstance(block.cross_attn, TritonMultiHeadAttention)
+    assert block.self_attn.qkv_fusion_option is qkv_fusion_option
+    assert block.cross_attn.qkv_fusion_option is cross_attn_qkv_fusion_option
+    assert block.self_attn.use_fp8 is block.cross_attn.use_fp8 is use_fp8

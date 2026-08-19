@@ -22,28 +22,37 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from flashdreams.accelerated.multi_head_attention_triton import SDPABackend
+from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
+    SDPABackend,
+)
 from flashdreams.recipes.wan.transformer.impl.modules import AttentionBackend
 
 
 @dataclass(frozen=True)
 class AttentionBenchmarkCase:
-    """Configuration and metadata for one attention benchmark implementation."""
+    """Configuration for one attention benchmark implementation."""
 
     implementation: str
-    """Stable implementation name stored in benchmark metadata."""
+    """Stable implementation name used by pytest and pipeline setup."""
 
-    attention_backend: AttentionBackend
-    """DiT block implementation configured for this case."""
+    self_attention_backend: AttentionBackend
+    """Self-attention implementation configured for this case."""
+
+    cross_attention_backend: AttentionBackend
+    """Cross-attention implementation configured for this case."""
 
     sdpa_backend: SDPABackend
-    """SDPA implementation configured for Triton self-attention."""
+    """SDPA backend configured for accelerated attention."""
 
-    self_attention_operator: str
-    """Self-attention operator reported in benchmark metadata."""
+    use_fp8: bool = True
+    """Whether accelerated projections and supported cache storage use FP8."""
 
-    cross_attention_operator: str
-    """Cross-attention operator reported in benchmark metadata."""
+    self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL
+    """Projection fusion policy used by accelerated self-attention."""
+
+    cross_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV
+    """Projection fusion policy used by accelerated cross-attention."""
 
     minimum_compute_capability: tuple[int, int] | None = None
     """Minimum CUDA compute capability; ``None`` accepts any CUDA device."""
@@ -54,53 +63,52 @@ class AttentionBenchmarkCase:
         return self.implementation.replace("_", "-")
 
 
-WAN_TORCH_CASE = AttentionBenchmarkCase(
-    implementation="wan_torch",
-    attention_backend=AttentionBackend.WAN,
-    sdpa_backend=SDPABackend.CUDNN,
-    self_attention_operator="cudnn",
-    cross_attention_operator="cudnn",
-)
-
-TRITON_CUDNN_CASE = AttentionBenchmarkCase(
-    implementation="triton_cudnn",
-    attention_backend=AttentionBackend.TRITON,
-    sdpa_backend=SDPABackend.CUDNN,
-    self_attention_operator="torch_cudnn_sdpa",
-    cross_attention_operator="triton_fa2",
-    minimum_compute_capability=(9, 0),
-)
-
-TRITON_FA2_CASE = AttentionBenchmarkCase(
-    implementation="triton_fa2",
-    attention_backend=AttentionBackend.TRITON,
-    sdpa_backend=SDPABackend.TRITON,
-    self_attention_operator="triton_fa2",
-    cross_attention_operator="triton_fa2",
-    minimum_compute_capability=(9, 0),
-)
-
-ATTENTION_CASES = (WAN_TORCH_CASE, TRITON_CUDNN_CASE, TRITON_FA2_CASE)
-"""Attention cases exercised by each Lingbot benchmark layer."""
-
-assert {case.attention_backend for case in ATTENTION_CASES} == set(AttentionBackend)
-assert {
-    case.sdpa_backend
-    for case in ATTENTION_CASES
-    if case.attention_backend is AttentionBackend.TRITON
-} == set(SDPABackend)
+BENCHMARK_CASES = [
+    AttentionBenchmarkCase(
+        implementation="wan_torch",
+        self_attention_backend=AttentionBackend.WAN,
+        cross_attention_backend=AttentionBackend.WAN,
+        sdpa_backend=SDPABackend.CUDNN,
+        use_fp8=False,
+        self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+    ),
+    AttentionBenchmarkCase(
+        implementation="triton_fa2_fp8_full",
+        self_attention_backend=AttentionBackend.TRITON,
+        cross_attention_backend=AttentionBackend.TRITON,
+        sdpa_backend=SDPABackend.TRITON,
+        minimum_compute_capability=(9, 0),
+    ),
+    AttentionBenchmarkCase(
+        implementation="triton_cudnn_bf16_full",
+        self_attention_backend=AttentionBackend.TRITON,
+        cross_attention_backend=AttentionBackend.TRITON,
+        sdpa_backend=SDPABackend.CUDNN,
+        use_fp8=False,
+    ),
+    AttentionBenchmarkCase(
+        implementation="triton_cudnn_bf16_full_wan_cross",
+        self_attention_backend=AttentionBackend.TRITON,
+        cross_attention_backend=AttentionBackend.WAN,
+        sdpa_backend=SDPABackend.CUDNN,
+        use_fp8=False,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+    ),
+]
+"""Attention cases exercised by the LingBot network and pipeline benchmarks."""
 
 
 def skip_unsupported_device(
     case: AttentionBenchmarkCase,
     device: torch.device,
 ) -> None:
-    """Skip a benchmark case when device is older than its minimum capability."""
+    """Skip a benchmark case when the device is older than its minimum."""
     minimum = case.minimum_compute_capability
     if minimum is None:
         return
     if torch.cuda.get_device_capability(device) < minimum:
         pytest.skip(
-            f"{case.pytest_id} attention requires compute capability "
+            f"{case.implementation} attention requires compute capability "
             f"{minimum[0]}.{minimum[1]}+"
         )

@@ -31,11 +31,14 @@ from lingbot.transformer.impl.modules import CamCtrlBlock
 from lingbot.transformer.impl.network import LingbotWorldDiTNetwork14BConfig
 from pytest_benchmark.fixture import BenchmarkFixture
 
+from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
+    SDPABackend,
+)
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from flashdreams.core.distributed import init as init_distributed
 from flashdreams.recipes.wan.transformer.impl.modules import AttentionBackend
 from integrations.lingbot.benchmarks.cases import (
-    ATTENTION_CASES,
     AttentionBenchmarkCase,
     skip_unsupported_device,
 )
@@ -58,6 +61,50 @@ _TEXT_TOKENS = 512
 _WARMUP_ROUNDS = 3
 _BENCHMARK_ROUNDS = 20
 _SEED = 0
+
+_MODULE_CASE_MATRIX = [
+    AttentionBenchmarkCase(
+        implementation="wan_torch",
+        self_attention_backend=AttentionBackend.WAN,
+        cross_attention_backend=AttentionBackend.WAN,
+        sdpa_backend=SDPABackend.CUDNN,
+        use_fp8=False,
+        self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+    ),
+    *[
+        AttentionBenchmarkCase(
+            implementation=(
+                f"triton_{'fa2' if sdpa_backend is SDPABackend.TRITON else 'cudnn'}_"
+                f"{'fp8' if use_fp8 else 'bf16'}_{qkv_fusion_option.value}"
+            ),
+            self_attention_backend=AttentionBackend.TRITON,
+            cross_attention_backend=AttentionBackend.TRITON,
+            sdpa_backend=sdpa_backend,
+            use_fp8=use_fp8,
+            self_attn_qkv_fusion_option=qkv_fusion_option,
+            cross_attn_qkv_fusion_option=(
+                qkv_fusion_option
+                if qkv_fusion_option is not QKVFusionOption.FULL
+                else QKVFusionOption.FUSE_KV
+            ),
+            minimum_compute_capability=(
+                (9, 0) if use_fp8 or sdpa_backend is SDPABackend.TRITON else None
+            ),
+        )
+        for sdpa_backend in SDPABackend
+        for use_fp8 in (False, True)
+        for qkv_fusion_option in QKVFusionOption
+    ],
+    AttentionBenchmarkCase(
+        implementation="triton_cudnn_bf16_full_wan_cross",
+        self_attention_backend=AttentionBackend.TRITON,
+        cross_attention_backend=AttentionBackend.WAN,
+        sdpa_backend=SDPABackend.CUDNN,
+        use_fp8=False,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+    ),
+]
 
 
 def _benchmark_device() -> torch.device:
@@ -84,7 +131,9 @@ def _make_block(
 ) -> CamCtrlBlock:
     """Build a backend-selected block with shared random weights."""
 
-    def make(selected_backend: AttentionBackend) -> CamCtrlBlock:
+    def make(
+        self_backend: AttentionBackend, cross_backend: AttentionBackend
+    ) -> CamCtrlBlock:
         return CamCtrlBlock(
             dim=config.dim,
             ffn_dim=config.ffn_dim,
@@ -92,8 +141,14 @@ def _make_block(
             cross_attn_norm=config.cross_attn_norm,
             eps=config.eps,
             cp_method=config.cp_method,
-            attention_backend=selected_backend,
+            attention_backend=self_backend,
+            self_attention_backend=self_backend,
+            cross_attention_backend=cross_backend,
             sdpa_backend=config.sdpa_backend,
+            cross_attn_sdpa_backend=config.cross_attn_sdpa_backend,
+            self_attn_qkv_fusion_option=config.self_attn_qkv_fusion_option,
+            cross_attn_qkv_fusion_option=config.cross_attn_qkv_fusion_option,
+            use_fp8=config.use_fp8,
         )
 
     # Allocate this 14B-sized block directly in BF16 on the target GPU. This
@@ -104,10 +159,13 @@ def _make_block(
         torch.set_default_dtype(dtype)
         with torch.device(device):
             torch.manual_seed(_SEED)
-            reference = make(AttentionBackend.WAN)
-            if case.attention_backend is AttentionBackend.WAN:
+            reference = make(AttentionBackend.WAN, AttentionBackend.WAN)
+            if (
+                case.self_attention_backend is AttentionBackend.WAN
+                and case.cross_attention_backend is AttentionBackend.WAN
+            ):
                 return reference
-            block = make(case.attention_backend)
+            block = make(case.self_attention_backend, case.cross_attention_backend)
             block.load_state_dict(reference.state_dict(), strict=True)
             return block
     finally:
@@ -117,7 +175,7 @@ def _make_block(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
 @pytest.mark.parametrize(
     "case",
-    ATTENTION_CASES,
+    _MODULE_CASE_MATRIX,
     ids=lambda case: case.pytest_id,
 )
 @torch.inference_mode()
@@ -136,18 +194,28 @@ def test_camctrl_dit_block_benchmark(
         patch_embedding_type="conv3d",
         control_type="cam",
         cp_method="ulysses",
-        attention_backend=case.attention_backend,
+        self_attention_backend=case.self_attention_backend,
+        cross_attention_backend=case.cross_attention_backend,
         sdpa_backend=case.sdpa_backend,
+        cross_attn_sdpa_backend=case.sdpa_backend,
+        self_attn_qkv_fusion_option=case.self_attn_qkv_fusion_option,
+        cross_attn_qkv_fusion_option=case.cross_attn_qkv_fusion_option,
+        use_fp8=case.use_fp8,
     )
     cp_size = dist.get_world_size() if dist.is_initialized() else 1
     skip_unsupported_device(case, device)
-    if case.attention_backend is AttentionBackend.TRITON and cp_size > 1:
+    if case.self_attention_backend is AttentionBackend.TRITON and cp_size > 1:
         pytest.skip("Triton attention does not support context parallelism")
     block = _make_block(config, case, device, dtype)
     block.eval()
     block.update_parameters_after_loading_checkpoint()
-    assert block.attention_backend is case.attention_backend
+    assert block.self_attention_backend is case.self_attention_backend
+    assert block.cross_attention_backend is case.cross_attention_backend
     assert block.sdpa_backend is case.sdpa_backend
+    assert block.cross_attn_sdpa_backend is case.sdpa_backend
+    assert block.self_attn_qkv_fusion_option is case.self_attn_qkv_fusion_option
+    assert block.cross_attn_qkv_fusion_option is case.cross_attn_qkv_fusion_option
+    assert block.use_fp8 is case.use_fp8
     generator = torch.Generator(device=device).manual_seed(_SEED)
 
     cp_group = dist.group.WORLD if cp_size > 1 else None
@@ -155,7 +223,7 @@ def test_camctrl_dit_block_benchmark(
     self_attention_cp_enabled = block.self_attn.is_context_parallel_enabled()
     cross_attention_cp_enabled = block.cross_attn.is_context_parallel_enabled()
     assert self_attention_cp_enabled == (
-        case.attention_backend is AttentionBackend.WAN and cp_size > 1
+        case.self_attention_backend is AttentionBackend.WAN and cp_size > 1
     )
     assert not cross_attention_cp_enabled
 
@@ -236,82 +304,10 @@ def test_camctrl_dit_block_benchmark(
         output = forward(chunk_idx, rope_freqs[chunk_idx])
     torch.cuda.synchronize(device)
 
-    self_attention_cp_method = (
-        config.cp_method if case.attention_backend is AttentionBackend.WAN else None
-    )
-    cross_attention_method = (
-        config.cp_method if case.attention_backend is AttentionBackend.WAN else None
-    )
-    camera_parameter_count = sum(
-        parameter.numel()
-        for name, parameter in block.named_parameters()
-        if name.startswith("cam_")
-    )
-
     benchmark.group = "lingbot-camctrl-dit-block"
-    benchmark.extra_info.update(
-        {
-            "module": "CamCtrlBlock",
-            "module_owner": "lingbot",
-            "model_family": "lingbot-world",
-            "model_variant": "lingbot-world-14b",
-            "benchmark_scope": "whole_block_including_inherited_wan_branches",
-            "implementation": case.implementation,
-            "batch_shape": [],
-            "pixel_resolution": [_PIXEL_HEIGHT, _PIXEL_WIDTH],
-            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
-            "global_chunk_tokens": global_chunk_tokens,
-            "local_chunk_tokens": chunk_tokens,
-            "global_window_tokens": global_window_tokens,
-            "local_window_tokens": window_tokens,
-            "global_sink_tokens": global_sink_tokens,
-            "local_sink_tokens": sink_tokens,
-            "text_tokens": _TEXT_TOKENS,
-            "model_channels": config.dim,
-            "ffn_channels": config.ffn_dim,
-            "num_heads": config.num_heads,
-            "parameter_count": sum(
-                parameter.numel() for parameter in block.parameters()
-            ),
-            "lingbot_camera_parameter_count": camera_parameter_count,
-            "checkpoint": "random_init_shared_weights",
-            "dtype": str(dtype),
-            "attention_backend": case.attention_backend.value,
-            "sdpa_backend": case.sdpa_backend.value,
-            "self_attention_operator": case.self_attention_operator,
-            "cross_attention_operator": case.cross_attention_operator,
-            "projection_backend": (
-                "separate_qkv"
-                if case.attention_backend is AttentionBackend.WAN
-                else "row_scaled_fp8_fused_qkv_output"
-            ),
-            "self_attention_cache_dtype": str(cache.self_attn.dtype),
-            "cross_attention_cache_dtype": str(cache.cross_attn.text.dtype),
-            "self_attention_context_parallel_method": self_attention_cp_method,
-            "cross_attention_method": cross_attention_method,
-            "context_parallel_size": cp_size,
-            "self_attention_context_parallel_enabled": self_attention_cp_enabled,
-            "cross_attention_context_parallel_enabled": (cross_attention_cp_enabled),
-            "distributed_sample_alignment": "barrier_before_each_round",
-            "cache_state": "full_sink_and_window",
-            "cache_prefill_chunks": cache_prefill_chunks,
-            "benchmark_ar_index": benchmark_ar_index,
-            "cache_update_bookkeeping": "excluded_from_timing",
-            "global_rank": dist.get_rank() if dist.is_initialized() else 0,
-            "gpu": torch.cuda.get_device_name(device),
-            "compute_capability": list(torch.cuda.get_device_capability(device)),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "seed": _SEED,
-        }
-    )
 
     cache.before_update(benchmark_ar_index)
     torch.cuda.synchronize(device)
-    torch.cuda.reset_peak_memory_stats(device)
 
     def synchronized_forward() -> torch.Tensor:
         result = block(
@@ -332,9 +328,6 @@ def test_camctrl_dit_block_benchmark(
         warmup_rounds=_WARMUP_ROUNDS,
     )
     cache.after_update(benchmark_ar_index)
-    benchmark.extra_info["peak_cuda_memory_bytes"] = torch.cuda.max_memory_allocated(
-        device
-    )
 
     assert output.shape == x.shape
     assert torch.isfinite(output).all()

@@ -100,7 +100,13 @@ class LingbotWorldDiTNetwork(WanDiTNetwork):
             eps=self.eps,
             cp_method=self.cp_method,
             attention_backend=self.attention_backend,
+            self_attention_backend=self.self_attention_backend,
+            cross_attention_backend=self.cross_attention_backend,
             sdpa_backend=self.sdpa_backend,
+            cross_attn_sdpa_backend=self.cross_attn_sdpa_backend,
+            self_attn_qkv_fusion_option=self.self_attn_qkv_fusion_option,
+            cross_attn_qkv_fusion_option=self.cross_attn_qkv_fusion_option,
+            use_fp8=self.use_fp8,
         )
 
     def replace_text_embeddings(

@@ -31,12 +31,21 @@ state, collects Python objects, and empties the CUDA allocator cache. This preve
 one case from retaining memory needed by the next, but does not reduce a case's own
 peak memory requirement.
 
-Each benchmark layer runs three cases: the WAN/cuDNN reference, Triton FP8
-projections with PyTorch cuDNN SDPA, and Triton FP8 projections with Triton
-FlashAttention2 (FA2). Their stable labels are `wan_torch`, `triton_cudnn`, and
-`triton_fa2`. Both Triton cases require compute capability 9.0 or newer and run
-only on a single GPU because Triton attention does not support context
-parallelism; cross-attention remains cuDNN in all three cases.
+The block microbenchmark runs the WAN/cuDNN reference plus every combination of
+cuDNN or Triton FlashAttention2 (FA2) SDPA, BF16 or FP8 projections, and the
+three QKV fusion policies. Its Triton labels follow
+`triton_{cudnn,fa2}_{bf16,fp8}_{none,fuse_kv,full}`. Full fusion applies to
+self-attention; those rows retain fused K/V projections for cross-attention.
+The matrix also includes `triton_cudnn_bf16_full_wan_cross` to isolate native
+WAN cross-attention behind the same accelerated self-attention configuration.
+
+The network and pipeline benchmarks use a smaller representative list:
+`wan_torch`, `triton_fa2_fp8_full`, `triton_cudnn_bf16_full`, and
+`triton_cudnn_bf16_full_wan_cross`. Triton self-attention cases
+run only on one GPU because that attention implementation does not support
+context parallelism. FP8 and FA2 cases require compute capability 9.0 or newer;
+the BF16/cuDNN Triton cases do not. Accelerated branches use the SDPA backend
+named by each case.
 
 First sync the LingBot package and the workspace `test` dependency group,
 which provides both `pytest` and `pytest-benchmark`:
@@ -97,11 +106,9 @@ To select another benchmark layer, use one of these files:
   `finalize` for
   `lingbot-world-v2-14b-causal-fast-taehv-window15-sink3` at the CLI replay's
   352x640 geometry. This is an end-to-end measurement, so the recurring path
-  includes its configured recipe components, but metadata identifies those
-  stages and no reused component is presented as a LingBot module
-  microbenchmark. At the measured AR indices, the Wan I2V VAE branch reuses
-  its cached latent. Reported output FPS is generate-only; use the separate
-  finalize result when evaluating the complete per-chunk lifecycle.
+  includes its configured recipe components. At the measured AR indices, the
+  Wan I2V VAE branch reuses its cached latent. Use the separate generate and
+  finalize results when evaluating the complete per-chunk lifecycle.
 
 Keep `--group test` on both setup and run commands. A package-only environment
 does not include the benchmark plugin. The benchmarks exclude setup, cache

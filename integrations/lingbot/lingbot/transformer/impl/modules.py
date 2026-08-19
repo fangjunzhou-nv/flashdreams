@@ -23,7 +23,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from flashdreams.accelerated.multi_head_attention_triton import SDPABackend
+from flashdreams.accelerated.multi_head_attention_triton import (
+    QKVFusionOption,
+    SDPABackend,
+)
 from flashdreams.recipes.wan.transformer.impl.modules import (
     AttentionBackend,
     Block,
@@ -43,7 +46,13 @@ class CamCtrlBlock(Block):
         eps: float = 1e-6,
         cp_method: Literal["ring", "ulysses"] = "ring",
         attention_backend: AttentionBackend = AttentionBackend.TRITON,
+        self_attention_backend: AttentionBackend | None = None,
+        cross_attention_backend: AttentionBackend | None = None,
         sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
+        cross_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV,
+        use_fp8: bool = True,
     ) -> None:
         super().__init__(
             dim=dim,
@@ -53,7 +62,13 @@ class CamCtrlBlock(Block):
             eps=eps,
             cp_method=cp_method,
             attention_backend=attention_backend,
+            self_attention_backend=self_attention_backend,
+            cross_attention_backend=cross_attention_backend,
             sdpa_backend=sdpa_backend,
+            cross_attn_sdpa_backend=cross_attn_sdpa_backend,
+            self_attn_qkv_fusion_option=self_attn_qkv_fusion_option,
+            cross_attn_qkv_fusion_option=cross_attn_qkv_fusion_option,
+            use_fp8=use_fp8,
         )
         self.cam_injector_layer1 = nn.Linear(dim, dim)
         self.cam_injector_layer2 = nn.Linear(dim, dim)
