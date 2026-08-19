@@ -104,7 +104,6 @@ def test_dit_network_benchmark(
     network = CosmosDiTNetwork(config).to(device=device, dtype=dtype)
     network.eval()
     network.update_parameters_after_loading_checkpoint()
-    parameter_count = sum(parameter.numel() for parameter in network.parameters())
     assert all(
         block.self_attention_backend is case.self_attention_backend
         for block in network.blocks
@@ -224,51 +223,9 @@ def test_dit_network_benchmark(
     torch.cuda.synchronize()
 
     benchmark.group = "omnidreams-dit-network"
-    benchmark.extra_info.update(
-        {
-            "batch_size": _BATCH_SIZE,
-            "num_views": _NUM_VIEWS,
-            "pixel_resolution": [_PIXEL_HEIGHT, _PIXEL_WIDTH],
-            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
-            "chunk_tokens": chunk_tokens,
-            "window_tokens": window_tokens,
-            "text_tokens": _TEXT_TOKENS,
-            "hdmap_channels": config.additional_concat_ch,
-            "model_channels": config.model_channels,
-            "num_blocks": config.num_blocks,
-            "num_heads": config.num_heads,
-            "parameter_count": parameter_count,
-            "checkpoint": "random_init",
-            "dtype": str(dtype),
-            "implementation": case.implementation,
-            "execution_backend": "pytorch",
-            "sdpa_backend": case.sdpa_backend.value,
-            "use_fp8": case.use_fp8,
-            "self_attn_qkv_fusion_option": case.self_attn_qkv_fusion_option.value,
-            "cross_attn_qkv_fusion_option": case.cross_attn_qkv_fusion_option.value,
-            "attention_backend": case.self_attention_operator,
-            "self_attention_backend": case.self_attention_operator,
-            "cross_attention_backend": case.cross_attention_operator,
-            "self_attention_cache_dtype": str(cache.block_caches[0].self_attn.dtype),
-            "cross_attention_cache_dtype": str(cache.block_caches[0].cross_attn.dtype),
-            "compiled": True,
-            "cuda_graph": True,
-            "cache_prefill_chunks": capture_chunk_idx + 1,
-            "benchmark_ar_index": benchmark_chunk_idx,
-            "diffusion_timestep": _DIFFUSION_TIMESTEP,
-            "gpu": torch.cuda.get_device_name(device),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "seed": _SEED,
-        }
-    )
 
     # Repeated scheduler evaluations overwrite one production steady-state slot.
     cache.before_update(benchmark_chunk_idx)
-    torch.cuda.reset_peak_memory_stats(device)
 
     def synchronized_forward() -> torch.Tensor:
         result = forward(benchmark_chunk_idx, rope_freqs[benchmark_chunk_idx])
@@ -282,9 +239,6 @@ def test_dit_network_benchmark(
         warmup_rounds=_WARMUP_ROUNDS,
     )
     cache.after_update(benchmark_chunk_idx)
-    benchmark.extra_info["peak_cuda_memory_bytes"] = torch.cuda.max_memory_allocated(
-        device
-    )
 
     expected_output_shape = (
         _BATCH_SIZE,
@@ -341,7 +295,6 @@ def test_native_cuda_dit_network_benchmark(
     )
     transformer = CosmosTransformer(transformer_config).to(device=device, dtype=dtype)
     transformer.eval()
-    parameter_count = sum(parameter.numel() for parameter in transformer.parameters())
 
     x_unpatched = torch.randn(
         (
@@ -406,7 +359,7 @@ def test_native_cuda_dit_network_benchmark(
     patch_volume = network_config.patch_temporal * network_config.patch_spatial**2
     tokens_per_frame = patch_h * patch_w
     chunk_tokens = patch_t * tokens_per_frame
-    window_tokens = _WINDOW_SIZE_T * tokens_per_frame
+    _WINDOW_SIZE_T * tokens_per_frame
 
     def forward() -> torch.Tensor:
         return transformer.predict_flow(
@@ -437,51 +390,9 @@ def test_native_cuda_dit_network_benchmark(
     )
     assert native_executor._attention_backend == case.native_attention_backend
     benchmark.group = "omnidreams-dit-network"
-    benchmark.extra_info.update(
-        {
-            "batch_size": _BATCH_SIZE,
-            "num_views": _NUM_VIEWS,
-            "pixel_resolution": [_PIXEL_HEIGHT, _PIXEL_WIDTH],
-            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
-            "chunk_tokens": chunk_tokens,
-            "window_tokens": window_tokens,
-            "text_tokens": _TEXT_TOKENS,
-            "hdmap_channels": network_config.additional_concat_ch,
-            "model_channels": network_config.model_channels,
-            "num_blocks": network_config.num_blocks,
-            "num_heads": network_config.num_heads,
-            "parameter_count": parameter_count,
-            "checkpoint": "random_init",
-            "dtype": str(dtype),
-            "implementation": case.implementation,
-            "execution_backend": "native_cuda",
-            "native_dit_backend": transformer_config.native_dit_backend,
-            "native_dit_attention_backend": (
-                transformer_config.native_dit_attention_backend
-            ),
-            "use_fp8": native_executor._uses_fp8_dit,
-            "attention_backend": native_executor._attention_backend,
-            "self_attention_backend": native_executor._attention_backend,
-            "cross_attention_backend": native_executor._attention_backend,
-            "native_extension": native_selection.reason,
-            "compiled": transformer_config.compile_network,
-            "cuda_graph": transformer_config.use_cuda_graph,
-            "cache_prefill_chunks": capture_chunk_idx + 1,
-            "benchmark_ar_index": benchmark_chunk_idx,
-            "diffusion_timestep": _DIFFUSION_TIMESTEP,
-            "gpu": torch.cuda.get_device_name(device),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "seed": _SEED,
-        }
-    )
 
     # Repeated scheduler evaluations overwrite one production steady-state slot.
     cache.start(benchmark_chunk_idx)
-    torch.cuda.reset_peak_memory_stats(device)
 
     def synchronized_forward() -> torch.Tensor:
         result = forward()
@@ -495,9 +406,6 @@ def test_native_cuda_dit_network_benchmark(
         warmup_rounds=_WARMUP_ROUNDS,
     )
     cache.finalize(benchmark_chunk_idx)
-    benchmark.extra_info["peak_cuda_memory_bytes"] = torch.cuda.max_memory_allocated(
-        device
-    )
 
     expected_output_shape = (
         _BATCH_SIZE,

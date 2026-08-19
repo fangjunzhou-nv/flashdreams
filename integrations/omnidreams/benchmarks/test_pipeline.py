@@ -24,7 +24,6 @@ Run the benchmark with::
 
 from __future__ import annotations
 
-import math
 from typing import Literal
 
 import pytest
@@ -154,8 +153,6 @@ def _run_full_pipeline_benchmark(
     assert pipeline.encoder is not None
     assert pipeline.decoder is not None
 
-    parameter_count = sum(parameter.numel() for parameter in pipeline.parameters())
-
     diffusion_config = pipeline_config.diffusion_model
     transformer_config = diffusion_config.transformer
     scheduler_config = diffusion_config.scheduler
@@ -283,189 +280,19 @@ def _run_full_pipeline_benchmark(
     if native_dit:
         assert native_selection is not None and native_selection.enabled
         assert native_executor is not None
-        dit_use_fp8 = native_executor._uses_fp8_dit
-        assert dit_use_fp8 is (case.native_dit_backend == "fp8_kvcache_cudnn")
+        assert native_executor._uses_fp8_dit is (
+            case.native_dit_backend == "fp8_kvcache_cudnn"
+        )
         assert native_executor._attention_backend == case.native_attention_backend
-        first_block_cache = cache.transformer_cache.network_cache.block_caches[0]
-        if dit_use_fp8:
-            fp8_runtime = native_executor._fp8_runtime
-            assert fp8_runtime is not None
-            for cache_name in ("k_self_fp8_caches", "v_self_fp8_caches"):
-                fp8_caches = fp8_runtime[cache_name]
-                assert fp8_caches
-                assert all(
-                    cache_tensor.dtype == torch.uint8 for cache_tensor in fp8_caches
-                )
-            dit_self_kv_cache_dtype = "float8_e4m3fn (uint8 native storage)"
-            if case.native_attention_backend == "sage3_fp8":
-                for cache_name in (
-                    "k_cross_sage3_fp4_caches",
-                    "v_cross_sage3_fp4_caches",
-                ):
-                    fp4_caches = fp8_runtime[cache_name]
-                    assert fp4_caches
-                    assert all(
-                        cache_tensor.dtype == torch.uint8 for cache_tensor in fp4_caches
-                    )
-                for cache_name in (
-                    "k_cross_sage3_sf_caches",
-                    "v_cross_sage3_sf_caches",
-                ):
-                    scale_caches = fp8_runtime[cache_name]
-                    assert scale_caches
-                    assert all(
-                        cache_tensor.dtype == torch.float8_e4m3fn
-                        for cache_tensor in scale_caches
-                    )
-                dit_cross_kv_cache_dtype = "Sage3 FP4 + FP8 scale factors"
-            else:
-                for cache_name in ("k_cross_fp8_caches", "v_cross_fp8_caches"):
-                    fp8_caches = fp8_runtime[cache_name]
-                    assert fp8_caches
-                    assert all(
-                        cache_tensor.dtype == torch.uint8 for cache_tensor in fp8_caches
-                    )
-                dit_cross_kv_cache_dtype = "float8_e4m3fn (uint8 native storage)"
-            if case.native_attention_backend == "sparge":
-                dit_self_kv_cache_dtype += " + bfloat16 Sparge storage"
-                dit_cross_kv_cache_dtype += " + bfloat16 Sparge storage"
-            native_setup = "FP8 conversion, "
-        else:
-            assert native_executor._bf16_runtime is not None
-            dit_self_kv_cache_dtype = str(first_block_cache.self_attn.dtype)
-            dit_cross_kv_cache_dtype = str(first_block_cache.cross_attn.dtype)
-            native_setup = ""
-        dit_execution = "native_cuda"
-        dit_self_attn_qkv_fusion_option = "native_cuda"
-        dit_cross_attn_qkv_fusion_option = "native_cuda"
-        dit_attention_backend = native_executor._attention_backend
-        dit_self_attention_backend = native_executor._attention_backend
-        dit_cross_attention_backend = native_executor._attention_backend
-        dit_sdpa_backend = native_executor._attention_backend
-        dit_kv_cache_dtype = (
-            f"self={dit_self_kv_cache_dtype}, cross={dit_cross_kv_cache_dtype}"
-        )
-        native_extension = native_selection.reason
-        compiler_cache_state = (
-            f"host-dependent; native extension build, {native_setup}CUDA graph "
-            "capture, and autotune excluded by prefill"
-        )
     else:
         assert native_selection is None
         assert native_executor is None
-        dit_execution = "pytorch"
-        dit_use_fp8 = case.use_fp8
-        dit_self_attn_qkv_fusion_option = case.self_attn_qkv_fusion_option.value
-        dit_cross_attn_qkv_fusion_option = case.cross_attn_qkv_fusion_option.value
-        dit_attention_backend = case.self_attention_operator
-        dit_self_attention_backend = case.self_attention_operator
-        dit_cross_attention_backend = case.cross_attention_operator
-        dit_sdpa_backend = case.sdpa_backend.value
-        first_block_cache = cache.transformer_cache.network_cache.block_caches[0]
-        dit_self_kv_cache_dtype = str(first_block_cache.self_attn.dtype)
-        dit_cross_kv_cache_dtype = str(first_block_cache.cross_attn.dtype)
-        dit_kv_cache_dtype = (
-            f"self={dit_self_kv_cache_dtype}, cross={dit_cross_kv_cache_dtype}"
-        )
-        native_extension = None
-        compiler_cache_state = (
-            "host-dependent; compile, CUDA graph capture, and autotune excluded "
-            "by prefill"
-        )
 
-    denoising_timesteps = scheduler_config.denoising_timesteps
-    timed_stages = (
-        ["hdmap_encode", "diffuse", "decode"] if stage == "generate" else ["finalize"]
-    )
-    untimed_lifecycle_stage = "finalize" if stage == "generate" else "generate"
     benchmark.group = f"omnidreams-full-pipeline-{stage}"
-    benchmark.extra_info.update(
-        {
-            "pipeline": pipeline_config.name,
-            "source_pipeline": (SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF.name),
-            "batch_size": _BATCH_SIZE,
-            "num_views": _NUM_VIEWS,
-            "pixel_resolution": [_PIXEL_HEIGHT, _PIXEL_WIDTH],
-            "latent_shape": [
-                transformer_config.len_t,
-                latent_channels,
-                latent_height,
-                latent_width,
-            ],
-            "frames_per_chunk": steady_chunk_frames,
-            "text_tokens": _TEXT_TOKENS,
-            "text_embedding_dim": text_dim,
-            "num_inference_steps": scheduler_config.num_inference_steps,
-            "denoising_timesteps": (
-                list(denoising_timesteps) if denoising_timesteps is not None else None
-            ),
-            "context_noise": diffusion_config.context_noise,
-            "window_size_t": transformer_config.window_size_t,
-            "cache_prefill_chunks": cache_prefill_chunks,
-            "timed_stage": stage,
-            "timed_stages": timed_stages,
-            "untimed_lifecycle_stage": untimed_lifecycle_stage,
-            "one_shot_inputs": "synthetic_precomputed_embeddings",
-            "dit_checkpoint": transformer_config.checkpoint_path,
-            "hdmap_encoder_checkpoint": encoder_config.checkpoint_path,
-            "decoder_checkpoint": decoder_config.checkpoint_path,
-            "dtype": str(dtype),
-            "implementation": case.implementation,
-            "dit_execution": dit_execution,
-            "dit_sdpa_backend": dit_sdpa_backend,
-            "dit_use_fp8": dit_use_fp8,
-            "dit_self_attn_qkv_fusion_option": dit_self_attn_qkv_fusion_option,
-            "dit_cross_attn_qkv_fusion_option": dit_cross_attn_qkv_fusion_option,
-            "dit_attention_backend": dit_attention_backend,
-            "dit_self_attention_backend": dit_self_attention_backend,
-            "dit_cross_attention_backend": dit_cross_attention_backend,
-            "dit_kv_cache_dtype": dit_kv_cache_dtype,
-            "dit_self_attention_kv_cache_dtype": dit_self_kv_cache_dtype,
-            "dit_cross_attention_kv_cache_dtype": dit_cross_kv_cache_dtype,
-            "native_dit_acceleration": transformer_config.native_dit_acceleration,
-            "native_dit_backend": transformer_config.native_dit_backend,
-            "native_dit_attention_backend": (
-                transformer_config.native_dit_attention_backend
-            ),
-            "native_extension": native_extension,
-            "dit_compiled": transformer_config.compile_network,
-            "dit_cuda_graph": transformer_config.use_cuda_graph,
-            "skip_finalize_kv_cache": transformer_config.skip_finalize_kv_cache,
-            "hdmap_encoder_compiled": encoder_config.use_compile,
-            "hdmap_encoder_cuda_graph": encoder_config.use_cuda_graph,
-            "decoder_compiled": decoder_config.use_compile,
-            "decoder_cuda_graph": decoder_config.use_cuda_graph,
-            "parameter_count": parameter_count,
-            "gpu": torch.cuda.get_device_name(device),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "cudnn_benchmark": torch.backends.cudnn.benchmark,
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "startup_timing": "excluded",
-            "first_visible_timing": "excluded",
-            "compiler_cache_state": compiler_cache_state,
-            "num_gpus": torch.cuda.device_count(),
-            "seed": _SEED,
-        }
-    )
 
     next_chunk_index = cache_prefill_chunks
     latest_output: torch.Tensor | None = None
-    stage_peak_cuda_memory_bytes = 0
-
-    def record_stage_peak_memory() -> None:
-        nonlocal stage_peak_cuda_memory_bytes
-        stage_peak_cuda_memory_bytes = max(
-            stage_peak_cuda_memory_bytes,
-            int(torch.cuda.max_memory_allocated(device)),
-        )
-
     if stage == "generate":
-
-        def setup_generate() -> None:
-            torch.cuda.reset_peak_memory_stats(device)
 
         def synchronized_generate() -> torch.Tensor:
             nonlocal latest_output
@@ -479,7 +306,6 @@ def _run_full_pipeline_benchmark(
 
         def teardown_generate() -> None:
             nonlocal next_chunk_index
-            record_stage_peak_memory()
             pipeline.finalize(
                 autoregressive_index=next_chunk_index,
                 cache=cache,
@@ -489,7 +315,6 @@ def _run_full_pipeline_benchmark(
 
         output = benchmark.pedantic(
             synchronized_generate,
-            setup=setup_generate,
             teardown=teardown_generate,
             iterations=1,
             rounds=_BENCHMARK_ROUNDS,
@@ -505,7 +330,6 @@ def _run_full_pipeline_benchmark(
                 hdmap=hdmap_steady,
             )
             torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats(device)
 
         def synchronized_finalize() -> None:
             pipeline.finalize(
@@ -516,7 +340,6 @@ def _run_full_pipeline_benchmark(
 
         def teardown_finalize() -> None:
             nonlocal next_chunk_index
-            record_stage_peak_memory()
             next_chunk_index += 1
 
         benchmark.pedantic(
@@ -528,28 +351,6 @@ def _run_full_pipeline_benchmark(
             warmup_rounds=_WARMUP_ROUNDS,
         )
         output = latest_output
-
-    benchmark.extra_info["peak_cuda_memory_bytes"] = stage_peak_cuda_memory_bytes
-    assert benchmark.stats is not None
-    sample_times_s = benchmark.stats.stats.sorted_data
-    p90_index = math.ceil(0.9 * len(sample_times_s)) - 1
-    median_stage_s = benchmark.stats.stats.median
-    p90_stage_s = sample_times_s[p90_index]
-    benchmark.extra_info.update(
-        {
-            f"median_{stage}_ms": median_stage_s * 1_000,
-            f"p90_{stage}_ms": p90_stage_s * 1_000,
-            "median_chunks_per_second": 1.0 / median_stage_s,
-            "p90_chunks_per_second": 1.0 / p90_stage_s,
-        }
-    )
-    if stage == "generate":
-        benchmark.extra_info.update(
-            {
-                "median_output_fps": steady_chunk_frames / median_stage_s,
-                "p90_output_fps": steady_chunk_frames / p90_stage_s,
-            }
-        )
 
     assert output is not None
     assert output.shape == (

@@ -32,10 +32,10 @@ from flashdreams.accelerated.multi_head_attention_triton import (
 
 @dataclass(frozen=True)
 class AttentionBenchmarkCase:
-    """Configuration and metadata for one attention benchmark implementation."""
+    """Configuration for one attention benchmark implementation."""
 
     implementation: str
-    """Stable implementation name stored in benchmark metadata."""
+    """Stable implementation name used by pytest and pipeline setup."""
 
     self_attention_backend: AttentionBackend
     """Self-attention implementation configured for this case."""
@@ -45,12 +45,6 @@ class AttentionBenchmarkCase:
 
     sdpa_backend: SDPABackend
     """SDPA backend configured for accelerated self-attention."""
-
-    self_attention_operator: str
-    """Self-attention operator reported in benchmark metadata."""
-
-    cross_attention_operator: str
-    """Cross-attention operator reported in benchmark metadata."""
 
     use_fp8: bool = True
     """Whether accelerated projections and supported attention storage use FP8."""
@@ -85,8 +79,6 @@ BENCHMARK_CASES = [
         self_attention_backend=AttentionBackend.OMNIDREAMS,
         cross_attention_backend=AttentionBackend.OMNIDREAMS,
         sdpa_backend=SDPABackend.CUDNN,
-        self_attention_operator="cudnn",
-        cross_attention_operator="cudnn",
         use_fp8=False,
         self_attn_qkv_fusion_option=QKVFusionOption.NONE,
         cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
@@ -96,8 +88,6 @@ BENCHMARK_CASES = [
         self_attention_backend=AttentionBackend.TRITON,
         cross_attention_backend=AttentionBackend.TRITON,
         sdpa_backend=SDPABackend.TRITON,
-        self_attention_operator="triton_fa2",
-        cross_attention_operator="triton_fa2",
         minimum_compute_capability=(9, 0),
     ),
     AttentionBenchmarkCase(
@@ -105,8 +95,6 @@ BENCHMARK_CASES = [
         self_attention_backend=AttentionBackend.TRITON,
         cross_attention_backend=AttentionBackend.TRITON,
         sdpa_backend=SDPABackend.CUDNN,
-        self_attention_operator="torch_cudnn_sdpa",
-        cross_attention_operator="torch_cudnn_sdpa",
         use_fp8=False,
     ),
     AttentionBenchmarkCase(
@@ -114,8 +102,6 @@ BENCHMARK_CASES = [
         self_attention_backend=AttentionBackend.TRITON,
         cross_attention_backend=AttentionBackend.OMNIDREAMS,
         sdpa_backend=SDPABackend.CUDNN,
-        self_attention_operator="torch_cudnn_sdpa",
-        cross_attention_operator="cudnn",
         use_fp8=False,
         cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
     ),
@@ -124,8 +110,6 @@ BENCHMARK_CASES = [
         self_attention_backend=AttentionBackend.OMNIDREAMS,
         cross_attention_backend=AttentionBackend.OMNIDREAMS,
         sdpa_backend=SDPABackend.CUDNN,
-        self_attention_operator="cudnn",
-        cross_attention_operator="cudnn",
         use_fp8=False,
         self_attn_qkv_fusion_option=QKVFusionOption.NONE,
         cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
@@ -136,8 +120,6 @@ BENCHMARK_CASES = [
         self_attention_backend=AttentionBackend.OMNIDREAMS,
         cross_attention_backend=AttentionBackend.OMNIDREAMS,
         sdpa_backend=SDPABackend.CUDNN,
-        self_attention_operator="sparge",
-        cross_attention_operator="sparge",
         use_fp8=False,
         self_attn_qkv_fusion_option=QKVFusionOption.NONE,
         cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
@@ -150,8 +132,6 @@ BENCHMARK_CASES = [
         self_attention_backend=AttentionBackend.OMNIDREAMS,
         cross_attention_backend=AttentionBackend.OMNIDREAMS,
         sdpa_backend=SDPABackend.CUDNN,
-        self_attention_operator="sage3",
-        cross_attention_operator="sage3",
         use_fp8=False,
         self_attn_qkv_fusion_option=QKVFusionOption.NONE,
         cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
@@ -165,8 +145,6 @@ BENCHMARK_CASES = [
         self_attention_backend=AttentionBackend.OMNIDREAMS,
         cross_attention_backend=AttentionBackend.OMNIDREAMS,
         sdpa_backend=SDPABackend.CUDNN,
-        self_attention_operator="sage3_fp8",
-        cross_attention_operator="sage3_fp8",
         use_fp8=False,
         self_attn_qkv_fusion_option=QKVFusionOption.NONE,
         cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
@@ -192,6 +170,6 @@ def skip_unsupported_device(
         return
     if torch.cuda.get_device_capability(device) < minimum:
         pytest.skip(
-            f"{case.pytest_id} attention requires compute capability "
+            f"{case.implementation} attention requires compute capability "
             f"{minimum[0]}.{minimum[1]}+"
         )

@@ -39,7 +39,6 @@ from flashdreams.accelerated.multi_head_attention_triton import (
 )
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from integrations.omnidreams.benchmarks.cases import (
-    BENCHMARK_CASES,
     AttentionBenchmarkCase,
     skip_unsupported_device,
 )
@@ -62,17 +61,16 @@ _WARMUP_ROUNDS = 5
 _BENCHMARK_ROUNDS = 50
 _SEED = 0
 
-_OMNIDREAMS_TORCH_CASE = next(
-    case for case in BENCHMARK_CASES if case.implementation == "omnidreams_torch"
-)
-_HYBRID_ATTENTION_CASE = next(
-    case
-    for case in BENCHMARK_CASES
-    if case.implementation == "triton_cudnn_bf16_full_omnidreams_cross"
-)
-
-_MODULE_BENCHMARK_CASES = [
-    _OMNIDREAMS_TORCH_CASE,
+_MODULE_CASE_MATRIX = [
+    AttentionBenchmarkCase(
+        implementation="omnidreams_torch",
+        self_attention_backend=AttentionBackend.OMNIDREAMS,
+        cross_attention_backend=AttentionBackend.OMNIDREAMS,
+        sdpa_backend=SDPABackend.CUDNN,
+        use_fp8=False,
+        self_attn_qkv_fusion_option=QKVFusionOption.NONE,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+    ),
     *[
         AttentionBenchmarkCase(
             implementation=(
@@ -82,16 +80,6 @@ _MODULE_BENCHMARK_CASES = [
             self_attention_backend=AttentionBackend.TRITON,
             cross_attention_backend=AttentionBackend.TRITON,
             sdpa_backend=sdpa_backend,
-            self_attention_operator=(
-                "triton_fa2"
-                if sdpa_backend is SDPABackend.TRITON
-                else "torch_cudnn_sdpa"
-            ),
-            cross_attention_operator=(
-                "triton_fa2"
-                if sdpa_backend is SDPABackend.TRITON
-                else "torch_cudnn_sdpa"
-            ),
             use_fp8=use_fp8,
             self_attn_qkv_fusion_option=qkv_fusion_option,
             cross_attn_qkv_fusion_option=(
@@ -107,16 +95,23 @@ _MODULE_BENCHMARK_CASES = [
         for use_fp8 in (False, True)
         for qkv_fusion_option in QKVFusionOption
     ],
-    _HYBRID_ATTENTION_CASE,
+    AttentionBenchmarkCase(
+        implementation="triton_cudnn_bf16_full_omnidreams_cross",
+        self_attention_backend=AttentionBackend.TRITON,
+        cross_attention_backend=AttentionBackend.OMNIDREAMS,
+        sdpa_backend=SDPABackend.CUDNN,
+        use_fp8=False,
+        cross_attn_qkv_fusion_option=QKVFusionOption.NONE,
+    ),
 ]
 _MODULE_SELF_ATTENTION_CASES = [
     case
-    for case in _MODULE_BENCHMARK_CASES
+    for case in _MODULE_CASE_MATRIX
     if case.self_attention_backend is case.cross_attention_backend
 ]
 _MODULE_CROSS_ATTENTION_CASES = [
     case
-    for case in _MODULE_BENCHMARK_CASES
+    for case in _MODULE_CASE_MATRIX
     if case.self_attention_backend is AttentionBackend.OMNIDREAMS
     or case.self_attn_qkv_fusion_option is not QKVFusionOption.FULL
 ]
@@ -175,9 +170,7 @@ def _make_block(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-@pytest.mark.parametrize(
-    "case", _MODULE_BENCHMARK_CASES, ids=lambda case: case.pytest_id
-)
+@pytest.mark.parametrize("case", _MODULE_CASE_MATRIX, ids=lambda case: case.pytest_id)
 @torch.inference_mode()
 def test_dit_block_benchmark(
     benchmark: BenchmarkFixture,
@@ -276,43 +269,6 @@ def test_dit_block_benchmark(
     torch.cuda.synchronize()
 
     benchmark.group = "omnidreams-dit-block"
-    benchmark.extra_info.update(
-        {
-            "batch_size": _BATCH_SIZE,
-            "num_views": _NUM_VIEWS,
-            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
-            "chunk_tokens": chunk_tokens,
-            "window_tokens": window_tokens,
-            "text_tokens": _TEXT_TOKENS,
-            "model_channels": config.model_channels,
-            "num_heads": config.num_heads,
-            "parameter_count": sum(
-                parameter.numel() for parameter in block.parameters()
-            ),
-            "checkpoint": "random_init_shared_weights",
-            "dtype": str(dtype),
-            "implementation": case.implementation,
-            "sdpa_backend": case.sdpa_backend.value,
-            "use_fp8": case.use_fp8,
-            "self_attn_qkv_fusion_option": case.self_attn_qkv_fusion_option.value,
-            "cross_attn_qkv_fusion_option": case.cross_attn_qkv_fusion_option.value,
-            "attention_backend": case.self_attention_operator,
-            "self_attention_backend": case.self_attention_operator,
-            "cross_attention_backend": case.cross_attention_operator,
-            "self_attention_cache_dtype": str(cache.self_attn.dtype),
-            "cross_attention_cache_dtype": str(cache.cross_attn.dtype),
-            "cache_state": "full_window_static_context",
-            "cache_prefill_chunks": steady_chunk_idx + 1,
-            "benchmark_chunk_idx": steady_chunk_idx,
-            "gpu": torch.cuda.get_device_name(device),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "seed": _SEED,
-        }
-    )
 
     def synchronized_forward() -> torch.Tensor:
         result = forward(steady_chunk_idx, rope_freqs[steady_chunk_idx])
@@ -395,39 +351,6 @@ def test_self_attention_benchmark(
     torch.cuda.synchronize()
 
     benchmark.group = "omnidreams-dit-self-attention"
-    benchmark.extra_info.update(
-        {
-            "module": "self_attention",
-            "batch_size": _BATCH_SIZE,
-            "num_views": _NUM_VIEWS,
-            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
-            "chunk_tokens": chunk_tokens,
-            "window_tokens": window_tokens,
-            "model_channels": config.model_channels,
-            "num_heads": config.num_heads,
-            "parameter_count": sum(
-                parameter.numel() for parameter in attention.parameters()
-            ),
-            "checkpoint": "random_init_shared_weights",
-            "dtype": str(dtype),
-            "implementation": case.implementation,
-            "sdpa_backend": case.sdpa_backend.value,
-            "use_fp8": case.use_fp8,
-            "qkv_fusion_option": case.self_attn_qkv_fusion_option.value,
-            "attention_backend": case.self_attention_operator,
-            "cache_dtype": str(cache.dtype),
-            "cache_state": "full_window",
-            "cache_prefill_chunks": steady_chunk_idx + 1,
-            "benchmark_chunk_idx": steady_chunk_idx,
-            "gpu": torch.cuda.get_device_name(device),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "seed": _SEED,
-        }
-    )
 
     # Repeated denoising evaluations at one autoregressive position overwrite
     # the final cache chunk while attending over the same full window.
@@ -505,38 +428,6 @@ def test_cross_attention_benchmark(
     torch.cuda.synchronize()
 
     benchmark.group = "omnidreams-dit-cross-attention"
-    benchmark.extra_info.update(
-        {
-            "module": "cross_attention",
-            "batch_size": _BATCH_SIZE,
-            "num_views": _NUM_VIEWS,
-            "latent_shape": [_CHUNK_SIZE_T, _LATENT_HEIGHT, _LATENT_WIDTH],
-            "chunk_tokens": chunk_tokens,
-            "text_tokens": _TEXT_TOKENS,
-            "model_channels": config.model_channels,
-            "context_channels": config.crossattn_emb_channels,
-            "num_heads": config.num_heads,
-            "parameter_count": sum(
-                parameter.numel() for parameter in attention.parameters()
-            ),
-            "checkpoint": "random_init_shared_weights",
-            "dtype": str(dtype),
-            "implementation": case.implementation,
-            "sdpa_backend": case.sdpa_backend.value,
-            "use_fp8": case.use_fp8,
-            "qkv_fusion_option": case.cross_attn_qkv_fusion_option.value,
-            "attention_backend": case.cross_attention_operator,
-            "cache_dtype": str(cache.dtype),
-            "cache_state": "static_context",
-            "gpu": torch.cuda.get_device_name(device),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "warmup_rounds": _WARMUP_ROUNDS,
-            "benchmark_rounds": _BENCHMARK_ROUNDS,
-            "seed": _SEED,
-        }
-    )
 
     def synchronized_forward() -> torch.Tensor:
         result = attention(x, kv_cache=cache)
