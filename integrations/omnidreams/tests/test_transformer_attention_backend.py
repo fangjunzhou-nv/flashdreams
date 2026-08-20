@@ -17,6 +17,11 @@
 
 import pytest
 import torch
+from omnidreams.config import (
+    OMNIDREAMS_CONFIGS,
+    SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_TRITON_RTX_PRO_6000,
+)
+from omnidreams.transformer import CosmosTransformerConfig
 from omnidreams.transformer.impl import modules as transformer_modules
 from omnidreams.transformer.impl.modules import AttentionBackend, Block
 from omnidreams.transformer.impl.network import CosmosDiTNetwork, CosmosDiTNetworkConfig
@@ -54,6 +59,27 @@ def test_dit_attention_backend_defaults_to_omnidreams() -> None:
     assert transformer_modules.MultiHeadAttention.__base__ is torch.nn.Module
     assert isinstance(default_block.self_attn, transformer_modules.SelfAttention)
     assert isinstance(default_block.cross_attn, transformer_modules.CrossAttention)
+
+
+def test_rtx_pro_6000_config_uses_triton_fa2_attention() -> None:
+    """Keep the RTX Pro 6000 preset on Triton FA2 attention."""
+    config = SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_TRITON_RTX_PRO_6000
+    assert config.name == (
+        "omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-triton-rtx-pro-6000"
+    )
+    assert OMNIDREAMS_CONFIGS[config.name] is config
+
+    transformer_config = config.diffusion_model.transformer
+    assert isinstance(transformer_config, CosmosTransformerConfig)
+    network_config = transformer_config.network
+    assert isinstance(network_config, CosmosDiTNetworkConfig)
+    assert network_config.self_attention_backend is AttentionBackend.TRITON
+    assert network_config.cross_attention_backend is AttentionBackend.TRITON
+    assert network_config.sdpa_backend is SDPABackend.FA2
+    assert network_config.cross_attn_sdpa_backend is SDPABackend.FA2
+    assert network_config.use_fp8 is True
+    assert network_config.self_attn_qkv_fusion_option is QKVFusionOption.FULL
+    assert network_config.cross_attn_qkv_fusion_option is QKVFusionOption.NONE
 
 
 @pytest.mark.parametrize(
