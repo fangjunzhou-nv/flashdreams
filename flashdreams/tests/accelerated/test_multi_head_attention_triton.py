@@ -329,7 +329,9 @@ def _check_cross_attention(
     "rope_interleaved", [False, True], ids=["rope-split", "rope-interleaved"]
 )
 @pytest.mark.parametrize(
-    "sdpa_backend", tuple(SDPABackend), ids=lambda value: value.value
+    "sdpa_backend",
+    (SDPABackend.CUDNN, SDPABackend.FA2),
+    ids=lambda value: value.value,
 )
 @pytest.mark.parametrize(
     "qkv_fusion_option", tuple(QKVFusionOption), ids=lambda value: value.value

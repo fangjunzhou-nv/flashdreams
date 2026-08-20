@@ -510,7 +510,7 @@ class TritonCrossAttention(TritonMultiHeadAttention):
         n_heads: int = 8,
         head_dim: int = 64,
         cp_method: Literal["ring", "ulysses"] = "ring",
-        sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        sdpa_backend: SDPABackend = SDPABackend.FA2,
         qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV,
         use_fp8: bool = True,
     ) -> None:
@@ -614,7 +614,7 @@ class TritonSelfAttention(TritonMultiHeadAttention):
         n_heads: int = 8,
         head_dim: int = 64,
         cp_method: Literal["ring", "ulysses"] = "ring",
-        sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        sdpa_backend: SDPABackend = SDPABackend.FA2,
         qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
         use_fp8: bool = True,
     ) -> None:
@@ -715,8 +715,8 @@ class Block(nn.Module):
         cp_method: Literal["ring", "ulysses"] = "ring",
         self_attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS,
         cross_attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS,
-        sdpa_backend: SDPABackend = SDPABackend.TRITON,
-        cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        sdpa_backend: SDPABackend = SDPABackend.FA2,
+        cross_attn_sdpa_backend: SDPABackend = SDPABackend.FA2,
         self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
         cross_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV,
         use_fp8: bool = True,

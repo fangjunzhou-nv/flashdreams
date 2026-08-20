@@ -119,9 +119,9 @@ class WanDiTNetworkConfig(InstantiateConfig):
     """Self-attention implementation; ``None`` uses ``attention_backend``."""
     cross_attention_backend: AttentionBackend | None = None
     """Text cross-attention implementation; ``None`` uses ``attention_backend``."""
-    sdpa_backend: SDPABackend = SDPABackend.TRITON
+    sdpa_backend: SDPABackend = SDPABackend.FA2
     """SDPA implementation used by accelerated self-attention."""
-    cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON
+    cross_attn_sdpa_backend: SDPABackend = SDPABackend.FA2
     """SDPA implementation used by accelerated cross-attention."""
     self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL
     """Projection fusion policy used by accelerated self-attention."""

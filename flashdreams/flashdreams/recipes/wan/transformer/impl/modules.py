@@ -450,7 +450,7 @@ class TritonSelfAttention(TritonMultiHeadAttention):
         cp_method: Literal["ring", "ulysses"] = "ring",
         qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
         use_fp8: bool = True,
-        sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        sdpa_backend: SDPABackend = SDPABackend.FA2,
     ) -> None:
         """Initialize accelerated attention with Wan projection and RoPE policies.
 
@@ -670,7 +670,7 @@ class TritonCrossAttention(TritonMultiHeadAttention):
         cp_method: Literal["ring", "ulysses"] = "ring",
         qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV,
         use_fp8: bool = True,
-        sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        sdpa_backend: SDPABackend = SDPABackend.FA2,
     ) -> None:
         """Initialize accelerated cross-attention with Wan module names.
 
@@ -788,8 +788,8 @@ class Block(nn.Module):
         attention_backend: AttentionBackend = AttentionBackend.WAN,
         self_attention_backend: AttentionBackend | None = None,
         cross_attention_backend: AttentionBackend | None = None,
-        sdpa_backend: SDPABackend = SDPABackend.TRITON,
-        cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON,
+        sdpa_backend: SDPABackend = SDPABackend.FA2,
+        cross_attn_sdpa_backend: SDPABackend = SDPABackend.FA2,
         self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL,
         cross_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FUSE_KV,
         use_fp8: bool = True,

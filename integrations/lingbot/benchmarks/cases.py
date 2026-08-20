@@ -77,7 +77,7 @@ BENCHMARK_CASES = [
         implementation="triton_fa2_fp8_full",
         self_attention_backend=AttentionBackend.TRITON,
         cross_attention_backend=AttentionBackend.TRITON,
-        sdpa_backend=SDPABackend.TRITON,
+        sdpa_backend=SDPABackend.FA2,
         minimum_compute_capability=(9, 0),
     ),
     AttentionBenchmarkCase(

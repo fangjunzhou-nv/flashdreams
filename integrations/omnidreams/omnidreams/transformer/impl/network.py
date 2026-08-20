@@ -130,10 +130,10 @@ class CosmosDiTNetworkConfig(InstantiateConfig):
     cross_attention_backend: AttentionBackend = AttentionBackend.OMNIDREAMS
     """Text and cross-view attention implementation used by every DiT block."""
 
-    sdpa_backend: SDPABackend = SDPABackend.TRITON
+    sdpa_backend: SDPABackend = SDPABackend.FA2
     """SDPA implementation used by accelerated self-attention."""
 
-    cross_attn_sdpa_backend: SDPABackend = SDPABackend.TRITON
+    cross_attn_sdpa_backend: SDPABackend = SDPABackend.FA2
     """SDPA implementation used by accelerated cross-attention."""
 
     self_attn_qkv_fusion_option: QKVFusionOption = QKVFusionOption.FULL

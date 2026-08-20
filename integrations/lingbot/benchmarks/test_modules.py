@@ -75,7 +75,7 @@ _MODULE_CASE_MATRIX = [
     *[
         AttentionBenchmarkCase(
             implementation=(
-                f"triton_{'fa2' if sdpa_backend is SDPABackend.TRITON else 'cudnn'}_"
+                f"triton_{sdpa_backend.value}_"
                 f"{'fp8' if use_fp8 else 'bf16'}_{qkv_fusion_option.value}"
             ),
             self_attention_backend=AttentionBackend.TRITON,
@@ -89,7 +89,7 @@ _MODULE_CASE_MATRIX = [
                 else QKVFusionOption.FUSE_KV
             ),
             minimum_compute_capability=(
-                (9, 0) if use_fp8 or sdpa_backend is SDPABackend.TRITON else None
+                (9, 0) if use_fp8 or sdpa_backend is not SDPABackend.CUDNN else None
             ),
         )
         for sdpa_backend in SDPABackend

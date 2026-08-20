@@ -100,7 +100,7 @@ def test_lingbot_patchify_marks_i2v_and_plucker_as_patchified() -> None:
         pytest.param(
             AttentionBackend.TRITON,
             AttentionBackend.TRITON,
-            SDPABackend.TRITON,
+            SDPABackend.FA2,
             id="triton-fa2",
         ),
         pytest.param(
@@ -171,9 +171,7 @@ def test_lingbot_network_propagates_attention_backends(
             dtype=torch.bfloat16,
         )
         assert cache.dtype is (
-            torch.float8_e4m3fn
-            if sdpa_backend is SDPABackend.TRITON
-            else torch.bfloat16
+            torch.float8_e4m3fn if sdpa_backend is SDPABackend.FA2 else torch.bfloat16
         )
 
 

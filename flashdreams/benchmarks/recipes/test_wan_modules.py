@@ -86,7 +86,7 @@ _BENCHMARK_CASES = (
             qkv_fusion_option,
             id=(
                 f"triton-"
-                f"{'fa2' if sdpa_backend is SDPABackend.TRITON else 'cudnn'}-"
+                f"{sdpa_backend.value}-"
                 f"{'fp8' if use_fp8 else 'bf16'}-"
                 f"{qkv_fusion_option.value.replace('_', '-')}"
             ),

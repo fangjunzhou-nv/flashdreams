@@ -103,7 +103,7 @@ def test_triton_self_attention_matches_default_through_window_roll(
         dtype=torch.bfloat16,
     )
     assert actual_cache.dtype is (
-        torch.float8_e4m3fn if sdpa_backend is SDPABackend.TRITON else torch.bfloat16
+        torch.float8_e4m3fn if sdpa_backend is SDPABackend.FA2 else torch.bfloat16
     )
     rope = RotaryPositionEmbedding3D(
         head_dim=128,

@@ -32,7 +32,7 @@ from flashdreams.accelerated.multi_head_attention_triton import (
 )
 from integrations.omnidreams.benchmarks.cases import BENCHMARK_CASES
 from integrations.omnidreams.benchmarks.test_modules import (
-    _MODULE_BENCHMARK_CASES,
+    _MODULE_CASE_MATRIX,
     _MODULE_CROSS_ATTENTION_CASES,
     _MODULE_SELF_ATTENTION_CASES,
 )
@@ -203,7 +203,7 @@ def test_network_config_selects_triton_attention(
         dtype=torch.bfloat16,
     )
     assert cache.dtype is (
-        torch.float8_e4m3fn if sdpa_backend is SDPABackend.TRITON else torch.bfloat16
+        torch.float8_e4m3fn if sdpa_backend is SDPABackend.FA2 else torch.bfloat16
     )
     with pytest.raises(TypeError, match="FP8 projections require"):
         self_attention.allocate_kv_cache(
@@ -220,12 +220,12 @@ def test_network_config_selects_triton_attention(
     assert block.cross_attn.attention_type is AttentionType.CROSS_ATTENTION
     assert block.cross_attn.qkv_fusion_option is QKVFusionOption.FUSE_KV
     assert block.cross_attn.use_fp8 is True
-    assert block.cross_attn.sdpa_backend is SDPABackend.TRITON
+    assert block.cross_attn.sdpa_backend is SDPABackend.FA2
     assert block.cross_view_attn.context_dim == 32
     assert block.cross_view_attn.attention_type is AttentionType.CROSS_ATTENTION
     assert block.cross_view_attn.qkv_fusion_option is QKVFusionOption.FUSE_KV
     assert block.cross_view_attn.use_fp8 is True
-    assert block.cross_view_attn.sdpa_backend is SDPABackend.TRITON
+    assert block.cross_view_attn.sdpa_backend is SDPABackend.FA2
 
 
 def test_network_config_selects_triton_attention_policies() -> None:
@@ -259,7 +259,7 @@ def test_network_config_selects_triton_attention_policies() -> None:
     assert network.self_attn_qkv_fusion_option is QKVFusionOption.NONE
     assert network.cross_attn_qkv_fusion_option is QKVFusionOption.NONE
     assert network.use_fp8 is False
-    assert self_attention.sdpa_backend is SDPABackend.TRITON
+    assert self_attention.sdpa_backend is SDPABackend.FA2
     assert cross_attention.sdpa_backend is SDPABackend.CUDNN
     assert cross_view_attention.sdpa_backend is SDPABackend.CUDNN
     assert self_attention.qkv_fusion_option is QKVFusionOption.NONE
@@ -298,7 +298,7 @@ def test_benchmark_cases_match_selected_matrix() -> None:
             "triton_fa2_fp8_full",
             AttentionBackend.TRITON,
             AttentionBackend.TRITON,
-            SDPABackend.TRITON,
+            SDPABackend.FA2,
             True,
             QKVFusionOption.FULL,
             QKVFusionOption.FUSE_KV,
@@ -345,7 +345,7 @@ def test_module_benchmark_cases_cover_attention_policy_matrix() -> None:
     """Cover every module SDPA, precision, and QKV fusion combination."""
     triton_cases = [
         case
-        for case in _MODULE_BENCHMARK_CASES
+        for case in _MODULE_CASE_MATRIX
         if case.self_attention_backend is AttentionBackend.TRITON
         and case.cross_attention_backend is AttentionBackend.TRITON
     ]
@@ -364,9 +364,9 @@ def test_module_benchmark_cases_cover_attention_policy_matrix() -> None:
         )
         for case in triton_cases
     } == expected_cases
-    assert len(_MODULE_BENCHMARK_CASES) == 14
-    assert len(_MODULE_SELF_ATTENTION_CASES) == 13
-    assert len(_MODULE_CROSS_ATTENTION_CASES) == 9
+    assert len(_MODULE_CASE_MATRIX) == 20
+    assert len(_MODULE_SELF_ATTENTION_CASES) == 19
+    assert len(_MODULE_CROSS_ATTENTION_CASES) == 13
 
 
 def test_triton_backend_preserves_checkpoint_keys() -> None:

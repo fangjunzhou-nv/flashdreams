@@ -87,7 +87,7 @@ class _ImplementationCase:
             return "reference-torch"
         assert self.sdpa_backend is not None
         assert self.qkv_fusion_option is not None
-        backend = "fa2" if self.sdpa_backend is SDPABackend.TRITON else "cudnn"
+        backend = self.sdpa_backend.value
         precision = "fp8" if self.use_fp8 else "bf16"
         fusion = self.qkv_fusion_option.value.replace("_", "-")
         return f"triton-{backend}-{precision}-{fusion}"

@@ -45,7 +45,7 @@ class SDPABackend(str, Enum):
     CUDNN = "cudnn"
     """Use PyTorch SDPA forced to the cuDNN backend."""
 
-    TRITON = "triton"
+    FA2 = "fa2"
     """Use Triton FlashAttention2 (FA2)."""
 
 
@@ -523,7 +523,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             raise TypeError("FP8 projections require FP16 or BF16 activations")
         cache_dtype = (
             torch.float8_e4m3fn
-            if self.use_fp8 and self.sdpa_backend is SDPABackend.TRITON
+            if self.use_fp8 and self.sdpa_backend is SDPABackend.FA2
             else dtype
         )
         cache = BlockKVCache(
@@ -809,7 +809,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         PyTorch's cuDNN SDPA does not accept FP8 Q/K/V, so ``use_fp8`` affects
         its projection GEMMs but leaves attention and cache storage native.
         """
-        if self.use_fp8 and self.sdpa_backend is SDPABackend.TRITON:
+        if self.use_fp8 and self.sdpa_backend is SDPABackend.FA2:
             return x.to(torch.float8_e4m3fn)
         return x
 
@@ -876,7 +876,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             raise RuntimeError("K/V cache tensors must match the input device")
         expected_dtype = (
             torch.float8_e4m3fn
-            if self.use_fp8 and self.sdpa_backend is SDPABackend.TRITON
+            if self.use_fp8 and self.sdpa_backend is SDPABackend.FA2
             else x.dtype
         )
         if kv_cache._k.dtype != expected_dtype or kv_cache._v.dtype != expected_dtype:
@@ -957,7 +957,7 @@ class TritonMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             raise RuntimeError("K/V cache tensors must match the input device")
         expected_cache_dtype = (
             torch.float8_e4m3fn
-            if self.use_fp8 and self.sdpa_backend is SDPABackend.TRITON
+            if self.use_fp8 and self.sdpa_backend is SDPABackend.FA2
             else x.dtype
         )
         if (
