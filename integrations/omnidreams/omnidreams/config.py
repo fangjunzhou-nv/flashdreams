@@ -37,6 +37,7 @@ from omnidreams.pipeline import (
 )
 from omnidreams.runner import OmnidreamsRunnerConfig
 from omnidreams.transformer import CosmosTransformerConfig
+from omnidreams.transformer.impl.modules import AttentionBackend
 from omnidreams.transformer.impl.network import (
     CosmosDiTNetworkConfig,
 )
@@ -44,6 +45,11 @@ from omnidreams.vae_native import (
     OmnidreamsWanVAEEncoderConfig as WanVAEEncoderConfig,
 )
 
+from flashdreams.accelerated.multi_head_attention.optimized import (
+    QKVFusionOption,
+    SDPABackend,
+    OptimizedImplConfig,
+)
 from flashdreams.infra.config import derive_config
 from flashdreams.infra.diffusion.model import DiffusionModelConfig
 from flashdreams.infra.diffusion.scheduler.fm import (
@@ -152,6 +158,68 @@ SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF = cast(
 )  # ty:ignore[redundant-cast]
 """Performance-tuned variant: enable ``use_compile`` / ``use_cuda_graph``
 on the image encoder, the per-AR-step encoder, and the decoder."""
+
+SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_TRITON_FA2 = cast(
+    OmnidreamsPipelineConfig,
+    derive_config(
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
+        name=("omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-triton-rtx-pro-6000"),
+        diffusion_model=dict(
+            transformer=dict(
+                network=dict(
+                    self_attention_backend=AttentionBackend.OPTIMIZED,
+                    cross_attention_backend=AttentionBackend.OPTIMIZED,
+                    self_attn_optimized_impl_config=OptimizedImplConfig(
+                        qkv_fusion_option=QKVFusionOption.FULL,
+                        sdpa_backend=SDPABackend.FA2,
+                    ),
+                    cross_attn_optimized_impl_config=OptimizedImplConfig(
+                        qkv_fusion_option=QKVFusionOption.NONE,
+                        sdpa_backend=SDPABackend.FA2,
+                    ),
+                ),
+            ),
+        ),
+    ),
+)  # ty:ignore[redundant-cast]
+"""RTX Pro 6000 variant with Triton FA2 attention and FP8 projections."""
+
+SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_CUDNN = cast(
+    OmnidreamsPipelineConfig,
+    derive_config(
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
+        name="omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-cuda-cudnn",
+        diffusion_model=dict(
+            transformer=dict(
+                native_dit_acceleration="required",
+                native_dit_backend="fp8_kvcache_cudnn",
+                native_dit_attention_backend="cudnn",
+            ),
+        ),
+    ),
+)  # ty:ignore[redundant-cast]
+
+SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_SPARGE = cast(
+    OmnidreamsPipelineConfig,
+    derive_config(
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_CUDNN,
+        name="omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-cuda-sparge",
+        diffusion_model=dict(
+            transformer=dict(native_dit_attention_backend="sparge"),
+        ),
+    ),
+)  # ty:ignore[redundant-cast]
+
+SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_SAGE3_FP8 = cast(
+    OmnidreamsPipelineConfig,
+    derive_config(
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_CUDNN,
+        name="omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-cuda-sage3-fp8",
+        diffusion_model=dict(
+            transformer=dict(native_dit_attention_backend="sage3_fp8"),
+        ),
+    ),
+)  # ty:ignore[redundant-cast]
 
 SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_NATIVE_PERF = cast(
     OmnidreamsPipelineConfig,
@@ -412,6 +480,10 @@ OMNIDREAMS_CONFIGS: dict[str, OmnidreamsPipelineConfig] = {
     for cfg in (
         SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE,
         SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_TRITON_FA2,
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_CUDNN,
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_SPARGE,
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_SAGE3_FP8,
         SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_NATIVE_PERF,
         SV_2STEPS_CHUNK2_LOC6_VAE_VAE,
         SV_2STEPS_CHUNK3_LOC6_VAE_VAE,
@@ -461,7 +533,50 @@ RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF = OmnidreamsRunnerConfig(
     description=(
         "Single-view chunk2 perf preset (compile + CUDA graphs across all stages)."
     ),
-    pipeline=SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
+    pipeline=derive_config(
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
+        diffusion_model=dict(transformer=dict(skip_finalize_kv_cache=True)),
+    ),
+    prompt=_DEFAULT_PROMPT_1V,
+)
+
+RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_TRITON_FA2 = OmnidreamsRunnerConfig(
+    runner_name="omnidreams-triton-fa2",
+    description="Single-view chunk2 Triton FA2 preset tuned for RTX PRO 6000.",
+    pipeline=derive_config(
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_TRITON_FA2,
+        diffusion_model=dict(transformer=dict(skip_finalize_kv_cache=True)),
+    ),
+    prompt=_DEFAULT_PROMPT_1V,
+)
+
+RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_CUDNN = OmnidreamsRunnerConfig(
+    runner_name="omnidreams-cuda-cudnn",
+    description="Single-view chunk2 native CUDA DiT with cuDNN attention.",
+    pipeline=derive_config(
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_CUDNN,
+        diffusion_model=dict(transformer=dict(skip_finalize_kv_cache=True)),
+    ),
+    prompt=_DEFAULT_PROMPT_1V,
+)
+
+RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_SPARGE = OmnidreamsRunnerConfig(
+    runner_name="omnidreams-cuda-sparge",
+    description="Single-view chunk2 native CUDA DiT with Sparge attention.",
+    pipeline=derive_config(
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_SPARGE,
+        diffusion_model=dict(transformer=dict(skip_finalize_kv_cache=True)),
+    ),
+    prompt=_DEFAULT_PROMPT_1V,
+)
+
+RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_SAGE3_FP8 = OmnidreamsRunnerConfig(
+    runner_name="omnidreams-cuda-sage3fp8",
+    description="Single-view chunk2 native CUDA DiT with SageAttention-3 FP8.",
+    pipeline=derive_config(
+        SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_SAGE3_FP8,
+        diffusion_model=dict(transformer=dict(skip_finalize_kv_cache=True)),
+    ),
     prompt=_DEFAULT_PROMPT_1V,
 )
 
@@ -569,6 +684,10 @@ OMNIDREAMS_RUNNERS: dict[str, RunnerConfig] = {
     for cfg in (
         RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE,
         RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_PERF,
+        RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_TRITON_FA2,
+        RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_CUDNN,
+        RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_SPARGE,
+        RUNNER_SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_CUDA_SAGE3_FP8,
     )
 }
 """All shipped Omnidreams runners (single- and multi-view variants),

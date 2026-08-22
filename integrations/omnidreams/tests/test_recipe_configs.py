@@ -33,6 +33,7 @@ import pytest
 import tomli as tomllib
 from omnidreams import config as config_mod
 from omnidreams.config import OMNIDREAMS_RUNNERS
+from omnidreams.transformer import CosmosTransformerConfig
 
 from flashdreams.infra.runner import RunnerConfig
 
@@ -51,10 +52,40 @@ def test_public_runner_slugs_map_to_internal_pipeline_presets() -> None:
     expected = {
         "omnidreams": "omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae",
         "omnidreams-perf": "omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-perf",
+        "omnidreams-triton-fa2": (
+            "omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-triton-rtx-pro-6000"
+        ),
+        "omnidreams-cuda-cudnn": (
+            "omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-cuda-cudnn"
+        ),
+        "omnidreams-cuda-sparge": (
+            "omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-cuda-sparge"
+        ),
+        "omnidreams-cuda-sage3fp8": (
+            "omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-cuda-sage3-fp8"
+        ),
     }
     actual = {slug: cfg.pipeline.name for slug, cfg in OMNIDREAMS_RUNNERS.items()}
     assert actual == expected
     assert all(slug == cfg.runner_name for slug, cfg in OMNIDREAMS_RUNNERS.items())
+
+
+def test_accelerated_runners_skip_finalize_kv_cache() -> None:
+    """Only accelerated public runners skip the finalize cache refresh."""
+    skipped = set()
+    for slug, cfg in OMNIDREAMS_RUNNERS.items():
+        transformer = cfg.pipeline.diffusion_model.transformer
+        assert isinstance(transformer, CosmosTransformerConfig)
+        if transformer.skip_finalize_kv_cache:
+            skipped.add(slug)
+
+    assert skipped == {
+        "omnidreams-perf",
+        "omnidreams-triton-fa2",
+        "omnidreams-cuda-cudnn",
+        "omnidreams-cuda-sparge",
+        "omnidreams-cuda-sage3fp8",
+    }
 
 
 def test_runners_have_descriptions() -> None:
