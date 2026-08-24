@@ -13,22 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Performance plots for Omnidreams benchmark results."""
+"""Shared rendering for Omnidreams benchmark plots."""
 
 from __future__ import annotations
 
-import argparse
-import json
 import math
 import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.colors import CenteredNorm
 
-_DEFAULT_INPUT = Path("artifacts/benchmark/omnidreams/benchmark.json")
-_DEFAULT_OUTPUT_DIR = Path("artifacts/benchmark/omnidreams")
+from scripts.benchmark.common import (
+    add_relative_colorbar,
+    annotate_relative_cell,
+    benchmark_median_ms,
+    benchmark_subtitle,
+    draw_relative_heatmap,
+    load_benchmark_json,
+    save_figure,
+)
 
 _ATTENTION_PANELS = (
     ("omnidreams-dit-self-attention", "Self-attention"),
@@ -46,11 +49,11 @@ _END_TO_END_PANELS = (
 _PANELS = (*_ATTENTION_PANELS, _DIT_BLOCK_PANEL, *_END_TO_END_PANELS)
 
 _NATIVE_LABELS = {
-    "omnidreams-torch": "PyTorch Omnidreams BF16",
-    "cuda": "CUDA cuDNN FP8",
-    "cuda-sparge": "CUDA Sparge FP8",
-    "cuda-sage3": "CUDA Sage3 BF16",
-    "cuda-sage3-fp8": "CUDA Sage3 FP8",
+    "omnidreams-torch": "PyTorch\nOmnidreams\nBF16",
+    "cuda": "CUDA\ncuDNN\nFP8",
+    "cuda-sparge": "CUDA\nSparge\nFP8",
+    "cuda-sage3": "CUDA\nSage3\nBF16",
+    "cuda-sage3-fp8": "CUDA\nSage3\nFP8",
 }
 """Implementation labels for configurations without parseable optimized IDs."""
 
@@ -65,45 +68,15 @@ BenchmarkValues = dict[str, dict[str, float]]
 Panel = tuple[str, str]
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse benchmark input and plot output paths.
-
-    Args:
-        argv: Command-line arguments; ``None`` reads ``sys.argv``.
-
-    Returns:
-        Parsed command-line arguments.
-    """
-    parser = argparse.ArgumentParser(
-        description="Plot Omnidreams median benchmark latency as three figures."
-    )
-    parser.add_argument(
-        "input",
-        nargs="?",
-        type=Path,
-        default=_DEFAULT_INPUT,
-        help=f"pytest-benchmark JSON path (default: {_DEFAULT_INPUT})",
-    )
-    parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        default=_DEFAULT_OUTPUT_DIR,
-        help=f"output directory (default: {_DEFAULT_OUTPUT_DIR})",
-    )
-    parser.add_argument(
-        "--pipeline-generate-only",
-        action="store_true",
-        help="write only the pipeline generate benchmark figure",
-    )
-    return parser.parse_args(argv)
-
-
-def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
+def _load_results(
+    input_path: Path,
+    panels: tuple[Panel, ...] = _PANELS,
+) -> tuple[BenchmarkValues, list[str], str]:
     """Load Omnidreams median timings and environment metadata.
 
     Args:
         input_path: Pytest-benchmark JSON file to parse.
+        panels: Benchmark groups required by the requested figures.
 
     Returns:
         Median milliseconds by group and implementation, configuration order,
@@ -112,22 +85,12 @@ def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
     Raises:
         SystemExit: The input cannot be read or lacks complete Omnidreams data.
     """
-    try:
-        payload = json.loads(input_path.read_text(encoding="utf-8"))
-    except OSError as error:
-        raise SystemExit(f"Cannot read benchmark JSON {input_path}: {error}") from error
-    except json.JSONDecodeError as error:
-        raise SystemExit(
-            f"Cannot parse benchmark JSON {input_path}: {error}"
-        ) from error
+    payload, benchmark_records = load_benchmark_json(input_path)
 
-    if not isinstance(payload, dict) or not isinstance(payload.get("benchmarks"), list):
-        raise SystemExit(f"Benchmark JSON {input_path} has no benchmarks list")
-
-    values: BenchmarkValues = {group: {} for group, _ in _PANELS}
+    values: BenchmarkValues = {group: {} for group, _ in panels}
     configurations: list[str] = []
 
-    for record in payload["benchmarks"]:
+    for record in benchmark_records:
         if not isinstance(record, dict):
             continue
         group = record.get("group")
@@ -139,21 +102,10 @@ def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
                 f"Benchmark {record.get('name', '<unnamed>')} has no parameter ID"
             )
         implementation = param
-        stats = record.get("stats")
-        median = stats.get("median") if isinstance(stats, dict) else None
-        if (
-            isinstance(median, bool)
-            or not isinstance(median, (int, float))
-            or not math.isfinite(median)
-            or median <= 0
-        ):
-            raise SystemExit(
-                f"Benchmark {record.get('name', '<unnamed>')} has no positive median"
-            )
         if implementation in values[group]:
             raise SystemExit(f"Duplicate benchmark for {group} and {implementation}")
 
-        values[group][implementation] = median * 1000.0
+        values[group][implementation] = benchmark_median_ms(record)
         if implementation not in configurations:
             configurations.append(implementation)
 
@@ -162,20 +114,7 @@ def _load_results(input_path: Path) -> tuple[BenchmarkValues, list[str], str]:
         raise SystemExit(
             f"Benchmark JSON {input_path} lacks groups: {', '.join(missing)}"
         )
-    return values, configurations, _subtitle(payload)
-
-
-def _subtitle(payload: dict[str, object]) -> str:
-    """Build a compact benchmark-environment subtitle."""
-    parts = ["Median latency in ms (lower is faster)"]
-    commit_info = payload.get("commit_info")
-    commit_id = commit_info.get("id") if isinstance(commit_info, dict) else None
-    if isinstance(commit_id, str) and commit_id:
-        parts.append(f"commit {commit_id[:10]}")
-    timestamp = payload.get("datetime")
-    if isinstance(timestamp, str) and timestamp:
-        parts.append(timestamp)
-    return " · ".join(parts)
+    return values, configurations, benchmark_subtitle(payload)
 
 
 def _backend_label(backend: str) -> str:
@@ -183,60 +122,77 @@ def _backend_label(backend: str) -> str:
 
 
 def _attention_configuration_label(implementation: str) -> str:
-    """Format one attention implementation as a compact axis label.
+    """Format one attention implementation as a multiline axis label.
 
     Args:
         implementation: Stable benchmark implementation identifier.
 
     Returns:
-        Backend, fusion, TMA, and projection-quantization label.
+        Backend, fusion, TMA, projection, and SDPA labels.
     """
     if implementation == "omnidreams":
-        return "Omnidreams"
+        return "Omnidreams\nreference"
     match = re.fullmatch(
         r"(?:optimized|triton)-(cudnn|fa2)-(none|full|fuse-kv)-(no-tma|tma)"
-        r"(?:-projection-(float8-e4m3fn))?",
+        r"(?:-projection-(float8-e4m3fn))?(-quantized-sdpa)?",
         implementation,
     )
     if match is None:
-        return implementation.replace("-", " ")
-    backend, fusion, tma, projection = match.groups()
-    tma_label = "no TMA" if tma == "no-tma" else "TMA"
-    projection_label = "" if projection is None else "\nProjection: FP8 E4M3"
-    return (
-        f"Optimized {_backend_label(backend)}\n"
-        f"{_FUSION_LABELS[fusion]} · {tma_label}{projection_label}"
-    )
+        return "\n".join(implementation.split("-"))
+    backend, fusion, tma, projection, quantized_sdpa = match.groups()
+    labels = [
+        "Optimized",
+        _backend_label(backend),
+        f"Fusion: {_FUSION_LABELS[fusion]}",
+        "No TMA" if tma == "no-tma" else "TMA",
+    ]
+    if projection is not None:
+        labels.extend(("Projection:", "FP8 E4M3"))
+    if quantized_sdpa is not None:
+        labels.extend(("SDPA:", "FP8 E4M3"))
+    return "\n".join(labels)
 
 
 def _end_to_end_configuration_label(implementation: str) -> str:
-    """Format one network or pipeline implementation as an axis label.
+    """Format one network or pipeline implementation as a multiline axis label.
 
     Args:
         implementation: Stable benchmark implementation identifier.
 
     Returns:
-        Implementation, self-attention, and cross-attention label.
+        Implementation, precision, self-attention, and cross-attention labels.
     """
     native_label = _NATIVE_LABELS.get(implementation)
     if native_label is not None:
         return native_label
 
     selected = re.fullmatch(
-        r"(?:optimized|triton)-(cudnn|fa2)-(bf16)-self-(none|full|fuse-kv)-"
-        r"(no-tma|tma)-cross-(none|fuse-kv)-(no-tma|tma)",
+        r"(?:optimized|triton)-(cudnn|fa2)-(bf16|fp8|quantized-sdpa)-"
+        r"self-(none|full|fuse-kv)-(no-tma|tma)-"
+        r"cross-(none|fuse-kv)-(no-tma|tma)",
         implementation,
     )
     if selected is not None:
         backend, precision, self_fusion, self_tma, cross_fusion, cross_tma = (
             selected.groups()
         )
-        self_tma_label = "no TMA" if self_tma == "no-tma" else "TMA"
-        cross_tma_label = "no TMA" if cross_tma == "no-tma" else "TMA"
-        return (
-            f"Optimized {_backend_label(backend)} {precision.upper()}\n"
-            f"Self: {_FUSION_LABELS[self_fusion]} · {self_tma_label}\n"
-            f"Cross: {_FUSION_LABELS[cross_fusion]} · {cross_tma_label}"
+        precision_label = {
+            "bf16": "BF16",
+            "fp8": "FP8 projections",
+            "quantized-sdpa": "FP8 projections + SDPA",
+        }[precision]
+        return "\n".join(
+            (
+                "Optimized",
+                _backend_label(backend),
+                precision_label,
+                "Self:",
+                _FUSION_LABELS[self_fusion],
+                "No TMA" if self_tma == "no-tma" else "TMA",
+                "Cross:",
+                _FUSION_LABELS[cross_fusion],
+                "No TMA" if cross_tma == "no-tma" else "TMA",
+            )
         )
 
     legacy = re.fullmatch(
@@ -245,18 +201,25 @@ def _end_to_end_configuration_label(implementation: str) -> str:
         implementation,
     )
     if legacy is None:
-        return implementation.replace("-", " ")
+        return "\n".join(implementation.split("-"))
     backend, precision, self_fusion, omnidreams_cross = legacy.groups()
     cross_fusion = "fuse-kv" if self_fusion == "full" else self_fusion
-    cross_label = (
-        "Omnidreams · None"
+    cross_labels = (
+        ("Omnidreams", "No fusion")
         if omnidreams_cross is not None
-        else f"{_FUSION_LABELS[cross_fusion]} · TMA"
+        else (_FUSION_LABELS[cross_fusion], "TMA")
     )
-    return (
-        f"Optimized {_backend_label(backend)} {precision.upper()}\n"
-        f"Self: {_FUSION_LABELS[self_fusion]} · TMA\n"
-        f"Cross: {cross_label}"
+    return "\n".join(
+        (
+            "Optimized",
+            _backend_label(backend),
+            precision.upper(),
+            "Self:",
+            _FUSION_LABELS[self_fusion],
+            "TMA",
+            "Cross:",
+            *cross_labels,
+        )
     )
 
 
@@ -369,7 +332,7 @@ def _write_bar_figure(
         finite_latencies = [value for value in latencies if math.isfinite(value)]
         axes_item.set_ylim(0, max(finite_latencies) * 1.2)
         axes_item.set_title(panel_title)
-        axes_item.set_ylabel("Median latency (ms)")
+        axes_item.set_ylabel("Median\nlatency\n(ms)")
 
         for index, (bar, latency, configuration) in enumerate(
             zip(bars, latencies, ordered_configurations, strict=True)
@@ -379,7 +342,7 @@ def _write_bar_figure(
                 axes_item.text(
                     index,
                     0.02,
-                    "N/A",
+                    "N/A\nnot measured",
                     transform=axes_item.get_xaxis_transform(),
                     ha="center",
                     va="bottom",
@@ -403,20 +366,17 @@ def _write_bar_figure(
                 configuration_label(configuration)
                 for configuration in ordered_configurations
             ],
-            rotation=45,
-            ha="right",
-            rotation_mode="anchor",
+            rotation=0,
+            ha="center",
         )
 
     figure.supxlabel(
-        "Configuration (self-attention + cross-attention)"
+        "Configuration\n(self-attention + cross-attention)"
         if end_to_end
-        else "Configuration (SDPA backend / QKV fusion / TMA / projection dtype)"
+        else "Configuration\n(SDPA backend / QKV fusion /\nTMA / projection dtype)"
     )
     figure.suptitle(f"{title}\n{subtitle}")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path)
-    plt.close(figure)
+    save_figure(figure, output_path)
 
 
 def _split_block_implementation(
@@ -498,38 +458,32 @@ def _write_block_figure(
         ),
         layout="constrained",
     )
-    image = axes.imshow(
-        matrix,
-        aspect="auto",
-        cmap="RdYlGn_r",
-        norm=CenteredNorm(vcenter=1.0),
-    )
+    image = draw_relative_heatmap(axes, matrix)
     axes.set_xticks(
         range(len(cross_configurations)),
         labels=[
-            _attention_configuration_label(configuration).removeprefix("Optimized ")
+            _attention_configuration_label(configuration).removeprefix("Optimized\n")
             for configuration in cross_configurations
         ],
-        rotation=45,
-        ha="right",
-        rotation_mode="anchor",
+        rotation=0,
+        ha="center",
     )
     axes.set_yticks(
         range(len(self_configurations)),
         labels=[
-            _attention_configuration_label(configuration).removeprefix("Optimized ")
+            _attention_configuration_label(configuration).removeprefix("Optimized\n")
             for configuration in self_configurations
         ],
     )
-    axes.set_xlabel("Cross-attention implementation")
-    axes.set_ylabel("Self-attention implementation")
+    axes.set_xlabel("Cross-attention\nimplementation")
+    axes.set_ylabel("Self-attention\nimplementation")
     axes.set_title(f"Omnidreams DiT block performance\n{subtitle}")
 
     for self_index, self_implementation in enumerate(self_configurations):
         for cross_index, cross_implementation in enumerate(cross_configurations):
             latency = latencies.get((self_implementation, cross_implementation))
             if latency is None:
-                label = "N/A"
+                label = "N/A\nnot measured"
             else:
                 label = _bar_label(
                     latency,
@@ -541,65 +495,31 @@ def _write_block_figure(
                     == reference_key,
                 )
             relative_value = matrix[self_index][cross_index]
-            text_color = "black"
-            if math.isfinite(relative_value):
-                red, green, blue, _ = image.cmap(image.norm(np.asarray(relative_value)))
-                linear = tuple(
-                    channel / 12.92
-                    if channel <= 0.04045
-                    else ((channel + 0.055) / 1.055) ** 2.4
-                    for channel in (red, green, blue)
-                )
-                luminance = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
-                text_color = "white" if luminance < 0.179 else "black"
-            axes.text(
-                cross_index,
+            annotate_relative_cell(
+                axes,
+                image,
                 self_index,
+                cross_index,
                 label,
-                ha="center",
-                va="center",
-                color=text_color,
+                relative_value,
             )
 
-    colorbar = figure.colorbar(
+    add_relative_colorbar(
+        figure,
+        axes,
         image,
-        ax=axes,
-        label="Runtime relative to all-Omnidreams reference (×)",
+        "Runtime relative to\nall-Omnidreams reference (×)",
+        multiline_directions=True,
     )
-    colorbar.ax.text(
-        0.5, 1.02, "Slower ↑", ha="center", transform=colorbar.ax.transAxes
-    )
-    colorbar.ax.text(
-        0.5,
-        -0.04,
-        "↓ Faster",
-        ha="center",
-        va="top",
-        transform=colorbar.ax.transAxes,
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path)
-    plt.close(figure)
+    save_figure(figure, output_path)
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Generate the three Omnidreams benchmark figures."""
-    args = _parse_args(argv)
-    values, configurations, subtitle = _load_results(args.input)
-    if args.pipeline_generate_only:
-        output_path = args.output_dir / "pipeline_generate.png"
-        _write_bar_figure(
-            output_path,
-            "Omnidreams pipeline generate benchmark",
-            (_PIPELINE_GENERATE_PANEL,),
-            values,
-            configurations,
-            subtitle,
-        )
-        print(f"Wrote {output_path}")
-        return
+def plot_modules(input_path: Path, output_dir: Path) -> None:
+    """Generate attention-module and DiT-block benchmark figures."""
+    panels = (*_ATTENTION_PANELS, _DIT_BLOCK_PANEL)
+    values, configurations, subtitle = _load_results(input_path, panels)
 
-    attention_output = args.output_dir / "modules.png"
+    attention_output = output_dir / "modules.png"
     _write_bar_figure(
         attention_output,
         "Omnidreams attention module benchmarks",
@@ -610,21 +530,34 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"Wrote {attention_output}")
 
-    block_output = args.output_dir / "dit_block.png"
+    block_output = output_dir / "dit_block.png"
     _write_block_figure(block_output, values, subtitle)
     print(f"Wrote {block_output}")
 
-    end_to_end_output = args.output_dir / "network_pipeline.png"
+
+def plot_pipeline(
+    input_path: Path,
+    output_dir: Path,
+    *,
+    pipeline_generate_only: bool = False,
+) -> None:
+    """Generate network and pipeline benchmark figures."""
+    panels = (
+        (_PIPELINE_GENERATE_PANEL,) if pipeline_generate_only else _END_TO_END_PANELS
+    )
+    values, configurations, subtitle = _load_results(input_path, panels)
+    if pipeline_generate_only:
+        output_path = output_dir / "pipeline_generate.png"
+        title = "Omnidreams pipeline generate benchmark"
+    else:
+        output_path = output_dir / "network_pipeline.png"
+        title = "Omnidreams network and pipeline benchmarks"
     _write_bar_figure(
-        end_to_end_output,
-        "Omnidreams network and pipeline benchmarks",
-        _END_TO_END_PANELS,
+        output_path,
+        title,
+        panels,
         values,
         configurations,
         subtitle,
     )
-    print(f"Wrote {end_to_end_output}")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"Wrote {output_path}")

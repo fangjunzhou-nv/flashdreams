@@ -6,11 +6,14 @@ set -euo pipefail
 shopt -s globstar nullglob
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-cd "$(cd "$script_dir/../.." && pwd)"
+repo_root=$(cd "$script_dir/../.." && pwd)
+cd "$repo_root"
 
 status=0
 for plot_script in "$script_dir"/**/plot*.py; do
-    uv run python "$plot_script" || status=$?
+    plot_module=${plot_script#"$repo_root/"}
+    plot_module=${plot_module%.py}
+    uv run python -m "${plot_module//\//.}" || status=$?
 done
 
 exit "$status"

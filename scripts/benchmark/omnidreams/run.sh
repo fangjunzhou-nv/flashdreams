@@ -4,13 +4,7 @@
 
 set -euo pipefail
 
-cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-mkdir -p artifacts/benchmark/omnidreams
-uv run --package flashdreams-omnidreams python integrations/omnidreams/omnidreams_singleview/tools/sync_thirdparty.py sync
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-uv run --project integrations/omnidreams --group test pytest \
-    integrations/omnidreams/benchmarks \
-    -p no:manual_marker -m manual --benchmark-only -v "$@" \
-    --benchmark-json=artifacts/benchmark/omnidreams/benchmark.json
-
-uv run python scripts/benchmark/omnidreams/plot.py
+"$script_dir/run_module.sh" "$@"
+"$script_dir/run_pipeline.sh" "$@"

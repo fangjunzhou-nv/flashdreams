@@ -18,14 +18,22 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.colors import CenteredNorm
+
+from scripts.benchmark.common import (
+    add_plot_io_arguments,
+    add_relative_colorbar,
+    annotate_relative_cell,
+    benchmark_median_ms,
+    benchmark_subtitle,
+    draw_relative_heatmap,
+    load_benchmark_json,
+    save_figure,
+)
 
 _DEFAULT_OUTPUT_DIR = Path("artifacts/benchmark/flashdreams/accelerated/quantization")
 _DEFAULT_INPUT = _DEFAULT_OUTPUT_DIR / "benchmark.json"
@@ -65,20 +73,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot Torch and Triton quantizer median latency as PNG matrices."
     )
-    parser.add_argument(
-        "input",
-        nargs="?",
-        type=Path,
-        default=_DEFAULT_INPUT,
-        help=f"pytest-benchmark JSON path (default: {_DEFAULT_INPUT})",
-    )
-    parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        default=_DEFAULT_OUTPUT_DIR,
-        help=f"output directory (default: {_DEFAULT_OUTPUT_DIR})",
-    )
+    add_plot_io_arguments(parser, _DEFAULT_INPUT, _DEFAULT_OUTPUT_DIR)
     return parser.parse_args(argv)
 
 
@@ -95,20 +90,10 @@ def _load_results(input_path: Path) -> tuple[dict[CellKey, float], str]:
     Raises:
         SystemExit: The input cannot be read or lacks complete quantizer data.
     """
-    try:
-        payload = json.loads(input_path.read_text(encoding="utf-8"))
-    except OSError as error:
-        raise SystemExit(f"Cannot read benchmark JSON {input_path}: {error}") from error
-    except json.JSONDecodeError as error:
-        raise SystemExit(
-            f"Cannot parse benchmark JSON {input_path}: {error}"
-        ) from error
-
-    if not isinstance(payload, dict) or not isinstance(payload.get("benchmarks"), list):
-        raise SystemExit(f"Benchmark JSON {input_path} has no benchmarks list")
+    payload, benchmark_records = load_benchmark_json(input_path)
 
     values_ms: dict[CellKey, float] = {}
-    for record in payload["benchmarks"]:
+    for record in benchmark_records:
         if not isinstance(record, dict):
             continue
         group = record.get("group")
@@ -120,22 +105,13 @@ def _load_results(input_path: Path) -> tuple[dict[CellKey, float], str]:
         implementation = (
             extra_info.get("implementation") if isinstance(extra_info, dict) else None
         )
-        if implementation not in _IMPLEMENTATIONS:
+        if (
+            not isinstance(implementation, str)
+            or implementation not in _IMPLEMENTATIONS
+        ):
             raise SystemExit(
                 f"Benchmark {record.get('name', '<unnamed>')} has no supported "
                 "implementation metadata"
-            )
-
-        stats = record.get("stats")
-        median = stats.get("median") if isinstance(stats, dict) else None
-        if (
-            isinstance(median, bool)
-            or not isinstance(median, (int, float))
-            or not math.isfinite(median)
-            or median <= 0
-        ):
-            raise SystemExit(
-                f"Benchmark {record.get('name', '<unnamed>')} has no positive median"
             )
 
         cell = (
@@ -146,7 +122,7 @@ def _load_results(input_path: Path) -> tuple[dict[CellKey, float], str]:
         )
         if cell in values_ms:
             raise SystemExit(f"Duplicate quantizer benchmark cell for {cell}")
-        values_ms[cell] = median * 1000.0
+        values_ms[cell] = benchmark_median_ms(record)
 
     missing_operations = [
         operation
@@ -158,20 +134,7 @@ def _load_results(input_path: Path) -> tuple[dict[CellKey, float], str]:
             f"Benchmark JSON {input_path} lacks quantizer operations: "
             f"{', '.join(missing_operations)}"
         )
-    return values_ms, _subtitle(payload)
-
-
-def _subtitle(payload: dict[str, object]) -> str:
-    """Build a compact benchmark-environment subtitle."""
-    parts = ["Median latency in ms (lower is faster)"]
-    commit_info = payload.get("commit_info")
-    commit_id = commit_info.get("id") if isinstance(commit_info, dict) else None
-    if isinstance(commit_id, str) and commit_id:
-        parts.append(f"commit {commit_id[:10]}")
-    timestamp = payload.get("datetime")
-    if isinstance(timestamp, str) and timestamp:
-        parts.append(timestamp)
-    return " · ".join(parts)
+    return values_ms, benchmark_subtitle(payload)
 
 
 def _cell_label(
@@ -246,12 +209,7 @@ def _write_png(
         max(default_width, len(_COLUMNS) * 1.8),
         max(default_height, len(_FORMATS) * 1.2),
     )
-    image = axes.imshow(
-        np.asarray(matrix),
-        aspect="auto",
-        cmap="RdYlGn_r",
-        norm=CenteredNorm(vcenter=1.0),
-    )
+    image = draw_relative_heatmap(axes, matrix)
     axes.set_xticks(
         range(len(_COLUMNS)),
         labels=[
@@ -277,44 +235,24 @@ def _write_png(
                 is_reference=implementation == "torch",
             )
 
-            text_color = "black"
             relative_value = matrix[row_index][column_index]
-            if math.isfinite(relative_value):
-                colors = image.cmap(image.norm(np.asarray([relative_value])))
-                red, green, blue, _ = np.asarray(colors)[0]
-                linear = tuple(
-                    channel / 12.92
-                    if channel <= 0.04045
-                    else ((channel + 0.055) / 1.055) ** 2.4
-                    for channel in (red, green, blue)
-                )
-                luminance = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
-                text_color = "white" if luminance < 0.179 else "black"
-            axes.text(
-                column_index,
+            annotate_relative_cell(
+                axes,
+                image,
                 row_index,
+                column_index,
                 label,
-                ha="center",
-                va="center",
-                color=text_color,
+                relative_value,
             )
 
-    colorbar = figure.colorbar(image, ax=axes, label="Runtime relative to Torch (×)")
-    colorbar.ax.text(
-        0.5, 1.02, "Slower ↑", ha="center", transform=colorbar.ax.transAxes
-    )
-    colorbar.ax.text(
-        0.5,
-        -0.04,
-        "↓ Faster",
-        ha="center",
-        va="top",
-        transform=colorbar.ax.transAxes,
+    add_relative_colorbar(
+        figure,
+        axes,
+        image,
+        "Runtime relative to Torch (×)",
     )
     figure.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path)
-    plt.close(figure)
+    save_figure(figure, output_path)
 
 
 def main(argv: list[str] | None = None) -> None:

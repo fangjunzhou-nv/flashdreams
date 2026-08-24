@@ -12,4 +12,5 @@ uv run --project flashdreams --group test pytest \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json=artifacts/benchmark/flashdreams/accelerated/multi_head_attention/benchmark.json
 
-uv run python scripts/benchmark/flashdreams/accelerated/multi_head_attention/plot.py
+uv run python -m \
+    scripts.benchmark.flashdreams.accelerated.multi_head_attention.plot

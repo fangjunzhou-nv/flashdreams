@@ -18,14 +18,24 @@
 from __future__ import annotations
 
 import argparse
-import json
-import math
 import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-from matplotlib.colors import CenteredNorm
 from matplotlib.patches import Rectangle
+
+from scripts.benchmark.common import (
+    add_plot_io_arguments,
+    add_relative_colorbar,
+    annotate_relative_cell,
+    benchmark_median_ms,
+    benchmark_subtitle,
+    draw_relative_heatmap,
+    load_benchmark_json,
+    percentage_latency_label,
+    relative_matrix_with_fastest,
+    save_figure,
+)
 
 _DEFAULT_OUTPUT_DIR = Path(
     "artifacts/benchmark/flashdreams/accelerated/multi_head_attention"
@@ -52,22 +62,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         Parsed command-line arguments.
     """
     parser = argparse.ArgumentParser(
-        description="Plot self- and cross-attention median latency as PNG matrices."
+        description="Plot self- and cross-attention latency as three PNG matrices."
     )
-    parser.add_argument(
-        "input",
-        nargs="?",
-        type=Path,
-        default=_DEFAULT_INPUT,
-        help=f"pytest-benchmark JSON path (default: {_DEFAULT_INPUT})",
-    )
-    parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        default=_DEFAULT_OUTPUT_DIR,
-        help=f"output directory (default: {_DEFAULT_OUTPUT_DIR})",
-    )
+    add_plot_io_arguments(parser, _DEFAULT_INPUT, _DEFAULT_OUTPUT_DIR)
     return parser.parse_args(argv)
 
 
@@ -87,23 +84,13 @@ def _load_matrix(
         SystemExit: The input cannot be read or does not contain compatible
             accelerated attention records.
     """
-    try:
-        payload = json.loads(input_path.read_text(encoding="utf-8"))
-    except OSError as error:
-        raise SystemExit(f"Cannot read benchmark JSON {input_path}: {error}") from error
-    except json.JSONDecodeError as error:
-        raise SystemExit(
-            f"Cannot parse benchmark JSON {input_path}: {error}"
-        ) from error
-
-    if not isinstance(payload, dict) or not isinstance(payload.get("benchmarks"), list):
-        raise SystemExit(f"Benchmark JSON {input_path} has no benchmarks list")
+    payload, benchmark_records = load_benchmark_json(input_path)
 
     rows: list[RowKey] = []
     columns: list[str] = []
     values_ms: dict[CellKey, float] = {}
 
-    for record in payload["benchmarks"]:
+    for record in benchmark_records:
         if not isinstance(record, dict):
             continue
         group = record.get("group")
@@ -111,7 +98,7 @@ def _load_matrix(
         if not isinstance(group, str) or not isinstance(param, str):
             continue
         match = re.fullmatch(
-            r"multi-head-attention-(self|cross)-norm-(.+)-rope-"
+            r"multi-head-attention-(self|cross(?:-query-only)?)-norm-(.+)-rope-"
             r"(interleaved|split)(?:-scope-(before-kv-cache|after-kv-cache))?"
             r"-bias-(on|off)",
             group,
@@ -119,7 +106,11 @@ def _load_matrix(
         if match is None:
             continue
         attention, norm, rope, scope_state, bias_state = match.groups()
-        attention_type = f"{attention}_attention"
+        attention_type = (
+            "cross_attention_query_only"
+            if attention == "cross-query-only"
+            else f"{attention}_attention"
+        )
         rope_scope = (scope_state or "before-kv-cache").replace("-", "_")
         rope_interleaved = rope == "interleaved"
         bias = bias_state == "on"
@@ -129,18 +120,6 @@ def _load_matrix(
             raise SystemExit(f"Unsupported attention parameter {param!r}")
         implementation = param.removeprefix(implementation_prefix)
 
-        stats = record.get("stats")
-        median = stats.get("median") if isinstance(stats, dict) else None
-        if (
-            isinstance(median, bool)
-            or not isinstance(median, (int, float))
-            or not math.isfinite(median)
-            or median <= 0
-        ):
-            raise SystemExit(
-                f"Benchmark {record.get('name', '<unnamed>')} has no positive median"
-            )
-
         row = (attention_type, norm, rope_scope, rope_interleaved, bias)
         cell = (row, implementation)
         if cell in values_ms:
@@ -149,22 +128,14 @@ def _load_matrix(
             rows.append(row)
         if implementation not in columns:
             columns.append(implementation)
-        values_ms[cell] = median * 1000.0
+        values_ms[cell] = benchmark_median_ms(record)
 
     if not values_ms:
         raise SystemExit(
             f"Benchmark JSON {input_path} contains no accelerated attention results"
         )
 
-    subtitle_parts = ["Median latency in ms (lower is faster)"]
-    commit_info = payload.get("commit_info")
-    commit_id = commit_info.get("id") if isinstance(commit_info, dict) else None
-    if isinstance(commit_id, str) and commit_id:
-        subtitle_parts.append(f"commit {commit_id[:10]}")
-    timestamp = payload.get("datetime")
-    if isinstance(timestamp, str) and timestamp:
-        subtitle_parts.append(timestamp)
-    return rows, columns, values_ms, " · ".join(subtitle_parts)
+    return rows, columns, values_ms, benchmark_subtitle(payload)
 
 
 def _row_label(row: RowKey) -> str:
@@ -186,33 +157,6 @@ def _column_label(column: str) -> str:
         .replace(" projection ", "\nprojection ")
         .replace(" quantized sdpa", "\nquantized sdpa")
     )
-
-
-def _cell_label(
-    value: float | None, reference: float | None, *, is_reference: bool
-) -> str:
-    """Format a latency and its relationship to the row reference.
-
-    Args:
-        value: Cell latency in milliseconds; ``None`` marks a missing result.
-        reference: Torch-reference latency in milliseconds; ``None`` marks a
-            missing reference.
-        is_reference: Whether the cell is the torch reference in its row.
-
-    Returns:
-        Two-line latency and relative-performance annotation.
-    """
-    if value is None:
-        return "N/A"
-    if is_reference:
-        return f"{value:.2f} ms\n1.00× reference"
-    if reference is None:
-        return f"{value:.2f} ms\nreference unavailable"
-    if value < reference:
-        return f"{value:.2f} ms\n{(1 - value / reference) * 100:.0f}% faster"
-    if value > reference:
-        return f"{value:.2f} ms\n{(value / reference - 1) * 100:.0f}% slower"
-    return f"{value:.2f} ms\nsame as reference"
 
 
 def _write_png(
@@ -237,32 +181,9 @@ def _write_png(
     if _REFERENCE_IMPLEMENTATION not in columns:
         raise SystemExit("Benchmark results have no reference-torch implementation")
     display_columns = [*columns, _FASTEST_IMPLEMENTATION_COLUMN]
-    fastest_implementations: dict[RowKey, str | None] = {}
-    matrix = []
-    for row in rows:
-        reference = values_ms.get((row, _REFERENCE_IMPLEMENTATION))
-        fastest = min(
-            (
-                column
-                for column in columns
-                if column != _REFERENCE_IMPLEMENTATION and (row, column) in values_ms
-            ),
-            key=lambda column: values_ms[(row, column)],
-            default=None,
-        )
-        fastest_implementations[row] = fastest
-        relative_values = [
-            values_ms.get((row, column), math.nan) / reference
-            if reference is not None
-            else math.nan
-            for column in columns
-        ]
-        relative_values.append(
-            values_ms[(row, fastest)] / reference
-            if reference is not None and fastest is not None
-            else math.nan
-        )
-        matrix.append(relative_values)
+    matrix, fastest_implementations = relative_matrix_with_fastest(
+        rows, columns, values_ms, _REFERENCE_IMPLEMENTATION
+    )
     figure, axes = plt.subplots()
     default_width, default_height = figure.get_size_inches()
     # ponytail: Linear sizing assumes current short labels; measure rendered
@@ -271,12 +192,7 @@ def _write_png(
         max(default_width, len(display_columns) * 2.0),
         max(default_height, len(rows) * 0.9),
     )
-    image = axes.imshow(
-        matrix,
-        aspect="auto",
-        cmap="RdYlGn_r",
-        norm=CenteredNorm(vcenter=1.0),
-    )
+    image = draw_relative_heatmap(axes, matrix)
     axes.set_xticks(
         range(len(display_columns)),
         labels=[_column_label(column) for column in display_columns],
@@ -313,7 +229,7 @@ def _write_png(
                     label = "N/A"
                 else:
                     value = values_ms[(row, fastest)]
-                    relative_label = _cell_label(
+                    relative_label = percentage_latency_label(
                         value, reference, is_reference=False
                     ).splitlines()[1]
                     implementation, backend, config = _column_label(fastest).split(
@@ -322,54 +238,32 @@ def _write_png(
                     label = f"{implementation} {backend}\n{config}\n{relative_label}"
             else:
                 value = values_ms.get((row, column))
-                label = _cell_label(
+                label = percentage_latency_label(
                     value,
                     reference,
                     is_reference=column == _REFERENCE_IMPLEMENTATION,
                 )
-            text_color = "black"
             relative_value = matrix[row_index][column_index]
-            if math.isfinite(relative_value):
-                red, green, blue, _ = image.cmap(image.norm(relative_value))
-                channels = (red, green, blue)
-                linear = tuple(
-                    channel / 12.92
-                    if channel <= 0.04045
-                    else ((channel + 0.055) / 1.055) ** 2.4
-                    for channel in channels
-                )
-                luminance = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
-                text_color = "white" if luminance < 0.179 else "black"
-            axes.text(
-                column_index,
+            annotate_relative_cell(
+                axes,
+                image,
                 row_index,
+                column_index,
                 label,
-                ha="center",
-                va="center",
-                color=text_color,
+                relative_value,
             )
-    colorbar = figure.colorbar(
-        image, ax=axes, label="Runtime relative to torch reference (×)"
-    )
-    colorbar.ax.text(
-        0.5, 1.02, "Slower ↑", ha="center", transform=colorbar.ax.transAxes
-    )
-    colorbar.ax.text(
-        0.5,
-        -0.04,
-        "↓ Faster",
-        ha="center",
-        va="top",
-        transform=colorbar.ax.transAxes,
+    add_relative_colorbar(
+        figure,
+        axes,
+        image,
+        "Runtime relative to torch reference (×)",
     )
     figure.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path)
-    plt.close(figure)
+    save_figure(figure, output_path)
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Generate separate self- and cross-attention performance matrices."""
+    """Generate self-attention and both cross-attention performance matrices."""
     args = _parse_args(argv)
     rows, columns, values_ms, subtitle = _load_matrix(args.input)
     attention_types = list(dict.fromkeys(row[0] for row in rows))

@@ -14,6 +14,9 @@ uv run --project flashdreams --group test pytest \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json=artifacts/benchmark/flashdreams/accelerated/quantization/benchmark.json
 
-uv run python scripts/benchmark/flashdreams/accelerated/quantization/plot_quantizer.py
-uv run python scripts/benchmark/flashdreams/accelerated/quantization/plot_gemm.py
-uv run python scripts/benchmark/flashdreams/accelerated/quantization/plot_quantized_linear.py
+uv run python -m \
+    scripts.benchmark.flashdreams.accelerated.quantization.plot_quantizer
+uv run python -m \
+    scripts.benchmark.flashdreams.accelerated.quantization.plot_gemm
+uv run python -m \
+    scripts.benchmark.flashdreams.accelerated.quantization.plot_quantized_linear
