@@ -46,6 +46,7 @@ from flashdreams.accelerated.multi_head_attention.optimized import (
     SDPABackend,
     OptimizedImplConfig,
     OptimizedHultiHeadAttention,
+    is_tma_flash_attention_supported,
 )
 
 pytestmark = [
@@ -249,6 +250,9 @@ class _TorchMultiHeadAttention(TorchMultiHeadAttention):
 class _OptimizedHultiHeadAttention(OptimizedHultiHeadAttention):
     """Optimized attention implementation used by benchmarks."""
 
+    effective_use_tma: bool | None
+    """Whether the first attention call selected TMA; ``None`` before execution."""
+
     @property
     def query_projection(self) -> torch.nn.Linear:
         """Return the optimized query projection."""
@@ -348,7 +352,25 @@ class _OptimizedHultiHeadAttention(OptimizedHultiHeadAttention):
             self.k_norm = torch.nn.RMSNorm(
                 norm_dim, eps=self.attention_config.qk_norm_eps
             )
+        self.effective_use_tma = None
         self._initialize_derived_weights()
+
+    def _attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        *,
+        output_dtype: torch.dtype | None = None,
+    ) -> Tensor:
+        """Record the effective backend selected by the first attention call."""
+        if self.effective_use_tma is None:
+            self.effective_use_tma = (
+                self.sdpa_backend is SDPABackend.FA2
+                and self.use_tma
+                and is_tma_flash_attention_supported(query, key, value)
+            )
+        return super()._attention(query, key, value, output_dtype=output_dtype)
 
 
 _Attention = _TorchMultiHeadAttention | _OptimizedHultiHeadAttention
@@ -546,13 +568,6 @@ def _benchmark_multi_head_attention(
         else optimized_impl_config.qkv_fusion_option.value
     )
     use_tma = optimized_impl_config is not None and optimized_impl_config.use_tma
-    effective_use_tma = (
-        optimized_impl_config is not None
-        and optimized_impl_config.sdpa_backend is SDPABackend.FA2
-        and use_tma
-        and torch.cuda.get_device_capability(device)[0] >= 9
-    )
-    effective_sdpa_backend = "fa2-tma" if effective_use_tma else sdpa_backend
     timing_scope = (
         "steady-state"
         if attention_type is AttentionType.SELF_ATTENTION
@@ -594,10 +609,8 @@ def _benchmark_multi_head_attention(
             "bias": bias,
             "quantized_sdpa": quantized_sdpa,
             "sdpa_backend": sdpa_backend,
-            "effective_sdpa_backend": effective_sdpa_backend,
             "qkv_fusion_option": qkv_fusion_option,
             "use_tma": use_tma,
-            "effective_use_tma": effective_use_tma,
             "seed": _SEED,
             "batch_size": _BATCH_SIZE,
             "chunk_size": _CHUNK_SIZE,
@@ -674,6 +687,19 @@ def _benchmark_multi_head_attention(
             warmup_rounds=_WARMUP_ROUNDS,
         )
 
+    if isinstance(attention, _OptimizedHultiHeadAttention):
+        assert attention.effective_use_tma is not None
+        effective_use_tma = attention.effective_use_tma
+    else:
+        effective_use_tma = False
+    benchmark.extra_info.update(
+        {
+            "effective_sdpa_backend": (
+                "fa2-tma" if effective_use_tma else sdpa_backend
+            ),
+            "effective_use_tma": effective_use_tma,
+        }
+    )
     assert output.shape == query.shape
     assert torch.isfinite(output).all()
 
