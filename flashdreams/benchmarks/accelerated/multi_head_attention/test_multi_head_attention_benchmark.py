@@ -69,11 +69,10 @@ _IMPLEMENTATION_CONFIGS: tuple[OptimizedImplConfig | None, ...] = (
         OptimizedImplConfig(
             sdpa_backend=sdpa_backend,
             qkv_fusion_option=qkv_fusion_option,
-            use_tma=use_tma,
+            use_tma=True,
         )
         for sdpa_backend in SDPABackend
         for qkv_fusion_option in QKVFusionOption
-        for use_tma in (False, True)
     ),
     *(
         OptimizedImplConfig(
@@ -86,15 +85,10 @@ _IMPLEMENTATION_CONFIGS: tuple[OptimizedImplConfig | None, ...] = (
     ),
     *(
         OptimizedImplConfig(
-            sdpa_backend=sdpa_backend,
+            sdpa_backend=SDPABackend.FA2,
             qkv_fusion_option=qkv_fusion_option,
             use_tma=use_tma,
-            quantization=QuantizationOption(
-                projection=torch.float8_e4m3fn,
-                quantized_sdpa=True,
-            ),
         )
-        for sdpa_backend in SDPABackend
         for qkv_fusion_option in QKVFusionOption
         for use_tma in (False, True)
     ),
@@ -445,12 +439,13 @@ def _benchmark_multi_head_attention(
     rope_scope: RoPEScope,
     rope_interleaved: bool,
     bias: bool,
+    cross_attention_query_only: bool = False,
 ) -> None:
     """Run one synchronized attention benchmark within a shared-policy group.
 
     Streaming self-attention times forward over a prefilled rolling cache.
-    Cross-attention times static K/V preparation and forward together so the
-    requested fusion variants exercise the work they actually change.
+    Cross-attention either times static K/V preparation and forward together or
+    reuses K/V prepared before timing to isolate repeated query latency.
 
     Args:
         benchmark: Pytest benchmark fixture used to record synchronized timings.
@@ -460,6 +455,8 @@ def _benchmark_multi_head_attention(
         rope_scope: Whether keys are rotated before or after cache storage.
         rope_interleaved: Shared rotary-pair layout.
         bias: Whether every Q/K/V and output projection uses a bias.
+        cross_attention_query_only: Whether to prepare cross-attention K/V before
+            timing.
     """
     if not torch.cuda.is_bf16_supported():
         pytest.skip("Multi-head attention benchmark requires bfloat16 support.")
@@ -524,6 +521,8 @@ def _benchmark_multi_head_attention(
     attention_label = (
         "self" if attention_type is AttentionType.SELF_ATTENTION else "cross"
     )
+    if cross_attention_query_only:
+        attention_label += "-query-only"
     rope_label = "interleaved" if rope_interleaved else "split"
     bias_label = "on" if bias else "off"
     benchmark.group = "-".join(
@@ -571,6 +570,13 @@ def _benchmark_multi_head_attention(
             "use_tma": (
                 None if optimized_impl_config is None else optimized_impl_config.use_tma
             ),
+            "cross_attention_timing": (
+                None
+                if attention_type is AttentionType.SELF_ATTENTION
+                else "query-only"
+                if cross_attention_query_only
+                else "end-to-end"
+            ),
             "seed": _SEED,
             "batch_size": _BATCH_SIZE,
             "chunk_size": _CHUNK_SIZE,
@@ -616,15 +622,27 @@ def _benchmark_multi_head_attention(
     else:
         context = torch.cat(inputs[:_WINDOW_CHUNKS], dim=1)
         context_rope = torch.cat(rope_freqs[:_WINDOW_CHUNKS], dim=0)
-        torch.cuda.synchronize()
-
-        # Static K/V projection is part of this end-to-end cross-attention
-        # measurement because fusion changes that stage, not query-only forward.
-        def synchronized_cross_forward() -> Tensor:
+        if cross_attention_query_only:
+            # Reuse prompt K/V across every timed query, matching repeated
+            # cross-attention calls against static context.
             cache = attention.compute_kv(context, context_rope)
-            result = attention(query, cache, query_rope)
             torch.cuda.synchronize()
-            return result
+
+            def synchronized_cross_forward() -> Tensor:
+                result = attention(query, cache, query_rope)
+                torch.cuda.synchronize()
+                return result
+
+        else:
+            torch.cuda.synchronize()
+
+            # Static K/V projection is part of this end-to-end cross-attention
+            # measurement because fusion changes that stage.
+            def synchronized_cross_forward() -> Tensor:
+                cache = attention.compute_kv(context, context_rope)
+                result = attention(query, cache, query_rope)
+                torch.cuda.synchronize()
+                return result
 
         output = benchmark.pedantic(
             synchronized_cross_forward,
@@ -710,4 +728,43 @@ def test_cross_attention_benchmark(
         rope_scope=rope_scope,
         rope_interleaved=rope_interleaved,
         bias=bias,
+    )
+
+
+@pytest.mark.parametrize(
+    "optimized_impl_config",
+    _IMPLEMENTATION_CONFIGS,
+    ids=_implementation_id,
+)
+@pytest.mark.parametrize(
+    "qk_norm_scope,rope_scope,rope_interleaved,bias",
+    _CROSS_ATTENTION_CONFIGS,
+)
+def test_cross_attention_query_only_benchmark(
+    benchmark: BenchmarkFixture,
+    optimized_impl_config: OptimizedImplConfig | None,
+    qk_norm_scope: QKNormScope,
+    rope_scope: RoPEScope,
+    rope_interleaved: bool,
+    bias: bool,
+) -> None:
+    """Compare cross-attention query latency with K/V prepared before timing.
+
+    Args:
+        benchmark: Pytest benchmark fixture used to record synchronized timings.
+        optimized_impl_config: Optimized policy; ``None`` uses the Torch reference.
+        qk_norm_scope: Shared Q/K normalization policy defining the group.
+        rope_scope: Shared cache-relative rotation policy defining the group.
+        rope_interleaved: Shared rotary-pair layout defining the group.
+        bias: Shared projection-bias policy defining the group.
+    """
+    _benchmark_multi_head_attention(
+        benchmark,
+        optimized_impl_config,
+        attention_type=AttentionType.CROSS_ATTENTION,
+        qk_norm_scope=qk_norm_scope,
+        rope_scope=rope_scope,
+        rope_interleaved=rope_interleaved,
+        bias=bias,
+        cross_attention_query_only=True,
     )
