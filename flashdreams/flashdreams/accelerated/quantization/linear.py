@@ -15,6 +15,7 @@
 
 """Quantized nonpersistent linear transformation for accelerated inference."""
 
+from collections.abc import Callable
 from enum import Enum
 from typing import overload
 
@@ -139,6 +140,29 @@ class QuantizedNonPersistentLinear(NonPersistentLinear):
         self.register_buffer(
             "weight_scale", weight_scale.contiguous(), persistent=False
         )
+
+    def _apply(
+        self,
+        fn: Callable[[Tensor], Tensor],
+        recurse: bool = True,
+    ) -> "QuantizedNonPersistentLinear":
+        """Transform buffers without changing their quantization formats.
+
+        Args:
+            fn: Tensor transformation applied by :class:`torch.nn.Module`.
+            recurse: Apply ``fn`` recursively to child modules.
+
+        Returns:
+            This module with transformed buffers.
+        """
+        weight = self.weight
+        weight_scale = self.weight_scale
+        module = super()._apply(fn, recurse=recurse)
+        if self.weight.dtype is not weight.dtype:
+            self.weight = weight.to(device=self.weight.device)
+        if self.weight_scale.dtype is not weight_scale.dtype:
+            self.weight_scale = weight_scale.to(device=self.weight_scale.device)
+        return module
 
     @overload
     def forward(

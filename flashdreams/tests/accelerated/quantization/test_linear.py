@@ -111,6 +111,37 @@ def test_quantized_linear_buffers_are_nonpersistent() -> None:
     assert set(dict(linear.named_buffers())) == {"weight", "bias", "weight_scale"}
 
 
+@pytest.mark.parametrize(
+    "dtype", (torch.float8_e4m3fn, torch.float8_e5m2), ids=("e4m3", "e5m2")
+)
+def test_quantized_linear_dtype_cast_preserves_quantization_buffers(
+    dtype: torch.dtype,
+) -> None:
+    """Preserve FP8 weights and exact FP32 scales across module dtype casts."""
+    weight = torch.arange(1, 129, dtype=torch.float32).reshape(8, 16) / 17
+    linear = QuantizedNonPersistentLinear(
+        weight,
+        torch.ones(8),
+        WeightGranularity.PER_OUT_CHANNEL,
+        dtype,
+    )
+    quantized_weight = linear.weight.clone()
+    weight_scale = linear.weight_scale.clone()
+    assert not torch.equal(weight_scale, weight_scale.bfloat16().float())
+
+    linear.to(dtype=torch.bfloat16)
+
+    expected_weight_dtype = torch.float8_e4m3fn if dtype is torch.float8_e5m2 else dtype
+    assert linear.dtype is dtype
+    assert linear.weight.dtype is expected_weight_dtype
+    assert linear.weight_scale.dtype is torch.float32
+    assert linear.bias is not None and linear.bias.dtype is torch.bfloat16
+    torch.testing.assert_close(
+        linear.weight.float(), quantized_weight.float(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(linear.weight_scale, weight_scale, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("granularity", Granularity)
 def test_quantized_linear_empty_input(granularity: Granularity) -> None:
     """Preserve empty leading dimensions without reducing an empty tensor."""
