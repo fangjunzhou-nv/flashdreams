@@ -26,6 +26,8 @@ Run the manual GPU benchmarks with::
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 from pytest_benchmark.fixture import BenchmarkFixture
@@ -137,9 +139,36 @@ _SHARED_CONFIGS = tuple(
 )
 """Policies shared by Torch and optimized attention, each mapped to its own benchmark group."""
 
-_CROSS_ATTENTION_CONFIGS = tuple(
+_REPRESENTATIVE_CONFIGS = tuple(
     config
     for config in _SHARED_CONFIGS
+    if config.values
+    in (
+        (
+            QKNormScope.HEAD,
+            RoPEScope.BEFORE_KV_CACHE,
+            False,
+            False,
+        ),
+        (
+            QKNormScope.INNER,
+            RoPEScope.BEFORE_KV_CACHE,
+            True,
+            True,
+        ),
+    )
+)
+"""Cosmos- and Wan-style policies used by the default benchmark sweep."""
+
+_FULL_POLICY_SEARCH = os.environ.get("FLASHDREAMS_MHA_FULL_SEARCH") == "1"
+"""Whether to benchmark every shared attention policy."""
+
+_BENCHMARK_CONFIGS = _SHARED_CONFIGS if _FULL_POLICY_SEARCH else _REPRESENTATIVE_CONFIGS
+"""Selected attention policies; set ``FLASHDREAMS_MHA_FULL_SEARCH=1`` for all."""
+
+_CROSS_ATTENTION_CONFIGS = tuple(
+    config
+    for config in _BENCHMARK_CONFIGS
     if config.values[1] is RoPEScope.BEFORE_KV_CACHE
 )
 """Cross-attention policies representable with distinct query/context lengths."""
@@ -596,6 +625,7 @@ def _benchmark_multi_head_attention(
             "implementation": _implementation_id(optimized_impl_config),
             "attention_type": attention_type.value,
             "timing_scope": timing_scope,
+            "policy_search": "full" if _FULL_POLICY_SEARCH else "representative",
             "input_dtype": str(_DTYPE),
             "projection_dtype": str(projection_dtype),
             "sdpa_dtype": str(torch.float8_e4m3fn if quantized_sdpa else _DTYPE),
@@ -711,7 +741,7 @@ def _benchmark_multi_head_attention(
 )
 @pytest.mark.parametrize(
     "qk_norm_scope,rope_scope,rope_interleaved,bias",
-    _SHARED_CONFIGS,
+    _BENCHMARK_CONFIGS,
 )
 def test_self_attention_benchmark(
     benchmark: BenchmarkFixture,
