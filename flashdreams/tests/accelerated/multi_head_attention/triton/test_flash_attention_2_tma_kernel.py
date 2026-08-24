@@ -21,9 +21,61 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashdreams.accelerated.multi_head_attention.triton import flash_attention_2_tma
+from flashdreams.accelerated.multi_head_attention.triton import (
+    flash_attention_2_tma,
+    is_tma_flash_attention_supported,
+)
 
 pytestmark = pytest.mark.ci_gpu
+
+
+@pytest.mark.parametrize(
+    "misaligned_input",
+    [
+        pytest.param(0, id="query"),
+        pytest.param(1, id="key"),
+        pytest.param(2, id="value"),
+    ],
+)
+def test_tma_support_rejects_misaligned_base_pointer(
+    tma_device: torch.device,
+    misaligned_input: int,
+) -> None:
+    """Reject each Q/K/V view whose base pointer is not 16-byte aligned.
+
+    Args:
+        tma_device: CUDA device satisfying the shared TMA capability gate.
+        misaligned_input: Index of the input whose storage starts one element late.
+    """
+    tensors = [
+        torch.empty((1, 4, 2, 64), device=tma_device, dtype=torch.bfloat16),
+        torch.empty((1, 6, 2, 64), device=tma_device, dtype=torch.bfloat16),
+        torch.empty((1, 6, 2, 64), device=tma_device, dtype=torch.bfloat16),
+    ]
+    assert is_tma_flash_attention_supported(*tensors)
+
+    original = tensors[misaligned_input]
+    storage = torch.empty(
+        original.numel() + 1,
+        device=tma_device,
+        dtype=original.dtype,
+    )
+    tensors[misaligned_input] = storage[1:].view_as(original)
+    misaligned = tensors[misaligned_input]
+    bhld_strides = (
+        misaligned.stride(0),
+        misaligned.stride(2),
+        misaligned.stride(1),
+        misaligned.stride(3),
+    )
+    assert misaligned.data_ptr() % 16 != 0
+    assert bhld_strides[-1] == 1
+    assert all(
+        stride * misaligned.element_size() % 16 == 0 for stride in bhld_strides[:-1]
+    )
+    assert not is_tma_flash_attention_supported(*tensors)
+    with pytest.raises(RuntimeError, match="base pointers and strides"):
+        flash_attention_2_tma(*tensors)
 
 
 @pytest.mark.parametrize(

@@ -26,19 +26,24 @@ from torch import Tensor
 
 
 def _descriptor_layout_supported(x: Tensor) -> bool:
-    """Return whether ``x`` satisfies TMA tensor-descriptor stride rules.
+    """Return whether ``x`` satisfies TMA tensor-descriptor layout rules.
 
     Args:
         x: Projected tensor with shape ``[B, L|S, H, D]``.
 
     Returns:
-        Whether its ``[B, H, L|S, D]`` element strides are positive,
-        feature-contiguous, and 16-byte aligned on every outer axis.
+        Whether its base pointer and ``[B, H, L|S, D]`` outer strides are
+        16-byte aligned, with positive outer strides and contiguous features.
     """
     element_size = x.element_size()
     bhld_strides = (x.stride(0), x.stride(2), x.stride(1), x.stride(3))
-    return bhld_strides[-1] == 1 and all(
-        stride > 0 and stride * element_size % 16 == 0 for stride in bhld_strides[:-1]
+    return (
+        x.data_ptr() % 16 == 0
+        and bhld_strides[-1] == 1
+        and all(
+            stride > 0 and stride * element_size % 16 == 0
+            for stride in bhld_strides[:-1]
+        )
     )
 
 
@@ -50,7 +55,7 @@ def is_tma_flash_attention_supported(
     """Return whether projected tensors can use the TMA attention kernel.
 
     Check shape, placement, storage type, head geometry, device capability, and
-    descriptor strides without allocating output or launching Triton.
+    descriptor layouts without allocating output or launching Triton.
 
     Args:
         query: Query tensor with shape ``[B, L, H, D]``.
@@ -397,8 +402,8 @@ def flash_attention_2_tma(
 
     Raises:
         ValueError: Q/K/V shapes are incompatible or contain an empty key axis.
-        RuntimeError: Placement, dtype, head geometry, device capability, or
-            strides do not satisfy the TMA kernel contract.
+        RuntimeError: The placement, dtype, head geometry, device capability,
+            or descriptor layout is unsupported.
     """
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("query, key, and value must have shape [B, L, H, D]")
@@ -414,7 +419,7 @@ def flash_attention_2_tma(
         raise RuntimeError(
             "TMA FlashAttention2 requires matching CUDA FP16/BF16/FP8 e4m3 tensors, "
             "compute capability 9.0 or newer, a power-of-two head_dim in "
-            "[16, 256], and tensor-descriptor-compatible strides"
+            "[16, 256], and tensor-descriptor-compatible base pointers and strides"
         )
 
     # Allocate output ``[B, L, H, D]``; empty outer axes require no launch.
