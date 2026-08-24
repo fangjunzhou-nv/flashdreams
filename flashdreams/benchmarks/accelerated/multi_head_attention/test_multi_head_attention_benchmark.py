@@ -160,11 +160,11 @@ _REPRESENTATIVE_CONFIGS = tuple(
 )
 """Cosmos- and Wan-style policies used by the default benchmark sweep."""
 
-_FULL_POLICY_SEARCH = os.environ.get("FLASHDREAMS_MHA_FULL_SEARCH") == "1"
+_FULL_POLICY_SEARCH = os.environ.get("FLASHDREAMS_RUN_FULL_BENCHMARK") == "1"
 """Whether to benchmark every shared attention policy."""
 
 _BENCHMARK_CONFIGS = _SHARED_CONFIGS if _FULL_POLICY_SEARCH else _REPRESENTATIVE_CONFIGS
-"""Selected attention policies; set ``FLASHDREAMS_MHA_FULL_SEARCH=1`` for all."""
+"""Selected policies; set ``FLASHDREAMS_RUN_FULL_BENCHMARK=1`` for all."""
 
 _CROSS_ATTENTION_CONFIGS = tuple(
     config

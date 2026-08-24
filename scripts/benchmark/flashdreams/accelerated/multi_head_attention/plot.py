@@ -28,17 +28,18 @@ from scripts.benchmark.common import (
     add_plot_io_arguments,
     add_relative_colorbar,
     annotate_relative_cell,
+    benchmark_artifact_dir,
     benchmark_median_ms,
     benchmark_subtitle,
     draw_relative_heatmap,
     load_benchmark_json,
-    percentage_latency_label,
+    latency_comparison_label,
     relative_matrix_with_fastest,
     save_figure,
 )
 
-_DEFAULT_OUTPUT_DIR = Path(
-    "artifacts/benchmark/flashdreams/accelerated/multi_head_attention"
+_DEFAULT_OUTPUT_DIR = benchmark_artifact_dir(
+    Path("artifacts/benchmark/flashdreams/accelerated/multi_head_attention")
 )
 _DEFAULT_INPUT = _DEFAULT_OUTPUT_DIR / "benchmark.json"
 _FASTEST_IMPLEMENTATION_COLUMN = "fastest-implementation-config"
@@ -229,7 +230,7 @@ def _write_png(
                     label = "N/A"
                 else:
                     value = values_ms[(row, fastest)]
-                    relative_label = percentage_latency_label(
+                    relative_label = latency_comparison_label(
                         value, reference, is_reference=False
                     ).splitlines()[1]
                     implementation, backend, config = _column_label(fastest).split(
@@ -238,7 +239,7 @@ def _write_png(
                     label = f"{implementation} {backend}\n{config}\n{relative_label}"
             else:
                 value = values_ms.get((row, column))
-                label = percentage_latency_label(
+                label = latency_comparison_label(
                     value,
                     reference,
                     is_reference=column == _REFERENCE_IMPLEMENTATION,

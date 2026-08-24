@@ -31,7 +31,7 @@ from scripts.benchmark.common import (
     benchmark_subtitle,
     draw_relative_heatmap,
     load_benchmark_json,
-    percentage_latency_label,
+    latency_comparison_label,
     relative_matrix_with_fastest,
     save_figure,
 )
@@ -278,11 +278,11 @@ def _write_png(
                     value = values_ms[(row, fastest)]
                     label = (
                         f"{_config_label(fastest)}\n"
-                        f"{percentage_latency_label(value, reference, is_reference=False)}"
+                        f"{latency_comparison_label(value, reference, is_reference=False)}"
                     )
             else:
                 value = values_ms.get((row, column))
-                label = percentage_latency_label(
+                label = latency_comparison_label(
                     value,
                     reference,
                     is_reference=column == _REFERENCE_CONFIG,

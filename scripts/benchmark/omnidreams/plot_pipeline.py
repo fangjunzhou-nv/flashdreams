@@ -8,11 +8,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from scripts.benchmark.common import add_plot_io_arguments
+from scripts.benchmark.common import add_plot_io_arguments, benchmark_artifact_dir
 from ._plot import plot_pipeline
 
-_DEFAULT_INPUT = Path("artifacts/benchmark/omnidreams/pipeline.json")
-_DEFAULT_OUTPUT_DIR = Path("artifacts/benchmark/omnidreams")
+_DEFAULT_OUTPUT_DIR = benchmark_artifact_dir(Path("artifacts/benchmark/omnidreams"))
+_DEFAULT_INPUT = _DEFAULT_OUTPUT_DIR / "pipeline.json"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

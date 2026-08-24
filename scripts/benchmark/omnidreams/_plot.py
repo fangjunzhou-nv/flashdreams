@@ -29,6 +29,7 @@ from scripts.benchmark.common import (
     benchmark_median_ms,
     benchmark_subtitle,
     draw_relative_heatmap,
+    latency_comparison_label,
     load_benchmark_json,
     save_figure,
 )
@@ -239,19 +240,13 @@ def _bar_label(
     Returns:
         Two-line latency and relative-performance annotation.
     """
-    if latency_ms < 1:
-        latency_label = f"{latency_ms:.3f} ms"
-    elif latency_ms < 10:
-        latency_label = f"{latency_ms:.2f} ms"
-    else:
-        latency_label = f"{latency_ms:.1f} ms"
-    if is_reference:
-        return f"{latency_label}\nreference"
-    if latency_ms < reference_ms:
-        return f"{latency_label}\n{(1 - latency_ms / reference_ms) * 100:.0f}% faster"
-    if latency_ms > reference_ms:
-        return f"{latency_label}\n{(latency_ms / reference_ms - 1) * 100:.0f}% slower"
-    return f"{latency_label}\nsame as reference"
+    precision = 3 if latency_ms < 1 else 2 if latency_ms < 10 else 1
+    return latency_comparison_label(
+        latency_ms,
+        reference_ms,
+        is_reference=is_reference,
+        precision=precision,
+    )
 
 
 def _panel_configurations(

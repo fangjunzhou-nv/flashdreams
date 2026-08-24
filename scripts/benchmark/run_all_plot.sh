@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Replot every default benchmark artifact:
+#   ./scripts/benchmark/run_all_plot.sh
+# Replot every full benchmark artifact:
+#   FLASHDREAMS_RUN_FULL_BENCHMARK=1 ./scripts/benchmark/run_all_plot.sh
+
 set -euo pipefail
 shopt -s globstar nullglob
 

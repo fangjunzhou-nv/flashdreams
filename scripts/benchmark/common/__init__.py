@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from collections.abc import Hashable, Mapping, Sequence
 from pathlib import Path
 from typing import TypeVar
@@ -31,8 +32,18 @@ from matplotlib.colors import CenteredNorm
 from matplotlib.figure import Figure
 from matplotlib.image import AxesImage
 from matplotlib.text import Text
+from matplotlib.ticker import FuncFormatter
 
 RowKey = TypeVar("RowKey", bound=Hashable)
+
+
+def benchmark_artifact_dir(default: Path) -> Path:
+    """Select the default or full-benchmark artifact directory."""
+    return (
+        default / "full"
+        if os.environ.get("FLASHDREAMS_RUN_FULL_BENCHMARK") == "1"
+        else default
+    )
 
 
 def add_plot_io_arguments(
@@ -105,14 +116,14 @@ def benchmark_subtitle(payload: Mapping[str, object]) -> str:
     return " · ".join(parts)
 
 
-def percentage_latency_label(
+def latency_comparison_label(
     value: float | None,
     reference: float | None,
     *,
     is_reference: bool,
     precision: int = 2,
 ) -> str:
-    """Format latency and percentage change against a row reference."""
+    """Format latency and multiplicative performance against a row reference."""
     if value is None:
         return "N/A"
     latency = f"{value:.{precision}f} ms"
@@ -121,9 +132,9 @@ def percentage_latency_label(
     if reference is None:
         return f"{latency}\nreference unavailable"
     if value < reference:
-        return f"{latency}\n{(1 - value / reference) * 100:.0f}% faster"
+        return f"{latency}\n{reference / value:.2f}× faster"
     if value > reference:
-        return f"{latency}\n{(value / reference - 1) * 100:.0f}% slower"
+        return f"{latency}\n{value / reference:.2f}× slower"
     return f"{latency}\nsame as reference"
 
 
@@ -164,20 +175,27 @@ def relative_matrix_with_fastest(
 
 
 def draw_relative_heatmap(axes: Axes, matrix: Sequence[Sequence[float]]) -> AxesImage:
-    """Draw a lower-is-better matrix centered on its reference value."""
+    """Draw runtime ratios in log2 space centered on the reference value."""
+    ratios = np.asarray(matrix, dtype=float)
+    log2_ratios = np.full_like(ratios, np.nan)
+    np.log2(
+        ratios,
+        out=log2_ratios,
+        where=np.isfinite(ratios) & (ratios > 0),
+    )
     return axes.imshow(
-        matrix,
+        log2_ratios,
         aspect="auto",
         cmap="RdYlGn_r",
-        norm=CenteredNorm(vcenter=1.0),
+        norm=CenteredNorm(vcenter=0.0),
     )
 
 
 def relative_text_color(image: AxesImage, relative_value: float) -> str:
     """Choose readable annotation text for a heatmap cell."""
-    if not math.isfinite(relative_value):
+    if not math.isfinite(relative_value) or relative_value <= 0:
         return "black"
-    colors = image.cmap(image.norm(np.asarray([relative_value])))
+    colors = image.cmap(image.norm(np.asarray([math.log2(relative_value)])))
     red, green, blue, _ = np.asarray(colors)[0]
     linear = tuple(
         channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
@@ -215,7 +233,12 @@ def add_relative_colorbar(
     multiline_directions: bool = False,
 ) -> None:
     """Add the standard relative-runtime colorbar and direction labels."""
-    colorbar = figure.colorbar(image, ax=axes, label=label)
+    colorbar = figure.colorbar(
+        image,
+        ax=axes,
+        label=label,
+        format=FuncFormatter(lambda value, _position: f"{2**value:.3g}×"),
+    )
     slower = "Slower\n↑" if multiline_directions else "Slower ↑"
     faster = "↓\nFaster" if multiline_directions else "↓ Faster"
     colorbar.ax.text(0.5, 1.02, slower, ha="center", transform=colorbar.ax.transAxes)

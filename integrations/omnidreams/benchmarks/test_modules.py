@@ -185,11 +185,11 @@ def _module_block_cases(full_policy_search: bool) -> tuple[AttentionBenchmarkCas
     )
 
 
-_FULL_POLICY_SEARCH = os.environ.get("OMNIDREAMS_DIT_BLOCK_FULL_SEARCH") == "1"
+_FULL_POLICY_SEARCH = os.environ.get("FLASHDREAMS_RUN_FULL_BENCHMARK") == "1"
 """Whether to benchmark every self/cross pair in the full DiT block."""
 
 _MODULE_BLOCK_CASES = _module_block_cases(_FULL_POLICY_SEARCH)
-"""Selected block cases; set OMNIDREAMS_DIT_BLOCK_FULL_SEARCH=1 for all 925."""
+"""Selected block cases; set FLASHDREAMS_RUN_FULL_BENCHMARK=1 for all 925."""
 
 
 def _module_config(case: AttentionBenchmarkCase) -> CosmosDiTNetworkConfig:

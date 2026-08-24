@@ -28,11 +28,12 @@ import pytest
 from scripts.benchmark.common import (
     add_plot_io_arguments,
     annotate_relative_cell,
+    benchmark_artifact_dir,
     benchmark_median_ms,
     benchmark_subtitle,
     draw_relative_heatmap,
     load_benchmark_json,
-    percentage_latency_label,
+    latency_comparison_label,
     relative_matrix_with_fastest,
     save_figure,
 )
@@ -93,6 +94,17 @@ def test_add_plot_io_arguments_uses_defaults_and_overrides(tmp_path: Path) -> No
     assert overrides.output_dir == Path("custom-plots")
 
 
+def test_benchmark_artifact_dir_tracks_full_benchmark_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("FLASHDREAMS_RUN_FULL_BENCHMARK", raising=False)
+    assert benchmark_artifact_dir(tmp_path) == tmp_path
+
+    monkeypatch.setenv("FLASHDREAMS_RUN_FULL_BENCHMARK", "1")
+    assert benchmark_artifact_dir(tmp_path) == tmp_path / "full"
+
+
 def test_relative_matrix_tracks_fastest_candidate_and_missing_reference() -> None:
     rows = ("complete", "missing")
     columns = ("reference", "slow", "fast")
@@ -110,25 +122,34 @@ def test_relative_matrix_tracks_fastest_candidate_and_missing_reference() -> Non
     assert fastest == {"complete": "fast", "missing": "fast"}
 
 
-def test_percentage_latency_label_covers_reference_and_candidate() -> None:
-    assert percentage_latency_label(10.0, 10.0, is_reference=True) == (
+def test_latency_comparison_label_covers_reference_and_candidates() -> None:
+    assert latency_comparison_label(10.0, 10.0, is_reference=True) == (
         "10.00 ms\n1.00× reference"
     )
-    assert percentage_latency_label(8.0, 10.0, is_reference=False) == (
-        "8.00 ms\n20% faster"
+    assert latency_comparison_label(5.0, 10.0, is_reference=False) == (
+        "5.00 ms\n2.00× faster"
     )
-    assert percentage_latency_label(None, 10.0, is_reference=False) == "N/A"
+    assert latency_comparison_label(20.0, 10.0, is_reference=False) == (
+        "20.00 ms\n2.00× slower"
+    )
+    assert latency_comparison_label(10.0, 10.0, is_reference=False) == (
+        "10.00 ms\nsame as reference"
+    )
+    assert latency_comparison_label(None, 10.0, is_reference=False) == "N/A"
 
 
 def test_heatmap_annotation_and_save(tmp_path: Path) -> None:
     figure, axes = plt.subplots()
-    image = draw_relative_heatmap(axes, [[1.0, 2.0]])
+    image = draw_relative_heatmap(axes, [[0.5, 1.0, 2.0, 16.0]])
 
-    reference = annotate_relative_cell(axes, image, 0, 0, "reference", 1.0)
-    slower = annotate_relative_cell(axes, image, 0, 1, "slower", 2.0)
+    reference = annotate_relative_cell(axes, image, 0, 1, "reference", 1.0)
+    slower = annotate_relative_cell(axes, image, 0, 2, "slower", 2.0)
     output_path = tmp_path / "nested" / "heatmap.png"
     save_figure(figure, output_path)
 
+    assert image.get_array()[0].tolist() == pytest.approx([-1.0, 0.0, 1.0, 4.0])
+    assert image.norm.vcenter == 0.0
+    assert image.norm(-1.0) == pytest.approx(1 - image.norm(1.0))
     assert reference.get_color() in {"black", "white"}
     assert slower.get_color() in {"black", "white"}
     assert output_path.is_file()

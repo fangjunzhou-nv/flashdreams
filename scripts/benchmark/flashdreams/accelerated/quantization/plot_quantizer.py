@@ -31,6 +31,7 @@ from scripts.benchmark.common import (
     benchmark_median_ms,
     benchmark_subtitle,
     draw_relative_heatmap,
+    latency_comparison_label,
     load_benchmark_json,
     save_figure,
 )
@@ -158,17 +159,12 @@ def _cell_label(
     Returns:
         Two-line latency and relative-performance annotation.
     """
-    if value is None:
-        return "N/A"
-    if is_reference:
-        return f"{value:.3f} ms\n1.00× reference"
-    if reference is None:
-        return f"{value:.3f} ms\nreference unavailable"
-    if value < reference:
-        return f"{value:.3f} ms\n{reference / value:.2f}× faster"
-    if value > reference:
-        return f"{value:.3f} ms\n{value / reference:.2f}× slower"
-    return f"{value:.3f} ms\nsame as reference"
+    return latency_comparison_label(
+        value,
+        reference,
+        is_reference=is_reference,
+        precision=3,
+    )
 
 
 def _write_png(
