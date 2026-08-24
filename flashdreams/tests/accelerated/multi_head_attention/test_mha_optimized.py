@@ -30,6 +30,7 @@ from flashdreams.accelerated.multi_head_attention import (
     RoPEScope,
     RoPEStyle,
 )
+from flashdreams.accelerated.multi_head_attention.cudnn import native_cudnn_fp8_sdpa
 from flashdreams.accelerated.multi_head_attention.torch import TorchMultiHeadAttention
 from flashdreams.accelerated.multi_head_attention.optimized import (
     QKVFusionOption,
@@ -569,3 +570,20 @@ def test_mha_optimized_quantized_sdpa_matches_torch(
             cuda_device,
             tolerance,
         )
+
+
+@torch.inference_mode()
+def test_native_cudnn_fp8_sdpa_returns_independent_outputs(
+    cuda_device: torch.device,
+) -> None:
+    """Keep retained FP8 outputs unchanged across cached graph executions."""
+    shape = (1, 1, 16, 16)
+    query = torch.zeros(shape, device=cuda_device, dtype=torch.float8_e4m3fn)
+    key = torch.zeros_like(query)
+    first = native_cudnn_fp8_sdpa(query, key, torch.ones_like(query))
+    retained = first.float().clone()
+
+    second = native_cudnn_fp8_sdpa(query, key, torch.zeros_like(query))
+
+    assert first.data_ptr() != second.data_ptr()
+    torch.testing.assert_close(first.float(), retained)

@@ -93,13 +93,10 @@ def _build_cudnn_fp8_sdpa(
         name="sdpa",
     )
 
-    output = torch.empty_strided(
-        query_shape, query_stride, dtype=torch.float8_e4m3fn, device=device
-    )
     amax_s = torch.empty((1, 1, 1, 1), dtype=torch.float32, device=device)
     amax_o = torch.empty_like(amax_s)
-    output_desc.set_output(True).set_dim(list(output.shape)).set_stride(
-        list(output.stride())
+    output_desc.set_output(True).set_dim(list(query_shape)).set_stride(
+        list(query_stride)
     )
     amax_s_desc.set_output(False).set_dim(list(amax_s.shape)).set_stride(
         list(amax_s.stride())
@@ -114,6 +111,9 @@ def _build_cudnn_fp8_sdpa(
     )
 
     def execute(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        output = torch.empty_strided(
+            query_shape, query_stride, dtype=torch.float8_e4m3fn, device=device
+        )
         graph.execute(
             {
                 query_desc: query,
