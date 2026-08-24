@@ -81,14 +81,6 @@ BENCHMARK_CASES = [
         implementation="omnidreams_torch",
         self_attention_backend=AttentionBackend.OMNIDREAMS,
         cross_attention_backend=AttentionBackend.OMNIDREAMS,
-        self_attn_optimized_impl_config=OptimizedImplConfig(
-            qkv_fusion_option=QKVFusionOption.NONE,
-            sdpa_backend=SDPABackend.CUDNN,
-        ),
-        cross_attn_optimized_impl_config=OptimizedImplConfig(
-            qkv_fusion_option=QKVFusionOption.NONE,
-            sdpa_backend=SDPABackend.CUDNN,
-        ),
     ),
     # Selected production-shaped pair from the recorded GB300 MHA benchmark.
     AttentionBenchmarkCase(
@@ -119,18 +111,9 @@ BENCHMARK_CASES = [
     AttentionBenchmarkCase(
         implementation="optimized_fa2_quantized_sdpa_self_full_tma_cross_none_tma",
         self_attention_backend=AttentionBackend.OPTIMIZED,
-        cross_attention_backend=AttentionBackend.OPTIMIZED,
+        cross_attention_backend=AttentionBackend.OMNIDREAMS,
         self_attn_optimized_impl_config=OptimizedImplConfig(
             qkv_fusion_option=QKVFusionOption.FULL,
-            sdpa_backend=SDPABackend.FA2,
-            use_tma=True,
-            quantization=QuantizationOption(
-                projection=torch.float8_e4m3fn,
-                quantized_sdpa=True,
-            ),
-        ),
-        cross_attn_optimized_impl_config=OptimizedImplConfig(
-            qkv_fusion_option=QKVFusionOption.NONE,
             sdpa_backend=SDPABackend.FA2,
             use_tma=True,
             quantization=QuantizationOption(
