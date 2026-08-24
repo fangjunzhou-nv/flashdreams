@@ -204,6 +204,43 @@ def _benchmark_quantized_gemm(
 
     timing_scope = "end-to-end" if end_to_end else "gemm-only"
     benchmark.group = f"quantized-gemm-{original_format}-{timing_scope}"
+    left_dtype = original_dtype if quantized_dtype is None else quantized_dtype
+    right_dtype = (
+        original_dtype
+        if quantized_dtype is None
+        else torch.float8_e4m3fn
+        if quantized_dtype is torch.float8_e5m2
+        else quantized_dtype
+    )
+    implementation = (
+        "torch.matmul"
+        if quantized_dtype is None
+        else "torch._int_mm"
+        if quantized_dtype is torch.int8
+        else "torch._scaled_mm"
+    )
+    benchmark.extra_info.update(
+        {
+            "implementation": implementation,
+            "timing_scope": timing_scope,
+            "source_dtype": str(original_dtype),
+            "left_dtype": str(left_dtype),
+            "right_dtype": str(right_dtype),
+            "output_dtype": str(output_dtype),
+            "quantized_dtype": (
+                None if quantized_dtype is None else str(quantized_dtype)
+            ),
+            "granularity": None if granularity is None else granularity.value,
+            "operand_quantization_timed": end_to_end and quantized_dtype is not None,
+            "output_conversion_timed": end_to_end and quantized_dtype is not None,
+            "m": _M,
+            "k": _K,
+            "n": _N,
+            "seed": _SEED,
+            "warmup_rounds": _WARMUP_ROUNDS,
+            "benchmark_rounds": _BENCHMARK_ROUNDS,
+        }
+    )
 
     def synchronized_gemm() -> Tensor:
         output = operation()

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-import triton
 from pytest_benchmark.fixture import BenchmarkFixture
 from torch import Tensor
 
@@ -62,24 +61,27 @@ _IMPLEMENTATIONS = (
 )
 
 
-def _record_environment(
+def _record_case(
     benchmark: BenchmarkFixture,
+    operation: str,
     format: torch.dtype,
     granularity: Granularity,
     implementation: str,
 ) -> None:
-    """Attach the reproducibility metadata shared by both operations."""
+    """Attach metadata for one quantize or dequantize case."""
+    source_dtype = torch.float16 if operation == "quantize" else format
+    output_dtype = format if operation == "quantize" else torch.float16
     benchmark.extra_info.update(
         {
-            "gpu": torch.cuda.get_device_name(),
-            "torch": torch.__version__,
-            "triton": triton.__version__,
-            "cuda": torch.version.cuda,
+            "operation": operation,
+            "implementation": implementation,
             "shape": _SHAPE,
-            "source_dtype": str(torch.float16),
+            "axis": -1,
+            "source_dtype": str(source_dtype),
+            "output_dtype": str(output_dtype),
             "quantized_dtype": str(format),
             "granularity": granularity.value,
-            "implementation": implementation,
+            "seed": _SEED,
             "warmup_rounds": _WARMUP_ROUNDS,
             "benchmark_rounds": _BENCHMARK_ROUNDS,
         }
@@ -106,7 +108,7 @@ def test_quantize_benchmark(
     )
     format_name = str(format).removeprefix("torch.")
     benchmark.group = f"quantize-{format_name}-{granularity.value}"
-    _record_environment(benchmark, format, granularity, implementation)
+    _record_case(benchmark, "quantize", format, granularity, implementation)
 
     def synchronized_quantize() -> tuple[Tensor, Tensor]:
         output = quantize(
@@ -164,7 +166,7 @@ def test_dequantize_benchmark(
     )
     format_name = str(format).removeprefix("torch.")
     benchmark.group = f"dequantize-{format_name}-{granularity.value}"
-    _record_environment(benchmark, format, granularity, implementation)
+    _record_case(benchmark, "dequantize", format, granularity, implementation)
 
     def synchronized_dequantize() -> Tensor:
         output = dequantize(

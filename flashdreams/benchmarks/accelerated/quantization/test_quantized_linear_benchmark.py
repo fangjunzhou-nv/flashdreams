@@ -178,14 +178,49 @@ def test_quantized_linear_benchmark(
                 )
 
     benchmark.group = f"quantized-linear-{original_format}"
+    activation_dtype = original_dtype if quantized_dtype is None else quantized_dtype
+    weight_dtype = (
+        original_dtype
+        if quantized_dtype is None
+        else torch.float8_e4m3fn
+        if quantized_dtype is torch.float8_e5m2
+        else quantized_dtype
+    )
+    implementation = (
+        "torch.nn.Linear" if quantized_dtype is None else "QuantizedNonPersistentLinear"
+    )
+    input_preparation = (
+        "none"
+        if quantized_dtype is None
+        else "prequantized"
+        if prequantized
+        else "timed-quantization"
+    )
     benchmark.extra_info.update(
         {
-            "gpu": torch.cuda.get_device_name(),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
+            "implementation": implementation,
+            "input_preparation": input_preparation,
+            "source_dtype": str(original_dtype),
+            "activation_dtype": str(activation_dtype),
+            "weight_dtype": str(weight_dtype),
+            "output_dtype": str(original_dtype),
+            "quantized_dtype": (
+                None if quantized_dtype is None else str(quantized_dtype)
+            ),
+            "weight_granularity": (
+                None if weight_granularity is None else weight_granularity.value
+            ),
+            "input_granularity": (
+                None if input_granularity is None else input_granularity.value
+            ),
+            "prequantized": bool(prequantized),
+            "activation_quantization_timed": quantized_dtype is not None
+            and not prequantized,
+            "bias": False,
             "batch_size": _BATCH_SIZE,
             "in_features": _IN_FEATURES,
             "out_features": _OUT_FEATURES,
+            "seed": _SEED,
             "warmup_rounds": _WARMUP_ROUNDS,
             "benchmark_rounds": _BENCHMARK_ROUNDS,
         }

@@ -525,6 +525,41 @@ def _benchmark_multi_head_attention(
     )
     if cross_attention_query_only:
         attention_label += "-query-only"
+    projection_dtype = (
+        _DTYPE
+        if optimized_impl_config is None
+        or optimized_impl_config.quantization.projection is None
+        else optimized_impl_config.quantization.projection
+    )
+    quantized_sdpa = (
+        optimized_impl_config is not None
+        and optimized_impl_config.quantization.quantized_sdpa
+    )
+    sdpa_backend = (
+        "torch-sdpa"
+        if optimized_impl_config is None
+        else optimized_impl_config.sdpa_backend.value
+    )
+    qkv_fusion_option = (
+        QKVFusionOption.NONE.value
+        if optimized_impl_config is None
+        else optimized_impl_config.qkv_fusion_option.value
+    )
+    use_tma = optimized_impl_config is not None and optimized_impl_config.use_tma
+    effective_use_tma = (
+        optimized_impl_config is not None
+        and optimized_impl_config.sdpa_backend is SDPABackend.FA2
+        and use_tma
+        and torch.cuda.get_device_capability(device)[0] >= 9
+    )
+    effective_sdpa_backend = "fa2-tma" if effective_use_tma else sdpa_backend
+    timing_scope = (
+        "steady-state"
+        if attention_type is AttentionType.SELF_ATTENTION
+        else "query-only"
+        if cross_attention_query_only
+        else "end-to-end"
+    )
     rope_label = "interleaved" if rope_interleaved else "split"
     bias_label = "on" if bias else "off"
     benchmark.group = "-".join(
@@ -543,46 +578,32 @@ def _benchmark_multi_head_attention(
     )
     benchmark.extra_info.update(
         {
-            "gpu": torch.cuda.get_device_name(device),
-            "torch": str(torch.__version__),
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
+            "implementation": _implementation_id(optimized_impl_config),
+            "attention_type": attention_type.value,
+            "timing_scope": timing_scope,
             "input_dtype": str(_DTYPE),
-            "projection_dtype": (
-                None
-                if optimized_impl_config is None
-                or optimized_impl_config.quantization.projection is None
-                else str(optimized_impl_config.quantization.projection)
-            ),
-            "quantized_sdpa": (
-                False
-                if optimized_impl_config is None
-                else optimized_impl_config.quantization.quantized_sdpa
-            ),
-            "sdpa_backend": (
-                None
-                if optimized_impl_config is None
-                else optimized_impl_config.sdpa_backend.value
-            ),
-            "qkv_fusion_option": (
-                None
-                if optimized_impl_config is None
-                else optimized_impl_config.qkv_fusion_option.value
-            ),
-            "use_tma": (
-                None if optimized_impl_config is None else optimized_impl_config.use_tma
-            ),
-            "cross_attention_timing": (
-                None
-                if attention_type is AttentionType.SELF_ATTENTION
-                else "query-only"
-                if cross_attention_query_only
-                else "end-to-end"
-            ),
+            "projection_dtype": str(projection_dtype),
+            "sdpa_dtype": str(torch.float8_e4m3fn if quantized_sdpa else _DTYPE),
+            "query_dim": _QUERY_DIM,
+            "context_dim": _QUERY_DIM,
+            "n_heads": _N_HEADS,
+            "head_dim": _HEAD_DIM,
+            "qk_norm_scope": qk_norm_scope.value,
+            "rope_scope": rope_scope.value,
+            "rope_interleaved": rope_interleaved,
+            "bias": bias,
+            "quantized_sdpa": quantized_sdpa,
+            "sdpa_backend": sdpa_backend,
+            "effective_sdpa_backend": effective_sdpa_backend,
+            "qkv_fusion_option": qkv_fusion_option,
+            "use_tma": use_tma,
+            "effective_use_tma": effective_use_tma,
             "seed": _SEED,
             "batch_size": _BATCH_SIZE,
             "chunk_size": _CHUNK_SIZE,
+            "window_chunks": _WINDOW_CHUNKS,
             "window_size": _WINDOW_SIZE,
+            "sink_size": _SINK_SIZE,
             "warmup_rounds": _WARMUP_ROUNDS,
             "benchmark_rounds": _BENCHMARK_ROUNDS,
         }
