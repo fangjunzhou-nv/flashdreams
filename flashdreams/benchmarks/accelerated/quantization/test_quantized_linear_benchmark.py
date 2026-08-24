@@ -55,9 +55,20 @@ pytestmark = [
     ),
 ]
 
-_BATCH_SIZE = 4096
-_IN_FEATURES = 4096
-_OUT_FEATURES = 4096
+_LINEAR_SHAPES = (
+    pytest.param(4096, 4096, 4096, "square-4096", id="square-4096"),
+    pytest.param(4800, 2048, 2048, "mha-query-output", id="mha-query-output"),
+    pytest.param(4800, 2048, 6144, "mha-fused-qkv", id="mha-fused-qkv"),
+    pytest.param(
+        28800,
+        2048,
+        4096,
+        "mha-cross-fused-kv",
+        id="mha-cross-fused-kv",
+    ),
+)
+"""Legacy square linear layer and representative MHA projection geometries."""
+
 _SEED = 42
 _WARMUP_ROUNDS = 5
 """Warmup calls used to absorb kernel initialization and autotuning."""
@@ -122,6 +133,7 @@ def _effective_gemm_dtype(
     return original_dtype
 
 
+@pytest.mark.parametrize("m,k,n,geometry", _LINEAR_SHAPES)
 @pytest.mark.parametrize(
     "quantized_dtype,weight_granularity,input_granularity,prequantized",
     _LINEAR_CASES,
@@ -136,17 +148,21 @@ def test_quantized_linear_benchmark(
     weight_granularity: WeightGranularity | None,
     input_granularity: Granularity | None,
     prequantized: bool | None,
+    m: int,
+    k: int,
+    n: int,
+    geometry: str,
 ) -> None:
     """Benchmark regular and quantized linear inference."""
     generator = torch.Generator(device="cuda").manual_seed(_SEED)
     inputs = torch.randn(
-        (_BATCH_SIZE, _IN_FEATURES),
+        (m, k),
         device="cuda",
         dtype=original_dtype,
         generator=generator,
     )
     weight = torch.randn(
-        (_OUT_FEATURES, _IN_FEATURES),
+        (n, k),
         device="cuda",
         dtype=original_dtype,
         generator=generator,
@@ -160,8 +176,8 @@ def test_quantized_linear_benchmark(
             and prequantized is None
         )
         linear = nn.Linear(
-            _IN_FEATURES,
-            _OUT_FEATURES,
+            k,
+            n,
             bias=False,
             device="cuda",
             dtype=original_dtype,
@@ -212,7 +228,7 @@ def test_quantized_linear_benchmark(
         input_granularity,
     )
     effective_format = _DTYPE_FORMATS[effective_dtype]
-    benchmark.group = f"quantized-linear-{effective_format}"
+    benchmark.group = f"quantized-linear-{geometry}-{effective_format}"
     activation_dtype = original_dtype if quantized_dtype is None else quantized_dtype
     weight_dtype = (
         original_dtype
@@ -255,9 +271,13 @@ def test_quantized_linear_benchmark(
             "activation_quantization_timed": quantized_dtype is not None
             and not prequantized,
             "bias": False,
-            "batch_size": _BATCH_SIZE,
-            "in_features": _IN_FEATURES,
-            "out_features": _OUT_FEATURES,
+            "geometry": geometry,
+            "batch_size": m,
+            "in_features": k,
+            "out_features": n,
+            "m": m,
+            "k": k,
+            "n": n,
             "seed": _SEED,
             "warmup_rounds": _WARMUP_ROUNDS,
             "benchmark_rounds": _BENCHMARK_ROUNDS,
@@ -277,7 +297,7 @@ def test_quantized_linear_benchmark(
         warmup_rounds=_WARMUP_ROUNDS,
     )
 
-    assert output.shape == (_BATCH_SIZE, _OUT_FEATURES)
+    assert output.shape == (m, n)
     assert output.dtype is original_dtype
     assert torch.isfinite(output).all()
 

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for effective-precision quantization benchmark grouping."""
+"""CPU tests for quantization benchmark matrices and plots."""
 
 from __future__ import annotations
 
@@ -34,6 +34,10 @@ from scripts.benchmark.flashdreams.accelerated.quantization.plot_quantized_linea
     _load_matrix as load_linear_matrix,
     main as plot_linear,
 )
+from scripts.benchmark.flashdreams.accelerated.quantization.plot_quantizer import (
+    _load_results as load_quantizer_results,
+    main as plot_quantizer,
+)
 
 pytestmark = pytest.mark.ci_cpu
 
@@ -51,8 +55,67 @@ def _benchmark_globals(filename: str) -> dict[str, object]:
     )
 
 
-def _record(group: str, param: str, median: float) -> dict[str, object]:
-    return {"group": group, "param": param, "stats": {"median": median}}
+def _record(
+    group: str,
+    param: str,
+    median: float,
+    extra_info: dict[str, object] | None = None,
+) -> dict[str, object]:
+    record = {"group": group, "param": param, "stats": {"median": median}}
+    if extra_info is not None:
+        record["extra_info"] = extra_info
+    return record
+
+
+def test_projection_geometry_matrix() -> None:
+    expected_shapes = [
+        (4096, 4096, 4096, "square-4096"),
+        (4800, 2048, 2048, "mha-query-output"),
+        (4800, 2048, 6144, "mha-fused-qkv"),
+        (28800, 2048, 4096, "mha-cross-fused-kv"),
+    ]
+    gemm = _benchmark_globals("test_quantized_gemm_benchmark.py")
+    linear = _benchmark_globals("test_quantized_linear_benchmark.py")
+
+    assert [tuple(case.values) for case in gemm["_GEMM_SHAPES"]] == expected_shapes
+    assert [tuple(case.values) for case in linear["_LINEAR_SHAPES"]] == expected_shapes
+
+
+def test_quantizer_dequantization_scale_matrix_and_plot(tmp_path: Path) -> None:
+    quantizer = _benchmark_globals("test_quantizer_benchmark.py")
+    assert [case.values[0] for case in quantizer["_DEQUANTIZATION_SCALE_COUNTS"]] == [
+        1,
+        2,
+    ]
+
+    records = []
+    for operation, scale_counts in (("quantize", (1,)), ("dequantize", (1, 2))):
+        for format in ("float8_e4m3fn", "float8_e5m2", "int8"):
+            for granularity in ("slice", "tensor"):
+                for scale_count in scale_counts:
+                    for implementation in ("torch", "triton"):
+                        extra_info = {"implementation": implementation}
+                        if scale_count > 1:
+                            extra_info["scale_count"] = scale_count
+                        records.append(
+                            _record(
+                                f"{operation}-{format}-{granularity}",
+                                implementation,
+                                0.001,
+                                extra_info,
+                            )
+                        )
+    input_path = tmp_path / "benchmark.json"
+    input_path.write_text(json.dumps({"benchmarks": records}), encoding="utf-8")
+
+    values, _ = load_quantizer_results(input_path)
+    assert ("dequantize", "int8", "slice", 1, "triton") in values
+    assert ("dequantize", "int8", "slice", 2, "triton") in values
+
+    output_dir = tmp_path / "quantizer"
+    plot_quantizer([str(input_path), "--output-dir", str(output_dir)])
+    assert (output_dir / "quantize.png").is_file()
+    assert (output_dir / "dequantize.png").is_file()
 
 
 def test_effective_gemm_dtype_classification() -> None:
@@ -117,7 +180,10 @@ def test_effective_linear_dtype_classification() -> None:
     )
 
 
-def test_plot_rows_preserve_source_and_effective_dtypes(tmp_path: Path) -> None:
+def test_plot_rows_preserve_geometry_source_and_effective_dtypes(
+    tmp_path: Path,
+) -> None:
+    geometry = "mha-query-output"
     gemm_configuration = "float8_e4m3fn-slice"
     linear_configuration = (
         "float8_e4m3fn-weight-per_out_channel-input-tensor-full-precision-x"
@@ -128,19 +194,23 @@ def test_plot_rows_preserve_source_and_effective_dtypes(tmp_path: Path) -> None:
             {
                 "benchmarks": [
                     _record(
-                        "quantized-gemm-bf16-end-to-end",
-                        "bf16-full-precision",
+                        f"quantized-gemm-{geometry}-bf16-end-to-end",
+                        f"bf16-full-precision-{geometry}",
                         0.002,
                     ),
                     _record(
-                        "quantized-gemm-bf16-end-to-end",
-                        f"fp32-{gemm_configuration}",
+                        f"quantized-gemm-{geometry}-bf16-end-to-end",
+                        f"fp32-{gemm_configuration}-{geometry}",
                         0.001,
                     ),
-                    _record("quantized-linear-bf16", "bf16-nn-linear", 0.003),
                     _record(
-                        "quantized-linear-bf16",
-                        f"fp32-{linear_configuration}",
+                        f"quantized-linear-{geometry}-bf16",
+                        f"bf16-nn-linear-{geometry}",
+                        0.003,
+                    ),
+                    _record(
+                        f"quantized-linear-{geometry}-bf16",
+                        f"fp32-{linear_configuration}-{geometry}",
                         0.0015,
                     ),
                 ]
@@ -152,15 +222,15 @@ def test_plot_rows_preserve_source_and_effective_dtypes(tmp_path: Path) -> None:
     gemm_rows, _, gemm_values, _ = load_gemm_matrix(input_path)
     linear_rows, _, linear_values, _ = load_linear_matrix(input_path)
 
-    gemm_moved_row = ("end-to-end", "bf16", "fp32")
-    linear_moved_row = ("bf16", "fp32")
+    gemm_moved_row = ("end-to-end", geometry, "bf16", "fp32")
+    linear_moved_row = (geometry, "bf16", "fp32")
     assert gemm_rows == [
-        ("end-to-end", "bf16", "bf16"),
+        ("end-to-end", geometry, "bf16", "bf16"),
         gemm_moved_row,
     ]
     assert gemm_values[(gemm_moved_row, "full-precision")] == pytest.approx(2.0)
     assert gemm_values[(gemm_moved_row, gemm_configuration)] == pytest.approx(1.0)
-    assert linear_rows == [("bf16", "bf16"), linear_moved_row]
+    assert linear_rows == [(geometry, "bf16", "bf16"), linear_moved_row]
     assert linear_values[(linear_moved_row, "nn-linear")] == pytest.approx(3.0)
     assert linear_values[(linear_moved_row, linear_configuration)] == pytest.approx(1.5)
 

@@ -62,8 +62,14 @@ _INPUT_STATE_OUTPUT_NAMES = {
     "prequantized-x": "prequantized_input",
 }
 _FORMAT_LABELS = {"fp16": "FP16", "bf16": "BF16", "fp32": "FP32"}
+_GEOMETRY_LABELS = {
+    "square-4096": "Square 4096×4096×4096",
+    "mha-query-output": "MHA query/output 4800×2048×2048",
+    "mha-fused-qkv": "MHA fused QKV 4800×2048×6144",
+    "mha-cross-fused-kv": "MHA cross fused K/V 28800×2048×4096",
+}
 
-RowKey = tuple[str, str]
+RowKey = tuple[str, str, str]
 CellKey = tuple[RowKey, str]
 
 
@@ -133,18 +139,29 @@ def _load_matrix(
         param = record.get("param")
         if not isinstance(group, str) or not isinstance(param, str):
             continue
-        match = re.fullmatch(r"quantized-linear-(fp16|bf16|fp32)", group)
+        match = re.fullmatch(
+            r"quantized-linear-(?:(?P<geometry>.+)-)?"
+            r"(?P<effective>fp16|bf16|fp32)",
+            group,
+        )
         if match is None:
             continue
-        effective_format = match.group(1)
+        geometry_in_group = match.group("geometry")
+        geometry = geometry_in_group or "square-4096"
+        effective_format = match.group("effective")
         parameter_match = re.fullmatch(r"(fp16|bf16|fp32)-(.+)", param)
         if parameter_match is None:
             raise SystemExit(f"Unsupported quantized linear parameter {param!r}")
         source_format, configuration = parameter_match.groups()
+        if geometry_in_group is not None:
+            suffix = f"-{geometry}"
+            if not configuration.endswith(suffix):
+                raise SystemExit(f"Unsupported quantized linear parameter {param!r}")
+            configuration = configuration.removesuffix(suffix)
         if configuration != _REFERENCE_CONFIG:
             _parse_configuration(configuration)
 
-        row = (effective_format, source_format)
+        row = (geometry, effective_format, source_format)
         cell = (row, configuration)
         if cell in values_ms:
             raise SystemExit(f"Duplicate benchmark cell for {row} and {configuration}")
@@ -160,8 +177,8 @@ def _load_matrix(
         )
 
     for row in rows:
-        effective_format, _ = row
-        reference_row = (effective_format, effective_format)
+        geometry, effective_format, _ = row
+        reference_row = (geometry, effective_format, effective_format)
         reference = values_ms.get((reference_row, _REFERENCE_CONFIG))
         if reference is not None:
             values_ms.setdefault((row, _REFERENCE_CONFIG), reference)
@@ -186,13 +203,14 @@ def _config_label(configuration: str) -> str:
 
 
 def _row_label(row: RowKey) -> str:
-    """Return an effective-dtype label with source dtype when it differs."""
-    effective_format, source_format = row
+    """Return a geometry and effective-dtype label."""
+    geometry, effective_format, source_format = row
+    geometry_label = _GEOMETRY_LABELS.get(geometry, geometry.replace("-", " "))
     effective = _FORMAT_LABELS.get(effective_format, effective_format)
     if source_format == effective_format:
-        return effective
+        return f"{geometry_label}\n{effective}"
     source = _FORMAT_LABELS.get(source_format, source_format)
-    return f"{effective} effective\n{source} source"
+    return f"{geometry_label}\n{effective} effective · {source} source"
 
 
 def _write_png(

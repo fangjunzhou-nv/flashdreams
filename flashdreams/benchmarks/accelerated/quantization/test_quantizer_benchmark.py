@@ -60,6 +60,12 @@ _IMPLEMENTATIONS = (
     pytest.param(True, "triton", id="triton"),
 )
 
+_DEQUANTIZATION_SCALE_COUNTS = (
+    pytest.param(1, id="one-scale"),
+    pytest.param(2, id="two-scales"),
+)
+"""Single-scale and row/column-scaled GEMM restoration cases."""
+
 
 def _record_case(
     benchmark: BenchmarkFixture,
@@ -67,6 +73,7 @@ def _record_case(
     format: torch.dtype,
     granularity: Granularity,
     implementation: str,
+    scale_shapes: tuple[tuple[int, ...], ...],
 ) -> None:
     """Attach metadata for one quantize or dequantize case."""
     source_dtype = torch.float16 if operation == "quantize" else format
@@ -81,6 +88,9 @@ def _record_case(
             "output_dtype": str(output_dtype),
             "quantized_dtype": str(format),
             "granularity": granularity.value,
+            "scale_count": len(scale_shapes),
+            "scale_shapes": scale_shapes,
+            "scale_dtype": str(torch.float32),
             "seed": _SEED,
             "warmup_rounds": _WARMUP_ROUNDS,
             "benchmark_rounds": _BENCHMARK_ROUNDS,
@@ -108,7 +118,17 @@ def test_quantize_benchmark(
     )
     format_name = str(format).removeprefix("torch.")
     benchmark.group = f"quantize-{format_name}-{granularity.value}"
-    _record_case(benchmark, "quantize", format, granularity, implementation)
+    expected_scale_shape = (
+        (1, 1) if granularity is Granularity.TENSOR else (_SHAPE[0], 1)
+    )
+    _record_case(
+        benchmark,
+        "quantize",
+        format,
+        granularity,
+        implementation,
+        (expected_scale_shape,),
+    )
 
     def synchronized_quantize() -> tuple[Tensor, Tensor]:
         output = quantize(
@@ -129,9 +149,6 @@ def test_quantize_benchmark(
         warmup_rounds=_WARMUP_ROUNDS,
     )
 
-    expected_scale_shape = (
-        (1, 1) if granularity is Granularity.TENSOR else (_SHAPE[0], 1)
-    )
     assert quantized.shape == _SHAPE
     assert quantized.dtype is format
     assert scale.shape == expected_scale_shape
@@ -142,12 +159,14 @@ def test_quantize_benchmark(
 @pytest.mark.parametrize("format", DTYPE_MAX)
 @pytest.mark.parametrize("granularity", Granularity)
 @pytest.mark.parametrize("use_triton,implementation", _IMPLEMENTATIONS)
+@pytest.mark.parametrize("scale_count", _DEQUANTIZATION_SCALE_COUNTS)
 def test_dequantize_benchmark(
     benchmark: BenchmarkFixture,
     format: torch.dtype,
     granularity: Granularity,
     use_triton: bool,
     implementation: str,
+    scale_count: int,
 ) -> None:
     """Benchmark dequantization through one Torch or Triton implementation."""
     generator = torch.Generator(device="cuda").manual_seed(_SEED)
@@ -157,21 +176,31 @@ def test_dequantize_benchmark(
         dtype=torch.float16,
         generator=generator,
     )
-    quantized, scale = quantize(
+    quantized, row_scale = quantize(
         original,
         format,
         granularity,
         axis=-1,
         use_triton=False,
     )
+    scales = (
+        (row_scale,) if scale_count == 1 else (row_scale, row_scale.mT.contiguous())
+    )
     format_name = str(format).removeprefix("torch.")
     benchmark.group = f"dequantize-{format_name}-{granularity.value}"
-    _record_case(benchmark, "dequantize", format, granularity, implementation)
+    _record_case(
+        benchmark,
+        "dequantize",
+        format,
+        granularity,
+        implementation,
+        tuple(tuple(scale.shape) for scale in scales),
+    )
 
     def synchronized_dequantize() -> Tensor:
         output = dequantize(
             quantized,
-            scale,
+            *scales,
             dtype=torch.float16,
             use_triton=use_triton,
         )

@@ -42,11 +42,6 @@ _OPERATIONS = ("quantize", "dequantize")
 _FORMATS = ("float8_e4m3fn", "float8_e5m2", "int8")
 _GRANULARITIES = ("slice", "tensor")
 _IMPLEMENTATIONS = ("torch", "triton")
-_COLUMNS = tuple(
-    (granularity, implementation)
-    for granularity in _GRANULARITIES
-    for implementation in _IMPLEMENTATIONS
-)
 _GROUP_PATTERN = re.compile(
     r"(?P<operation>quantize|dequantize)-"
     r"(?P<format>float8_e4m3fn|float8_e5m2|int8)-"
@@ -58,7 +53,7 @@ _FORMAT_LABELS = {
     "int8": "INT8",
 }
 
-CellKey = tuple[str, str, str, str]
+CellKey = tuple[str, str, str, int, str]
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -84,8 +79,8 @@ def _load_results(input_path: Path) -> tuple[dict[CellKey, float], str]:
         input_path: Pytest-benchmark JSON file to parse.
 
     Returns:
-        Median milliseconds by operation, format, granularity, and
-        implementation, plus the plot subtitle.
+        Median milliseconds by operation, format, granularity, scale count,
+        and implementation, plus the plot subtitle.
 
     Raises:
         SystemExit: The input cannot be read or lacks complete quantizer data.
@@ -114,10 +109,23 @@ def _load_results(input_path: Path) -> tuple[dict[CellKey, float], str]:
                 "implementation metadata"
             )
 
+        scale_count = (
+            extra_info.get("scale_count", 1) if isinstance(extra_info, dict) else 1
+        )
+        if (
+            isinstance(scale_count, bool)
+            or not isinstance(scale_count, int)
+            or scale_count < 1
+        ):
+            raise SystemExit(
+                f"Benchmark {record.get('name', '<unnamed>')} has an invalid "
+                "scale count"
+            )
         cell = (
             match.group("operation"),
             match.group("format"),
             match.group("granularity"),
+            scale_count,
             implementation,
         )
         if cell in values_ms:
@@ -180,55 +188,83 @@ def _write_png(
     Raises:
         SystemExit: Any format and granularity pair lacks its Torch reference.
     """
+    scale_counts = sorted({cell[3] for cell in values_ms if cell[0] == operation})
+    columns = tuple(
+        (scale_count, granularity, implementation)
+        for scale_count in scale_counts
+        for granularity in _GRANULARITIES
+        for implementation in _IMPLEMENTATIONS
+    )
     missing_references = [
-        (format, granularity)
+        (format, granularity, scale_count)
         for format in _FORMATS
         for granularity in _GRANULARITIES
-        if (operation, format, granularity, "torch") not in values_ms
+        for scale_count in scale_counts
+        if (operation, format, granularity, scale_count, "torch") not in values_ms
     ]
     if missing_references:
         raise SystemExit(
             f"{operation.capitalize()} results lack Torch references: "
             + ", ".join(
-                f"{format}/{granularity}" for format, granularity in missing_references
+                f"{format}/{granularity}/{scale_count}-scale"
+                for format, granularity, scale_count in missing_references
             )
         )
 
     matrix: list[list[float]] = []
     for format in _FORMATS:
         row = []
-        for granularity, implementation in _COLUMNS:
-            reference = values_ms[(operation, format, granularity, "torch")]
-            value = values_ms.get((operation, format, granularity, implementation))
+        for scale_count, granularity, implementation in columns:
+            reference = values_ms[
+                (operation, format, granularity, scale_count, "torch")
+            ]
+            value = values_ms.get(
+                (operation, format, granularity, scale_count, implementation)
+            )
             row.append(value / reference if value is not None else math.nan)
         matrix.append(row)
 
     figure, axes = plt.subplots()
     default_width, default_height = figure.get_size_inches()
     figure.set_size_inches(
-        max(default_width, len(_COLUMNS) * 1.8),
+        max(default_width, len(columns) * 1.8),
         max(default_height, len(_FORMATS) * 1.2),
     )
     image = draw_relative_heatmap(axes, matrix)
     axes.set_xticks(
-        range(len(_COLUMNS)),
+        range(len(columns)),
         labels=[
-            f"{granularity.capitalize()}\n{implementation.capitalize()}"
-            for granularity, implementation in _COLUMNS
+            (
+                f"{scale_count} {'scale' if scale_count == 1 else 'scales'}\n"
+                f"{granularity.capitalize()}\n{implementation.capitalize()}"
+                if len(scale_counts) > 1
+                else f"{granularity.capitalize()}\n{implementation.capitalize()}"
+            )
+            for scale_count, granularity, implementation in columns
         ],
     )
     axes.set_yticks(
         range(len(_FORMATS)),
         labels=[_FORMAT_LABELS[format] for format in _FORMATS],
     )
-    axes.set_xlabel("Scale granularity and implementation")
+    axes.set_xlabel(
+        "Scale count, granularity, and implementation"
+        if len(scale_counts) > 1
+        else "Scale granularity and implementation"
+    )
     axes.set_ylabel("Quantized dtype")
     axes.set_title(f"{operation.capitalize()} · Torch vs Triton\n{subtitle}")
 
     for row_index, format in enumerate(_FORMATS):
-        for column_index, (granularity, implementation) in enumerate(_COLUMNS):
-            reference = values_ms[(operation, format, granularity, "torch")]
-            value = values_ms.get((operation, format, granularity, implementation))
+        for column_index, (scale_count, granularity, implementation) in enumerate(
+            columns
+        ):
+            reference = values_ms[
+                (operation, format, granularity, scale_count, "torch")
+            ]
+            value = values_ms.get(
+                (operation, format, granularity, scale_count, implementation)
+            )
             label = _cell_label(
                 value,
                 reference,

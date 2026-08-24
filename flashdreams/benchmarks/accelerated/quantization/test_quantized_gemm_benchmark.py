@@ -56,9 +56,20 @@ pytestmark = [
     ),
 ]
 
-_M = 4096
-_K = 4096
-_N = 4096
+_GEMM_SHAPES = (
+    pytest.param(4096, 4096, 4096, "square-4096", id="square-4096"),
+    pytest.param(4800, 2048, 2048, "mha-query-output", id="mha-query-output"),
+    pytest.param(4800, 2048, 6144, "mha-fused-qkv", id="mha-fused-qkv"),
+    pytest.param(
+        28800,
+        2048,
+        4096,
+        "mha-cross-fused-kv",
+        id="mha-cross-fused-kv",
+    ),
+)
+"""Legacy square GEMM and representative MHA projection geometries."""
+
 _SEED = 42
 _WARMUP_ROUNDS = 5
 """Warmup calls used to absorb kernel initialization and autotuning."""
@@ -197,16 +208,18 @@ def _benchmark_quantized_gemm(
     original_format: str,
     quantized_dtype: torch.dtype | None,
     granularity: Granularity | None,
+    m: int,
+    k: int,
+    n: int,
+    geometry: str,
     *,
     end_to_end: bool,
 ) -> None:
     """Benchmark one quantized GEMM configuration."""
     generator = torch.Generator(device="cuda").manual_seed(_SEED)
-    left = torch.randn(
-        (_M, _K), device="cuda", dtype=original_dtype, generator=generator
-    )
+    left = torch.randn((m, k), device="cuda", dtype=original_dtype, generator=generator)
     right = torch.randn(
-        (_K, _N), device="cuda", dtype=original_dtype, generator=generator
+        (k, n), device="cuda", dtype=original_dtype, generator=generator
     )
 
     if quantized_dtype is None:
@@ -231,7 +244,7 @@ def _benchmark_quantized_gemm(
         original_dtype, quantized_dtype, granularity
     )
     effective_format = _DTYPE_FORMATS[effective_dtype]
-    benchmark.group = f"quantized-gemm-{effective_format}-{timing_scope}"
+    benchmark.group = f"quantized-gemm-{geometry}-{effective_format}-{timing_scope}"
     left_dtype = original_dtype if quantized_dtype is None else quantized_dtype
     right_dtype = (
         original_dtype
@@ -264,9 +277,10 @@ def _benchmark_quantized_gemm(
             "granularity": None if granularity is None else granularity.value,
             "operand_quantization_timed": end_to_end and quantized_dtype is not None,
             "output_conversion_timed": end_to_end and quantized_dtype is not None,
-            "m": _M,
-            "k": _K,
-            "n": _N,
+            "geometry": geometry,
+            "m": m,
+            "k": k,
+            "n": n,
             "seed": _SEED,
             "warmup_rounds": _WARMUP_ROUNDS,
             "benchmark_rounds": _BENCHMARK_ROUNDS,
@@ -286,11 +300,12 @@ def _benchmark_quantized_gemm(
         warmup_rounds=_WARMUP_ROUNDS,
     )
 
-    assert output.shape == (_M, _N)
+    assert output.shape == (m, n)
     assert output.dtype is output_dtype
     assert torch.isfinite(output).all()
 
 
+@pytest.mark.parametrize("m,k,n,geometry", _GEMM_SHAPES)
 @pytest.mark.parametrize("quantized_dtype,granularity", _GEMM_CASES)
 @pytest.mark.parametrize("original_dtype,original_format", _ORIGINAL_DTYPES)
 def test_quantized_gemm_end_to_end_benchmark(
@@ -299,6 +314,10 @@ def test_quantized_gemm_end_to_end_benchmark(
     original_format: str,
     quantized_dtype: torch.dtype | None,
     granularity: Granularity | None,
+    m: int,
+    k: int,
+    n: int,
+    geometry: str,
 ) -> None:
     """Benchmark quantization, GEMM, and output conversion together."""
     _benchmark_quantized_gemm(
@@ -307,10 +326,15 @@ def test_quantized_gemm_end_to_end_benchmark(
         original_format,
         quantized_dtype,
         granularity,
+        m,
+        k,
+        n,
+        geometry,
         end_to_end=True,
     )
 
 
+@pytest.mark.parametrize("m,k,n,geometry", _GEMM_SHAPES)
 @pytest.mark.parametrize("quantized_dtype,granularity", _GEMM_CASES)
 @pytest.mark.parametrize("original_dtype,original_format", _ORIGINAL_DTYPES)
 def test_quantized_gemm_only_benchmark(
@@ -319,6 +343,10 @@ def test_quantized_gemm_only_benchmark(
     original_format: str,
     quantized_dtype: torch.dtype | None,
     granularity: Granularity | None,
+    m: int,
+    k: int,
+    n: int,
+    geometry: str,
 ) -> None:
     """Benchmark GEMM with operands quantized before timing."""
     _benchmark_quantized_gemm(
@@ -327,5 +355,9 @@ def test_quantized_gemm_only_benchmark(
         original_format,
         quantized_dtype,
         granularity,
+        m,
+        k,
+        n,
+        geometry,
         end_to_end=False,
     )
