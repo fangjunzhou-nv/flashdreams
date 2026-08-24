@@ -107,6 +107,7 @@ BENCHMARK_CASES = [
             use_tma=True,
             quantization=QuantizationOption(projection=torch.float8_e4m3fn),
         ),
+        minimum_compute_capability=(9, 0),
     ),
     # RTX PRO 6000 quantized SDPA pair with e4m3 projections enabled.
     AttentionBenchmarkCase(
