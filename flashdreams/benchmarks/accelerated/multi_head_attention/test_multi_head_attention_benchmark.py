@@ -67,30 +67,32 @@ _IMPLEMENTATION_CONFIGS: tuple[OptimizedImplConfig | None, ...] = (
     None,
     *(
         OptimizedImplConfig(
-            sdpa_backend=sdpa_backend,
-            qkv_fusion_option=qkv_fusion_option,
-            use_tma=True,
-        )
-        for sdpa_backend in SDPABackend
-        for qkv_fusion_option in QKVFusionOption
-    ),
-    *(
-        OptimizedImplConfig(
             sdpa_backend=SDPABackend.CUDNN,
             qkv_fusion_option=qkv_fusion_option,
             use_tma=False,
-            quantization=QuantizationOption(projection=torch.float8_e4m3fn),
+            quantization=QuantizationOption(
+                projection=projection_quantization,
+                quantized_sdpa=quantized_sdpa,
+            ),
         )
         for qkv_fusion_option in QKVFusionOption
+        for projection_quantization in (None, torch.float8_e4m3fn)
+        for quantized_sdpa in (False, True)
     ),
     *(
         OptimizedImplConfig(
             sdpa_backend=SDPABackend.FA2,
             qkv_fusion_option=qkv_fusion_option,
             use_tma=use_tma,
+            quantization=QuantizationOption(
+                projection=projection_quantization,
+                quantized_sdpa=quantized_sdpa,
+            ),
         )
         for qkv_fusion_option in QKVFusionOption
         for use_tma in (False, True)
+        for projection_quantization in (None, torch.float8_e4m3fn)
+        for quantized_sdpa in (False, True)
     ),
 )
 """Torch reference, optimized policies, FP8 projections, and quantized SDPA rows."""
