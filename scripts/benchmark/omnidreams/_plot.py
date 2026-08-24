@@ -284,7 +284,9 @@ def _write_bar_figure(
         configurations: Stable implementation order.
         subtitle: Benchmark environment summary.
     """
-    end_to_end = all(panel in _END_TO_END_PANELS for panel in panels)
+    end_to_end = all(
+        panel in (*_END_TO_END_PANELS, _DIT_BLOCK_PANEL) for panel in panels
+    )
     reference_configuration = "omnidreams-torch" if end_to_end else "omnidreams"
     configuration_label = (
         _end_to_end_configuration_label
@@ -531,7 +533,20 @@ def plot_modules(input_path: Path, output_dir: Path) -> None:
     print(f"Wrote {attention_output}")
 
     block_output = output_dir / "dit_block.png"
-    _write_block_figure(block_output, values, subtitle)
+    if all(
+        implementation.startswith("self-")
+        for implementation in values[_DIT_BLOCK_PANEL[0]]
+    ):
+        _write_block_figure(block_output, values, subtitle)
+    else:
+        _write_bar_figure(
+            block_output,
+            "Omnidreams DiT block benchmark",
+            (_DIT_BLOCK_PANEL,),
+            values,
+            configurations,
+            subtitle,
+        )
     print(f"Wrote {block_output}")
 
 

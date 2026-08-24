@@ -24,6 +24,8 @@ Run the module benchmarks with::
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 from omnidreams.transformer.impl.modules import (
@@ -42,6 +44,7 @@ from flashdreams.accelerated.multi_head_attention.optimized import (
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from integrations.omnidreams.benchmarks.cases import (
     AttentionBenchmarkCase,
+    BENCHMARK_CASES,
     skip_unsupported_device,
 )
 
@@ -78,42 +81,49 @@ def _implementation_id(optimized_impl_config: OptimizedImplConfig | None) -> str
         else f"-projection-{projection_dtype}".replace("torch.", "").replace("_", "-")
     )
     quantized_sdpa = (
-        "-quantized-sdpa"
-        if optimized_impl_config.quantization.quantized_sdpa
-        else ""
+        "-quantized-sdpa" if optimized_impl_config.quantization.quantized_sdpa else ""
     )
     return f"optimized-{backend}-{fusion}-{tma}{quantization}{quantized_sdpa}"
 
 
-_OPTIMIZED_IMPL_CONFIGS = (
-    *(
-        OptimizedImplConfig(
-            qkv_fusion_option=qkv_fusion_option,
-            quantization=QuantizationOption(projection=projection_dtype),
-            sdpa_backend=sdpa_backend,
-            use_tma=use_tma,
-        )
-        for sdpa_backend in SDPABackend
-        for qkv_fusion_option in QKVFusionOption
-        for use_tma in (False, True)
-        for projection_dtype in (None, torch.float8_e4m3fn)
-    ),
-    *(
-        OptimizedImplConfig(
-            qkv_fusion_option=qkv_fusion_option,
-            quantization=QuantizationOption(
-                projection=torch.float8_e4m3fn,
-                quantized_sdpa=True,
-            ),
-            sdpa_backend=sdpa_backend,
-            use_tma=use_tma,
-        )
-        for sdpa_backend in SDPABackend
-        for qkv_fusion_option in QKVFusionOption
-        for use_tma in (False, True)
-    ),
+_CUDNN_OPTIMIZED_IMPL_CONFIGS = tuple(
+    OptimizedImplConfig(
+        sdpa_backend=SDPABackend.CUDNN,
+        qkv_fusion_option=qkv_fusion_option,
+        use_tma=False,
+        quantization=QuantizationOption(
+            projection=projection_dtype,
+            quantized_sdpa=quantized_sdpa,
+        ),
+    )
+    for qkv_fusion_option in QKVFusionOption
+    for projection_dtype in (None, torch.float8_e4m3fn)
+    for quantized_sdpa in (False, True)
 )
-"""Every optimized SDPA, fusion, TMA, and attention-quantization policy."""
+"""Every cuDNN fusion and quantization policy; TMA only affects FA2 dispatch."""
+
+_FA2_OPTIMIZED_IMPL_CONFIGS = tuple(
+    OptimizedImplConfig(
+        sdpa_backend=SDPABackend.FA2,
+        qkv_fusion_option=qkv_fusion_option,
+        use_tma=use_tma,
+        quantization=QuantizationOption(
+            projection=projection_dtype,
+            quantized_sdpa=quantized_sdpa,
+        ),
+    )
+    for qkv_fusion_option in QKVFusionOption
+    for use_tma in (False, True)
+    for projection_dtype in (None, torch.float8_e4m3fn)
+    for quantized_sdpa in (False, True)
+)
+"""Every FA2 fusion, TMA, and quantization policy."""
+
+_OPTIMIZED_IMPL_CONFIGS = (
+    *_CUDNN_OPTIMIZED_IMPL_CONFIGS,
+    *_FA2_OPTIMIZED_IMPL_CONFIGS,
+)
+"""Every backend-specific policy used by the isolated attention benchmarks."""
 
 _MODULE_SELF_ATTENTION_CONFIGS = (None, *_OPTIMIZED_IMPL_CONFIGS)
 """Reference self-attention plus every Optimized implementation config."""
@@ -142,14 +152,7 @@ def _block_case(
         qkv_fusion_option=QKVFusionOption.NONE,
         sdpa_backend=SDPABackend.CUDNN,
     )
-    needs_hopper = any(
-        config is not None
-        and (
-            config.sdpa_backend is not SDPABackend.CUDNN
-            or config.quantization.projection is not None
-        )
-        for config in (self_config, cross_config)
-    )
+    needs_hopper = self_config is not None or cross_config is not None
     return AttentionBenchmarkCase(
         implementation=(
             f"self_{_implementation_id(self_config)}_"
@@ -171,12 +174,22 @@ def _block_case(
     )
 
 
-_MODULE_CASE_MATRIX = tuple(
-    _block_case(self_config, cross_config)
-    for self_config in _MODULE_SELF_ATTENTION_CONFIGS
-    for cross_config in _MODULE_CROSS_ATTENTION_CONFIGS
-)
-"""Every valid self- and cross-attention implementation combination."""
+def _module_block_cases(full_policy_search: bool) -> tuple[AttentionBenchmarkCase, ...]:
+    """Build representative or exhaustive self/cross pairs for block timing."""
+    if not full_policy_search:
+        return tuple(case for case in BENCHMARK_CASES if not case.native_dit)
+    return tuple(
+        _block_case(self_config, cross_config)
+        for self_config in _MODULE_SELF_ATTENTION_CONFIGS
+        for cross_config in _MODULE_CROSS_ATTENTION_CONFIGS
+    )
+
+
+_FULL_POLICY_SEARCH = os.environ.get("OMNIDREAMS_DIT_BLOCK_FULL_SEARCH") == "1"
+"""Whether to benchmark every self/cross pair in the full DiT block."""
+
+_MODULE_BLOCK_CASES = _module_block_cases(_FULL_POLICY_SEARCH)
+"""Selected block cases; set OMNIDREAMS_DIT_BLOCK_FULL_SEARCH=1 for all 925."""
 
 
 def _module_config(case: AttentionBenchmarkCase) -> CosmosDiTNetworkConfig:
@@ -226,7 +239,7 @@ def _make_block(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason=_GPU_REASON)
-@pytest.mark.parametrize("case", _MODULE_CASE_MATRIX, ids=lambda case: case.pytest_id)
+@pytest.mark.parametrize("case", _MODULE_BLOCK_CASES, ids=lambda case: case.pytest_id)
 @torch.inference_mode()
 def test_dit_block_benchmark(
     benchmark: BenchmarkFixture,

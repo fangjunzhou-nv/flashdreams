@@ -351,7 +351,6 @@ def test_native_cuda_dit_network_benchmark(
     patch_volume = network_config.patch_temporal * network_config.patch_spatial**2
     tokens_per_frame = patch_h * patch_w
     chunk_tokens = patch_t * tokens_per_frame
-    _WINDOW_SIZE_T * tokens_per_frame
 
     def forward() -> torch.Tensor:
         return transformer.predict_flow(

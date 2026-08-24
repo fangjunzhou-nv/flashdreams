@@ -41,11 +41,15 @@ from flashdreams.accelerated.multi_head_attention.optimized import (
 )
 from integrations.omnidreams.benchmarks.cases import BENCHMARK_CASES
 from integrations.omnidreams.benchmarks.test_modules import (
-    _MODULE_CASE_MATRIX,
+    _CUDNN_OPTIMIZED_IMPL_CONFIGS,
+    _FA2_OPTIMIZED_IMPL_CONFIGS,
+    _FULL_POLICY_SEARCH,
+    _MODULE_BLOCK_CASES,
     _MODULE_CROSS_ATTENTION_CONFIGS,
     _MODULE_SELF_ATTENTION_CONFIGS,
     _OPTIMIZED_IMPL_CONFIGS,
     _implementation_id,
+    _module_block_cases,
 )
 
 pytestmark = pytest.mark.ci_cpu
@@ -429,35 +433,41 @@ def test_benchmark_cases_match_selected_matrix() -> None:
     assert len({case.pytest_id for case in BENCHMARK_CASES}) == len(BENCHMARK_CASES)
 
 
-def test_module_benchmark_cases_cover_attention_policy_matrix() -> None:
-    """Cover every module SDPA, fusion, TMA, and quantization policy."""
-    expected_configs = {
+def test_module_benchmark_configs_cover_attention_policy_matrix() -> None:
+    """Keep exhaustive policies isolated and full-block pairs representative."""
+    expected_cudnn_configs = {
         OptimizedImplConfig(
-            sdpa_backend=sdpa_backend,
+            sdpa_backend=SDPABackend.CUDNN,
             qkv_fusion_option=qkv_fusion_option,
-            quantization=QuantizationOption(projection=projection_dtype),
-            use_tma=use_tma,
+            use_tma=False,
+            quantization=QuantizationOption(
+                projection=projection_dtype,
+                quantized_sdpa=quantized_sdpa,
+            ),
         )
-        for sdpa_backend in SDPABackend
+        for qkv_fusion_option in QKVFusionOption
+        for projection_dtype in (None, torch.float8_e4m3fn)
+        for quantized_sdpa in (False, True)
+    }
+    expected_fa2_configs = {
+        OptimizedImplConfig(
+            sdpa_backend=SDPABackend.FA2,
+            qkv_fusion_option=qkv_fusion_option,
+            use_tma=use_tma,
+            quantization=QuantizationOption(
+                projection=projection_dtype,
+                quantized_sdpa=quantized_sdpa,
+            ),
+        )
         for qkv_fusion_option in QKVFusionOption
         for use_tma in (False, True)
         for projection_dtype in (None, torch.float8_e4m3fn)
+        for quantized_sdpa in (False, True)
     }
-    expected_configs.update(
-        OptimizedImplConfig(
-            sdpa_backend=sdpa_backend,
-            qkv_fusion_option=qkv_fusion_option,
-            quantization=QuantizationOption(
-                projection=torch.float8_e4m3fn,
-                quantized_sdpa=True,
-            ),
-            use_tma=use_tma,
-        )
-        for sdpa_backend in SDPABackend
-        for qkv_fusion_option in QKVFusionOption
-        for use_tma in (False, True)
-    )
+    expected_configs = expected_cudnn_configs | expected_fa2_configs
 
+    assert set(_CUDNN_OPTIMIZED_IMPL_CONFIGS) == expected_cudnn_configs
+    assert set(_FA2_OPTIMIZED_IMPL_CONFIGS) == expected_fa2_configs
     assert set(_OPTIMIZED_IMPL_CONFIGS) == expected_configs
     assert _MODULE_SELF_ATTENTION_CONFIGS[0] is None
     assert set(_MODULE_SELF_ATTENTION_CONFIGS[1:]) == expected_configs
@@ -470,19 +480,38 @@ def test_module_benchmark_cases_cover_attention_policy_matrix() -> None:
     assert _MODULE_CROSS_ATTENTION_CONFIGS[0] is None
     assert set(_MODULE_CROSS_ATTENTION_CONFIGS[1:]) == expected_cross_configs
 
-    expected_block_ids = {
-        f"self_{_implementation_id(self_config)}_"
-        f"cross_{_implementation_id(cross_config)}"
-        for self_config in _MODULE_SELF_ATTENTION_CONFIGS
-        for cross_config in _MODULE_CROSS_ATTENTION_CONFIGS
-    }
-    assert {case.implementation for case in _MODULE_CASE_MATRIX} == expected_block_ids
+    representative_block_cases = _module_block_cases(False)
+    assert representative_block_cases == tuple(
+        case for case in BENCHMARK_CASES if not case.native_dit
+    )
+    assert tuple(
+        case.minimum_compute_capability for case in representative_block_cases
+    ) == (None, (9, 0), (9, 0))
+
+    full_block_cases = _module_block_cases(True)
+    assert len(full_block_cases) == 37 * 25
+    assert len({case.pytest_id for case in full_block_cases}) == len(full_block_cases)
+    assert all(
+        case.minimum_compute_capability
+        == (
+            (9, 0)
+            if AttentionBackend.OPTIMIZED
+            in (case.self_attention_backend, case.cross_attention_backend)
+            else None
+        )
+        for case in full_block_cases
+    )
+    assert _MODULE_BLOCK_CASES == (
+        full_block_cases if _FULL_POLICY_SEARCH else representative_block_cases
+    )
     assert len(_MODULE_SELF_ATTENTION_CONFIGS) == 37
     assert len(_MODULE_CROSS_ATTENTION_CONFIGS) == 25
-    assert len(_MODULE_CASE_MATRIX) == 37 * 25
-    assert len({case.pytest_id for case in _MODULE_CASE_MATRIX}) == len(
-        _MODULE_CASE_MATRIX
-    )
+    assert len(
+        {_implementation_id(config) for config in _MODULE_SELF_ATTENTION_CONFIGS}
+    ) == len(_MODULE_SELF_ATTENTION_CONFIGS)
+    assert len(
+        {_implementation_id(config) for config in _MODULE_CROSS_ATTENTION_CONFIGS}
+    ) == len(_MODULE_CROSS_ATTENTION_CONFIGS)
 
 
 def test_optimized_backend_preserves_checkpoint_keys() -> None:
