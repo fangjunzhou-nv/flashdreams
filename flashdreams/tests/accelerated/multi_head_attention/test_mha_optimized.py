@@ -363,12 +363,7 @@ def _check_cross_attention(
         device=device,
         dtype=torch.bfloat16,
     )
-    query_length = (
-        context.shape[-2]
-        if attention_config.rope_config is not None
-        and attention_config.rope_config.scope is RoPEScope.AFTER_KV_CACHE
-        else 8
-    )
+    query_length = 8
     query = torch.randn(
         1,
         query_length,
@@ -377,8 +372,15 @@ def _check_cross_attention(
         device=device,
         dtype=torch.bfloat16,
     )
+    assert query.shape[-2] != context.shape[-2]
     context_rope = _rope_freqs(24, attention_config, generator, device)
-    query_rope = _rope_freqs(query_length, attention_config, generator, device)
+    query_rope_length = (
+        max(query_length, context.shape[-2])
+        if attention_config.rope_config is not None
+        and attention_config.rope_config.scope is RoPEScope.AFTER_KV_CACHE
+        else query_length
+    )
+    query_rope = _rope_freqs(query_rope_length, attention_config, generator, device)
     reference_cache = reference.compute_kv(context, context_rope)
     actual_cache = actual.compute_kv(context, context_rope)
     expected_cache_dtype = (
@@ -394,6 +396,50 @@ def _check_cross_attention(
 
     _assert_close(output, expected, tolerance)
     _assert_cache_close(actual_cache, reference_cache, tolerance)
+
+
+@pytest.mark.parametrize(
+    "projection_biases",
+    [
+        pytest.param((True, False, False), id="query-only"),
+        pytest.param((False, True, False), id="key-only"),
+        pytest.param((False, False, True), id="value-only"),
+        pytest.param((True, True, False), id="query-key"),
+        pytest.param((True, False, True), id="query-value"),
+        pytest.param((False, True, True), id="key-value"),
+    ],
+)
+@pytest.mark.parametrize(
+    "qkv_fusion_option", tuple(QKVFusionOption), ids=lambda value: value.value
+)
+def test_refresh_derived_weights_rejects_mixed_projection_biases(
+    projection_biases: tuple[bool, bool, bool],
+    qkv_fusion_option: QKVFusionOption,
+) -> None:
+    """Reject mixed Q/K/V bias policies for every projection-fusion mode."""
+    attention = _OptimizedMHA(
+        AttentionType.SELF_ATTENTION,
+        AttentionConfig(
+            query_dim=_QUERY_DIM,
+            n_heads=_N_HEADS,
+            head_dim=_HEAD_DIM,
+        ),
+        OptimizedImplConfig(qkv_fusion_option=qkv_fusion_option),
+    )
+    projections = (
+        attention.query_projection,
+        attention.key_projection,
+        attention.value_projection,
+    )
+    for projection, has_bias in zip(projections, projection_biases, strict=True):
+        if not has_bias:
+            projection.bias = None
+
+    with pytest.raises(
+        ValueError,
+        match="must either all have biases or all omit biases",
+    ):
+        attention._refresh_derived_weights()
 
 
 @pytest.mark.parametrize(

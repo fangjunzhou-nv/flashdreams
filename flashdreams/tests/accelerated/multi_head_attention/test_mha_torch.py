@@ -68,14 +68,19 @@ class _IdentityMHA(TorchMultiHeadAttention):
         """Return identity key normalization."""
         return self.norm
 
-    def __init__(self, rope_style: RoPEStyle) -> None:
+    def __init__(
+        self,
+        rope_style: RoPEStyle,
+        attention_type: AttentionType = AttentionType.SELF_ATTENTION,
+    ) -> None:
         """Initialize identity attention with after-cache RoPE.
 
         Args:
             rope_style: Feature pairing convention under test.
+            attention_type: Relationship between query and context tokens.
         """
         super().__init__(
-            AttentionType.SELF_ATTENTION,
+            attention_type,
             AttentionConfig(
                 query_dim=4,
                 n_heads=1,
@@ -170,3 +175,38 @@ def test_after_kv_cache_rope_matches_visible_cache_positions(
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(cache.cached_k(), value)
         cache.after_update(chunk_idx)
+
+
+@pytest.mark.parametrize("rope_style", tuple(RoPEStyle), ids=lambda value: value.value)
+@torch.inference_mode()
+def test_cross_attention_after_cache_rope_allows_unequal_lengths(
+    rope_style: RoPEStyle,
+) -> None:
+    """Slice query and key rotations independently when cross lengths differ.
+
+    Args:
+        rope_style: Feature pairing convention under test.
+    """
+    attention = _IdentityMHA(rope_style, AttentionType.CROSS_ATTENTION)
+    query = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [2.0, -1.0, 0.5, 3.0], [0.5, 1.5, -2.0, 1.0]]]
+    )
+    context = torch.tensor([[[3.0, 0.5, 2.0, -1.0], [-1.0, 2.5, 1.0, 0.5]]])
+    rope_freqs = torch.linspace(0.1, 1.2, steps=12).reshape(3, 1, 1, 4)
+
+    cache = attention.compute_kv(context)
+    actual = attention(query, cache, rope_freqs)
+
+    rotated_query = _apply_rope(query.reshape(1, 3, 1, 4), rope_freqs[:3], rope_style)
+    rotated_key = _apply_rope(context.reshape(1, 2, 1, 4), rope_freqs[:2], rope_style)
+    expected = (
+        F.scaled_dot_product_attention(
+            rotated_query.transpose(1, 2),
+            rotated_key.transpose(1, 2),
+            context.reshape(1, 2, 1, 4).transpose(1, 2),
+        )
+        .transpose(1, 2)
+        .flatten(-2)
+    )
+
+    torch.testing.assert_close(actual, expected)

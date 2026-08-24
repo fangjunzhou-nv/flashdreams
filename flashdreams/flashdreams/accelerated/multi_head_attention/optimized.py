@@ -300,7 +300,11 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
 
     @torch.no_grad()
     def _refresh_derived_weights(self, *args: object) -> None:
-        """Rebuild fused projection modules from checkpoint parameters."""
+        """Rebuild fused projection modules from checkpoint parameters.
+
+        Raises:
+            ValueError: Query, key, and value projections mix bias policies.
+        """
         del args
         self.fused_qkv = None
         self.fused_kv = None
@@ -309,6 +313,18 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         self.quantized_value_projection = None
 
         projection_dtype = self.optimized_impl_config.quantization.projection
+        projection_biases = (
+            self.query_projection.bias,
+            self.key_projection.bias,
+            self.value_projection.bias,
+        )
+        present_biases = tuple(bias for bias in projection_biases if bias is not None)
+        if present_biases and len(present_biases) != len(projection_biases):
+            raise ValueError(
+                "query, key, and value projections must either all have biases "
+                "or all omit biases"
+            )
+
         if projection_dtype is not None:
             self.quantized_query_projection = self._new_quantized_projection(
                 self.query_projection.weight,
@@ -340,20 +356,9 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 .detach()
                 .contiguous()
             )
-            fused_bias = None
-            if self.query_projection.bias is not None:
-                assert (
-                    self.key_projection.bias is not None
-                    and self.value_projection.bias is not None
-                )
-                fused_bias = torch.cat(
-                    (
-                        self.query_projection.bias,
-                        self.key_projection.bias,
-                        self.value_projection.bias,
-                    ),
-                    dim=0,
-                ).detach()
+            fused_bias = (
+                torch.cat(present_biases, dim=0).detach() if present_biases else None
+            )
             fused_kv_weight = fused_weight[self.attention_config.inner_dim :]
             fused_kv_bias = (
                 None
@@ -378,12 +383,11 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
                 .detach()
                 .contiguous()
             )
-            fused_bias = None
-            if self.key_projection.bias is not None:
-                assert self.value_projection.bias is not None
-                fused_bias = torch.cat(
-                    (self.key_projection.bias, self.value_projection.bias), dim=0
-                ).detach()
+            fused_bias = (
+                torch.cat(present_biases[1:], dim=0).detach()
+                if present_biases
+                else None
+            )
             if projection_dtype is None:
                 self.fused_kv = NonPersistentLinear(fused_weight, fused_bias)
             else:
@@ -516,13 +520,16 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             kv_cache: Prepared rolling cache for self-attention or precomputed
                 static cache for cross-attention.
             rope_freqs: Optional positional data. Before-cache RoPE expects the
-                current chunk. After-cache RoPE expects positions relative to
-                the visible cache. Ignored when ``rope_config`` is ``None``.
+                current chunk. After-cache RoPE expects positions covering the
+                query and visible cache. Ignored when ``rope_config`` is
+                ``None``.
 
         Returns:
             Output-projected tokens with the same shape and dtype as ``x``.
         """
-        query_rope_freqs, key_rope_freqs = self._slice_rope_freqs(rope_freqs, kv_cache)
+        query_rope_freqs, key_rope_freqs = self._slice_rope_freqs(
+            rope_freqs, kv_cache, x.shape[-2]
+        )
         if self.attention_type is AttentionType.SELF_ATTENTION:
             query = self._update_kv_and_compute_query(x, kv_cache, query_rope_freqs)
         else:
@@ -568,12 +575,14 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         self,
         rope_freqs: Tensor | None,
         kv_cache: BlockKVCache,
+        query_length: int,
     ) -> tuple[Tensor | None, Tensor | None]:
         """Select query and key rotations for the configured cache scope.
 
         Args:
-            rope_freqs: Current-chunk or cache-relative rotation angles.
+            rope_freqs: Current-chunk or query/cache-relative rotation angles.
             kv_cache: Cache whose visible and current write ranges select angles.
+            query_length: Number of query tokens.
 
         Returns:
             Query and visible-key rotation slices, or two ``None`` values when
@@ -584,9 +593,12 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         if self.attention_config.rope_config.scope is RoPEScope.BEFORE_KV_CACHE:
             return rope_freqs, rope_freqs
 
+        key_rope_freqs = rope_freqs[: kv_cache.size]
+        if self.attention_type is AttentionType.CROSS_ATTENTION:
+            return rope_freqs[:query_length], key_rope_freqs
         write_end = kv_cache.write_end
-        write_start = write_end - kv_cache.chunk_size
-        return rope_freqs[write_start:write_end], rope_freqs[: kv_cache.size]
+        write_start = write_end - query_length
+        return rope_freqs[write_start:write_end], key_rope_freqs
 
     def _compute_query(
         self,

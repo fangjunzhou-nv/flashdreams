@@ -188,13 +188,16 @@ class TorchMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             kv_cache: Prepared rolling cache for self-attention or precomputed
                 static cache for cross-attention.
             rope_freqs: Optional positional data. Before-cache RoPE expects the
-                current chunk. After-cache RoPE expects positions relative to
-                the visible cache. Ignored when ``rope_config`` is ``None``.
+                current chunk. After-cache RoPE expects positions covering the
+                query and visible cache. Ignored when ``rope_config`` is
+                ``None``.
 
         Returns:
             Output-projected tokens with the same shape as ``x``.
         """
-        query_rope_freqs, key_rope_freqs = self._slice_rope_freqs(rope_freqs, kv_cache)
+        query_rope_freqs, key_rope_freqs = self._slice_rope_freqs(
+            rope_freqs, kv_cache, x.shape[-2]
+        )
         if self.attention_type is AttentionType.SELF_ATTENTION:
             kv_cache = self._update_kv(x, kv_cache, key_rope_freqs)
         return self._query_kv(x, kv_cache, query_rope_freqs, key_rope_freqs)
@@ -203,12 +206,14 @@ class TorchMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         self,
         rope_freqs: Tensor | None,
         kv_cache: BlockKVCache,
+        query_length: int,
     ) -> tuple[Tensor | None, Tensor | None]:
         """Select query and key rotations for the configured cache scope.
 
         Args:
-            rope_freqs: Current-chunk or cache-relative rotation angles.
+            rope_freqs: Current-chunk or query/cache-relative rotation angles.
             kv_cache: Cache whose visible and current write ranges select angles.
+            query_length: Number of query tokens.
 
         Returns:
             Query and visible-key rotation slices, or two ``None`` values when
@@ -219,9 +224,12 @@ class TorchMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         if self.attention_config.rope_config.scope is RoPEScope.BEFORE_KV_CACHE:
             return rope_freqs, rope_freqs
 
+        key_rope_freqs = rope_freqs[: kv_cache.size]
+        if self.attention_type is AttentionType.CROSS_ATTENTION:
+            return rope_freqs[:query_length], key_rope_freqs
         write_end = kv_cache.write_end
-        write_start = write_end - kv_cache.chunk_size
-        return rope_freqs[write_start:write_end], rope_freqs[: kv_cache.size]
+        write_start = write_end - query_length
+        return rope_freqs[write_start:write_end], key_rope_freqs
 
     def _update_kv(
         self,
