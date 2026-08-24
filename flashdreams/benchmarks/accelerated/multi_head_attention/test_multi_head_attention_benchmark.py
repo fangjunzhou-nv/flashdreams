@@ -149,36 +149,36 @@ _CROSS_ATTENTION_CONFIGS = tuple(
 
 
 class _TorchMultiHeadAttention(TorchMultiHeadAttention):
-    """Canonical Torch attention implementation used by benchmarks."""
+    """PyTorch reference attention implementation used by benchmarks."""
 
     @property
     def query_projection(self) -> torch.nn.Linear:
-        """Return the canonical query projection."""
+        """Return the reference query projection."""
         return self.q_proj
 
     @property
     def key_projection(self) -> torch.nn.Linear:
-        """Return the canonical key projection."""
+        """Return the reference key projection."""
         return self.k_proj
 
     @property
     def value_projection(self) -> torch.nn.Linear:
-        """Return the canonical value projection."""
+        """Return the reference value projection."""
         return self.v_proj
 
     @property
     def output_projection(self) -> torch.nn.Linear:
-        """Return the canonical output projection."""
+        """Return the reference output projection."""
         return self.output_proj
 
     @property
     def query_norm(self) -> torch.nn.Module:
-        """Return the canonical query normalization."""
+        """Return the reference query normalization."""
         return self.q_norm
 
     @property
     def key_norm(self) -> torch.nn.Module:
-        """Return the canonical key normalization."""
+        """Return the reference key normalization."""
         return self.k_norm
 
     def __init__(
@@ -195,7 +195,7 @@ class _TorchMultiHeadAttention(TorchMultiHeadAttention):
         rope_scope: RoPEScope = RoPEScope.BEFORE_KV_CACHE,
         rope_interleaved: bool = False,
     ) -> None:
-        """Initialize canonical projections and normalization modules."""
+        """Initialize reference projections and normalization modules."""
         super().__init__(
             attention_type=attention_type,
             attention_config=AttentionConfig(
@@ -251,36 +251,36 @@ class _TorchMultiHeadAttention(TorchMultiHeadAttention):
 
 
 class _OptimizedHultiHeadAttention(OptimizedHultiHeadAttention):
-    """Canonical Optimized attention implementation used by benchmarks."""
+    """Optimized attention implementation used by benchmarks."""
 
     @property
     def query_projection(self) -> torch.nn.Linear:
-        """Return the canonical query projection."""
+        """Return the optimized query projection."""
         return self.q_proj
 
     @property
     def key_projection(self) -> torch.nn.Linear:
-        """Return the canonical key projection."""
+        """Return the optimized key projection."""
         return self.k_proj
 
     @property
     def value_projection(self) -> torch.nn.Linear:
-        """Return the canonical value projection."""
+        """Return the optimized value projection."""
         return self.v_proj
 
     @property
     def output_projection(self) -> torch.nn.Linear:
-        """Return the canonical output projection."""
+        """Return the optimized output projection."""
         return self.output_proj
 
     @property
     def query_norm(self) -> torch.nn.Module:
-        """Return the canonical query normalization."""
+        """Return the optimized query normalization."""
         return self.q_norm
 
     @property
     def key_norm(self) -> torch.nn.Module:
-        """Return the canonical key normalization."""
+        """Return the optimized key normalization."""
         return self.k_norm
 
     def __init__(
@@ -298,7 +298,7 @@ class _OptimizedHultiHeadAttention(OptimizedHultiHeadAttention):
         rope_scope: RoPEScope = RoPEScope.BEFORE_KV_CACHE,
         rope_interleaved: bool = False,
     ) -> None:
-        """Initialize canonical projections and normalization modules."""
+        """Initialize optimized projections and normalization modules."""
         super().__init__(
             attention_type=attention_type,
             attention_config=AttentionConfig(
