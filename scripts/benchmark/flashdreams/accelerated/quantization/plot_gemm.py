@@ -57,7 +57,7 @@ _SCOPE_LABELS = {
     "gemm-only": "GEMM only",
 }
 
-RowKey = tuple[str, str]
+RowKey = tuple[str, str, str]
 CellKey = tuple[RowKey, str]
 
 
@@ -111,13 +111,13 @@ def _load_matrix(
         )
         if match is None:
             continue
-        original_format, timing_scope = match.groups()
-        prefix = f"{original_format}-"
-        if not param.startswith(prefix):
+        effective_format, timing_scope = match.groups()
+        parameter_match = re.fullmatch(r"(fp16|bf16|fp32)-(.+)", param)
+        if parameter_match is None:
             raise SystemExit(f"Unsupported quantized GEMM parameter {param!r}")
-        configuration = param.removeprefix(prefix)
+        source_format, configuration = parameter_match.groups()
 
-        row = (timing_scope, original_format)
+        row = (timing_scope, effective_format, source_format)
         cell = (row, configuration)
         if cell in values_ms:
             raise SystemExit(f"Duplicate benchmark cell for {row} and {configuration}")
@@ -132,6 +132,13 @@ def _load_matrix(
             f"Benchmark JSON {input_path} contains no quantized GEMM results"
         )
 
+    for row in rows:
+        timing_scope, effective_format, _ = row
+        reference_row = (timing_scope, effective_format, effective_format)
+        reference = values_ms.get((reference_row, _REFERENCE_CONFIG))
+        if reference is not None:
+            values_ms.setdefault((row, _REFERENCE_CONFIG), reference)
+
     return rows, columns, values_ms, benchmark_subtitle(payload)
 
 
@@ -140,6 +147,16 @@ def _config_label(configuration: str) -> str:
     if configuration == _FASTEST_CONFIG_COLUMN:
         return "Fastest quantized\nconfig"
     return _CONFIG_LABELS.get(configuration, configuration.replace("-", " "))
+
+
+def _row_label(row: RowKey) -> str:
+    """Return an effective-dtype label with source dtype when it differs."""
+    _, effective_format, source_format = row
+    effective = _FORMAT_LABELS.get(effective_format, effective_format)
+    if source_format == effective_format:
+        return effective
+    source = _FORMAT_LABELS.get(source_format, source_format)
+    return f"{effective} effective\n{source} source"
 
 
 def _write_png(
@@ -155,7 +172,7 @@ def _write_png(
     Args:
         output_path: Destination PNG file.
         timing_scope: Timed region represented by every row.
-        rows: Ordered source-format rows.
+        rows: Ordered effective- and source-format rows.
         columns: Ordered GEMM configuration columns.
         values_ms: Median milliseconds keyed by row and configuration.
         subtitle: Benchmark environment summary.
@@ -186,12 +203,9 @@ def _write_png(
         rotation_mode="anchor",
     )
     axes.axvline(len(columns) - 0.5, color="black", linewidth=1.5)
-    axes.set_yticks(
-        range(len(rows)),
-        labels=[_FORMAT_LABELS.get(row[1], row[1]) for row in rows],
-    )
+    axes.set_yticks(range(len(rows)), labels=[_row_label(row) for row in rows])
     axes.set_xlabel("GEMM configuration")
-    axes.set_ylabel("Source dtype")
+    axes.set_ylabel("Effective / source dtype")
     axes.set_title(f"Quantized GEMM {_SCOPE_LABELS[timing_scope]}\n{subtitle}")
 
     for row_index, row in enumerate(rows):

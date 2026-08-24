@@ -61,9 +61,10 @@ _INPUT_STATE_OUTPUT_NAMES = {
     "full-precision-x": "quantize_input",
     "prequantized-x": "prequantized_input",
 }
-_SOURCE_FORMAT_LABELS = {"fp16": "FP16", "bf16": "BF16", "fp32": "FP32"}
+_FORMAT_LABELS = {"fp16": "FP16", "bf16": "BF16", "fp32": "FP32"}
 
-CellKey = tuple[str, str]
+RowKey = tuple[str, str]
+CellKey = tuple[RowKey, str]
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -105,15 +106,15 @@ def _parse_configuration(configuration: str) -> re.Match[str]:
 
 def _load_matrix(
     input_path: Path,
-) -> tuple[list[str], list[str], dict[CellKey, float], str]:
+) -> tuple[list[RowKey], list[str], dict[CellKey, float], str]:
     """Load quantized linear rows and median timings from benchmark JSON.
 
     Args:
         input_path: Pytest-benchmark JSON file to parse.
 
     Returns:
-        Ordered source-format rows, configuration columns, median milliseconds
-        by cell, and plot subtitle.
+        Ordered effective- and source-format rows, configuration columns,
+        median milliseconds by cell, and plot subtitle.
 
     Raises:
         SystemExit: The input cannot be read or does not contain compatible
@@ -121,7 +122,7 @@ def _load_matrix(
     """
     payload, benchmark_records = load_benchmark_json(input_path)
 
-    rows: list[str] = []
+    rows: list[RowKey] = []
     columns: list[str] = []
     values_ms: dict[CellKey, float] = {}
 
@@ -135,21 +136,20 @@ def _load_matrix(
         match = re.fullmatch(r"quantized-linear-(fp16|bf16|fp32)", group)
         if match is None:
             continue
-        source_format = match.group(1)
-        prefix = f"{source_format}-"
-        if not param.startswith(prefix):
+        effective_format = match.group(1)
+        parameter_match = re.fullmatch(r"(fp16|bf16|fp32)-(.+)", param)
+        if parameter_match is None:
             raise SystemExit(f"Unsupported quantized linear parameter {param!r}")
-        configuration = param.removeprefix(prefix)
+        source_format, configuration = parameter_match.groups()
         if configuration != _REFERENCE_CONFIG:
             _parse_configuration(configuration)
 
-        cell = (source_format, configuration)
+        row = (effective_format, source_format)
+        cell = (row, configuration)
         if cell in values_ms:
-            raise SystemExit(
-                f"Duplicate benchmark cell for {source_format} and {configuration}"
-            )
-        if source_format not in rows:
-            rows.append(source_format)
+            raise SystemExit(f"Duplicate benchmark cell for {row} and {configuration}")
+        if row not in rows:
+            rows.append(row)
         if configuration not in columns:
             columns.append(configuration)
         values_ms[cell] = benchmark_median_ms(record)
@@ -158,6 +158,13 @@ def _load_matrix(
         raise SystemExit(
             f"Benchmark JSON {input_path} contains no quantized linear results"
         )
+
+    for row in rows:
+        effective_format, _ = row
+        reference_row = (effective_format, effective_format)
+        reference = values_ms.get((reference_row, _REFERENCE_CONFIG))
+        if reference is not None:
+            values_ms.setdefault((row, _REFERENCE_CONFIG), reference)
 
     return rows, columns, values_ms, benchmark_subtitle(payload)
 
@@ -178,10 +185,20 @@ def _config_label(configuration: str) -> str:
     return f"{quantized_format}\n{weight}\ninput {match.group('input')}"
 
 
+def _row_label(row: RowKey) -> str:
+    """Return an effective-dtype label with source dtype when it differs."""
+    effective_format, source_format = row
+    effective = _FORMAT_LABELS.get(effective_format, effective_format)
+    if source_format == effective_format:
+        return effective
+    source = _FORMAT_LABELS.get(source_format, source_format)
+    return f"{effective} effective\n{source} source"
+
+
 def _write_png(
     output_path: Path,
     input_state: str,
-    rows: list[str],
+    rows: list[RowKey],
     columns: list[str],
     values_ms: dict[CellKey, float],
     subtitle: str,
@@ -191,7 +208,7 @@ def _write_png(
     Args:
         output_path: Destination PNG file.
         input_state: Whether input quantization occurs inside the timed region.
-        rows: Ordered source-format rows.
+        rows: Ordered effective- and source-format rows.
         columns: Ordered linear configuration columns.
         values_ms: Median milliseconds keyed by row and configuration.
         subtitle: Benchmark environment summary.
@@ -226,12 +243,9 @@ def _write_png(
         rotation_mode="anchor",
     )
     axes.axvline(len(columns) - 0.5, color="black", linewidth=1.5)
-    axes.set_yticks(
-        range(len(rows)),
-        labels=[_SOURCE_FORMAT_LABELS.get(row, row) for row in rows],
-    )
+    axes.set_yticks(range(len(rows)), labels=[_row_label(row) for row in rows])
     axes.set_xlabel("Linear configuration")
-    axes.set_ylabel("Source dtype")
+    axes.set_ylabel("Effective / source dtype")
     axes.set_title(f"Quantized linear · {_INPUT_STATE_LABELS[input_state]}\n{subtitle}")
 
     for row_index, row in enumerate(rows):

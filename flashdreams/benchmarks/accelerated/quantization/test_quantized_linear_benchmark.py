@@ -19,6 +19,9 @@
 while ``prequantized-x`` rows prepare activations and scales before timing.
 Weight quantization always happens during module construction.
 
+Rows are grouped by the linear GEMM's effective output dtype. Rowwise FP8
+scaling emits BF16 and casts afterward when another output dtype is requested.
+
 Run the manual GPU benchmarks with::
 
     uv run --package flashdreams --group test pytest \
@@ -62,12 +65,18 @@ _WARMUP_ROUNDS = 5
 _BENCHMARK_ROUNDS = 50
 """Measured calls used for each linear comparison."""
 
+_DTYPE_FORMATS = {
+    torch.float16: "fp16",
+    torch.bfloat16: "bf16",
+    torch.float32: "fp32",
+}
+
 _ORIGINAL_DTYPES = (
     pytest.param(torch.float16, "fp16", id="fp16"),
     pytest.param(torch.bfloat16, "bf16", id="bf16"),
     pytest.param(torch.float32, "fp32", id="fp32"),
 )
-"""Original activation and output formats, each in a separate benchmark group."""
+"""Source activation and output formats used by every benchmark case."""
 
 _LINEAR_CASES = (
     pytest.param(None, None, None, None, id="nn-linear"),
@@ -92,6 +101,25 @@ _LINEAR_CASES = (
     ),
 )
 """Regular linear baseline and every quantized linear inference configuration."""
+
+
+def _effective_gemm_dtype(
+    original_dtype: torch.dtype,
+    quantized_dtype: torch.dtype | None,
+    weight_granularity: WeightGranularity | None,
+    input_granularity: Granularity | None,
+) -> torch.dtype:
+    """Return the dtype produced by GEMM before any output-only cast."""
+    if (
+        quantized_dtype is not None
+        and quantized_dtype is not torch.int8
+        and (
+            weight_granularity is WeightGranularity.PER_OUT_CHANNEL
+            or input_granularity is Granularity.SLICE
+        )
+    ):
+        return torch.bfloat16
+    return original_dtype
 
 
 @pytest.mark.parametrize(
@@ -177,7 +205,14 @@ def test_quantized_linear_benchmark(
                     out_dtype=original_dtype,
                 )
 
-    benchmark.group = f"quantized-linear-{original_format}"
+    effective_dtype = _effective_gemm_dtype(
+        original_dtype,
+        quantized_dtype,
+        weight_granularity,
+        input_granularity,
+    )
+    effective_format = _DTYPE_FORMATS[effective_dtype]
+    benchmark.group = f"quantized-linear-{effective_format}"
     activation_dtype = original_dtype if quantized_dtype is None else quantized_dtype
     weight_dtype = (
         original_dtype
@@ -201,6 +236,9 @@ def test_quantized_linear_benchmark(
             "implementation": implementation,
             "input_preparation": input_preparation,
             "source_dtype": str(original_dtype),
+            "source_format": original_format,
+            "effective_dtype": str(effective_dtype),
+            "effective_format": effective_format,
             "activation_dtype": str(activation_dtype),
             "weight_dtype": str(weight_dtype),
             "output_dtype": str(original_dtype),

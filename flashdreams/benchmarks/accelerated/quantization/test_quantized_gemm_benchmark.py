@@ -21,6 +21,10 @@ INT8 dequantization. FP8 scale application remains fused into ``torch._scaled_mm
 CUDA does not support E5M2 by E5M2 GEMM, so E5M2 rows use E5M2 for the left
 operand and E4M3 for the right operand.
 
+Rows are grouped by the GEMM's effective output dtype rather than the source or
+returned dtype. In particular, sliced FP8 GEMM with FP32 source emits BF16 and
+casts the result back to FP32 only for the end-to-end case.
+
 Run the manual GPU benchmarks with::
 
     uv run --package flashdreams --group test pytest \
@@ -62,12 +66,18 @@ _WARMUP_ROUNDS = 5
 _BENCHMARK_ROUNDS = 50
 """Measured calls used for each GEMM comparison."""
 
+_DTYPE_FORMATS = {
+    torch.float16: "fp16",
+    torch.bfloat16: "bf16",
+    torch.float32: "fp32",
+}
+
 _ORIGINAL_DTYPES = (
     pytest.param(torch.float16, "fp16", id="fp16"),
     pytest.param(torch.bfloat16, "bf16", id="bf16"),
     pytest.param(torch.float32, "fp32", id="fp32"),
 )
-"""Original matrix formats, each mapped to a separate benchmark group."""
+"""Source matrix formats used to construct every benchmark case."""
 
 _GEMM_CASES = (
     pytest.param(None, None, id="full-precision"),
@@ -86,6 +96,22 @@ _GEMM_CASES = (
     ),
 )
 """Full-precision baseline and every supported quantized GEMM configuration."""
+
+
+def _effective_gemm_dtype(
+    original_dtype: torch.dtype,
+    quantized_dtype: torch.dtype | None,
+    granularity: Granularity | None,
+) -> torch.dtype:
+    """Return the dtype produced by GEMM before any output-only cast."""
+    if (
+        original_dtype is torch.float32
+        and quantized_dtype is not None
+        and quantized_dtype is not torch.int8
+        and granularity is Granularity.SLICE
+    ):
+        return torch.bfloat16
+    return original_dtype
 
 
 def _quantized_gemm(
@@ -129,10 +155,8 @@ def _quantized_gemm(
     right_dtype = (
         torch.float8_e4m3fn if quantized_dtype is torch.float8_e5m2 else quantized_dtype
     )
-    scaled_output_dtype = (
-        torch.bfloat16
-        if granularity is Granularity.SLICE and output_dtype is torch.float32
-        else output_dtype
+    scaled_output_dtype = _effective_gemm_dtype(
+        output_dtype, quantized_dtype, granularity
     )
 
     def quantize_operands() -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -203,7 +227,11 @@ def _benchmark_quantized_gemm(
         )
 
     timing_scope = "end-to-end" if end_to_end else "gemm-only"
-    benchmark.group = f"quantized-gemm-{original_format}-{timing_scope}"
+    effective_dtype = _effective_gemm_dtype(
+        original_dtype, quantized_dtype, granularity
+    )
+    effective_format = _DTYPE_FORMATS[effective_dtype]
+    benchmark.group = f"quantized-gemm-{effective_format}-{timing_scope}"
     left_dtype = original_dtype if quantized_dtype is None else quantized_dtype
     right_dtype = (
         original_dtype
@@ -224,6 +252,9 @@ def _benchmark_quantized_gemm(
             "implementation": implementation,
             "timing_scope": timing_scope,
             "source_dtype": str(original_dtype),
+            "source_format": original_format,
+            "effective_dtype": str(effective_dtype),
+            "effective_format": effective_format,
             "left_dtype": str(left_dtype),
             "right_dtype": str(right_dtype),
             "output_dtype": str(output_dtype),
