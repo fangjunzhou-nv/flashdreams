@@ -29,7 +29,7 @@ from flashdreams.accelerated.multi_head_attention import (
     optimized as optimized_attention,
 )
 from flashdreams.accelerated.multi_head_attention.optimized import (
-    OptimizedHultiHeadAttention,
+    OptimizedMultiHeadAttention,
     OptimizedImplConfig,
     QKVFusionOption,
     QuantizationOption,
@@ -222,7 +222,7 @@ def test_network_config_selects_optimized_attention(
     assert network.self_attn_optimized_impl_config is optimized_impl_config
     assert block.self_attn_optimized_impl_config is optimized_impl_config
     self_attention = block.self_attn
-    assert isinstance(self_attention, OptimizedHultiHeadAttention)
+    assert isinstance(self_attention, OptimizedMultiHeadAttention)
     assert self_attention.attention_type is AttentionType.SELF_ATTENTION
     assert self_attention.optimized_impl_config is optimized_impl_config
     assert self_attention.qkv_fusion_option is QKVFusionOption.FULL
@@ -287,9 +287,9 @@ def test_network_config_selects_optimized_attention_policies() -> None:
     self_attention = block.self_attn
     cross_attention = block.cross_attn
     cross_view_attention = block.cross_view_attn
-    assert isinstance(self_attention, OptimizedHultiHeadAttention)
-    assert isinstance(cross_attention, OptimizedHultiHeadAttention)
-    assert isinstance(cross_view_attention, OptimizedHultiHeadAttention)
+    assert isinstance(self_attention, OptimizedMultiHeadAttention)
+    assert isinstance(cross_attention, OptimizedMultiHeadAttention)
+    assert isinstance(cross_view_attention, OptimizedMultiHeadAttention)
 
     assert network.self_attn_optimized_impl_config is self_optimized_impl_config
     assert network.cross_attn_optimized_impl_config is cross_optimized_impl_config
@@ -519,15 +519,15 @@ def test_optimized_cross_attention_dispatches_tma(
     )
     assert optimized_cross_attention.attention_type is AttentionType.CROSS_ATTENTION
     assert (
-        type(optimized_cross_attention).forward is OptimizedHultiHeadAttention.forward
+        type(optimized_cross_attention).forward is OptimizedMultiHeadAttention.forward
     )
     assert (
         type(optimized_cross_attention).compute_kv
-        is OptimizedHultiHeadAttention.compute_kv
+        is OptimizedMultiHeadAttention.compute_kv
     )
     assert (
         type(optimized_cross_attention)._attention
-        is OptimizedHultiHeadAttention._attention
+        is OptimizedMultiHeadAttention._attention
     )
 
     calls: list[tuple[torch.Size, torch.Size, torch.Size]] = []

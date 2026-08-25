@@ -45,7 +45,7 @@ from flashdreams.accelerated.multi_head_attention import (
     RoPEStyle,
 )
 from flashdreams.accelerated.multi_head_attention.optimized import (
-    OptimizedHultiHeadAttention,
+    OptimizedMultiHeadAttention,
     OptimizedImplConfig,
     QKVFusionOption,
     QuantizationOption,
@@ -279,7 +279,7 @@ class _TorchMultiHeadAttention(TorchMultiHeadAttention):
             )
 
 
-class _OptimizedHultiHeadAttention(OptimizedHultiHeadAttention):
+class _OptimizedMultiHeadAttention(OptimizedMultiHeadAttention):
     """Optimized attention implementation used by benchmarks."""
 
     effective_use_tma: bool | None
@@ -405,7 +405,7 @@ class _OptimizedHultiHeadAttention(OptimizedHultiHeadAttention):
         return super()._attention(query, key, value, output_dtype=output_dtype)
 
 
-_Attention = _TorchMultiHeadAttention | _OptimizedHultiHeadAttention
+_Attention = _TorchMultiHeadAttention | _OptimizedMultiHeadAttention
 
 _BATCH_SIZE = 1
 _DTYPE = torch.bfloat16
@@ -468,7 +468,7 @@ def _make_attention(
     if optimized_impl_config is None:
         return reference
 
-    optimized_attention = _OptimizedHultiHeadAttention(
+    optimized_attention = _OptimizedMultiHeadAttention(
         query_dim=_QUERY_DIM,
         context_dim=_QUERY_DIM,
         n_heads=_N_HEADS,
@@ -720,7 +720,7 @@ def _benchmark_multi_head_attention(
             warmup_rounds=_WARMUP_ROUNDS,
         )
 
-    if isinstance(attention, _OptimizedHultiHeadAttention):
+    if isinstance(attention, _OptimizedMultiHeadAttention):
         assert attention.effective_use_tma is not None
         effective_use_tma = attention.effective_use_tma
     else:

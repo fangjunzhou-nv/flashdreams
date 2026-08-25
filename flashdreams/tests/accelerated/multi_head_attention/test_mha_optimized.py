@@ -31,7 +31,7 @@ from flashdreams.accelerated.multi_head_attention import (
 )
 from flashdreams.accelerated.multi_head_attention.cudnn import native_cudnn_fp8_sdpa
 from flashdreams.accelerated.multi_head_attention.optimized import (
-    OptimizedHultiHeadAttention,
+    OptimizedMultiHeadAttention,
     OptimizedImplConfig,
     QKVFusionOption,
     QuantizationOption,
@@ -184,7 +184,7 @@ class _TorchMHA(_AttentionModules, TorchMultiHeadAttention):
         self._initialize_modules()
 
 
-class _OptimizedMHA(_AttentionModules, OptimizedHultiHeadAttention):
+class _OptimizedMHA(_AttentionModules, OptimizedMultiHeadAttention):
     """Checkpoint-compatible Optimized attention under test."""
 
     def __init__(

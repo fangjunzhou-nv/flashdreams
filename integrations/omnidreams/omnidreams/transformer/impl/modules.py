@@ -35,7 +35,7 @@ from flashdreams.accelerated.multi_head_attention import (
     RoPEStyle,
 )
 from flashdreams.accelerated.multi_head_attention.optimized import (
-    OptimizedHultiHeadAttention,
+    OptimizedMultiHeadAttention,
     OptimizedImplConfig,
     QKVFusionOption,
     SDPABackend,
@@ -478,7 +478,7 @@ class CrossAttention(MultiHeadAttention):
         return super().forward(x, kv_cache, rope_freqs=None, update_kv_cache=False)
 
 
-class OptimizedCrossAttention(OptimizedHultiHeadAttention):
+class OptimizedCrossAttention(OptimizedMultiHeadAttention):
     """Static-context cross-attention backed by TMA FlashAttention2."""
 
     @property
@@ -600,7 +600,7 @@ class OptimizedCrossAttention(OptimizedHultiHeadAttention):
         return 1
 
 
-class OptimizedSelfAttention(OptimizedHultiHeadAttention):
+class OptimizedSelfAttention(OptimizedMultiHeadAttention):
     """Accelerated self-attention adapted to the Omnidreams contract."""
 
     @property

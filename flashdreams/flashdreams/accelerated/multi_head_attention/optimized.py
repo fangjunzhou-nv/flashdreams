@@ -148,7 +148,7 @@ class OptimizedImplConfig:
             raise TypeError(f"use_tma must be a bool; got {self.use_tma!r}")
 
 
-class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
+class OptimizedMultiHeadAttention(MultiHeadAttention[BlockKVCache]):
     """Provide inference-only streaming self- and static cross-attention.
 
     Shape comments use ``B`` for the product of all leading batch dimensions,
@@ -399,7 +399,7 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         self,
         fn: Callable[[Tensor], Tensor],
         recurse: bool = True,
-    ) -> OptimizedHultiHeadAttention:
+    ) -> OptimizedMultiHeadAttention:
         """Transform parameters and rebuild fused modules on their final device.
 
         Args:
@@ -770,7 +770,7 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             return
         if torch.cuda.get_device_capability(device_index)[0] < 9:
             raise RuntimeError(
-                "OptimizedHultiHeadAttention requires compute capability 9.0 or newer"
+                "OptimizedMultiHeadAttention requires compute capability 9.0 or newer"
             )
         self._validated_cuda_device_index = device_index
 
@@ -796,7 +796,7 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             )
         if not x.is_cuda or x.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
-                "OptimizedHultiHeadAttention requires CUDA FP16 or BF16 inputs"
+                "OptimizedMultiHeadAttention requires CUDA FP16 or BF16 inputs"
             )
         self._validate_cuda_device(x.device)
 
@@ -815,7 +815,7 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         """
         if kv_cache.seq_dim != 1 or kv_cache._k.ndim != 4:
             raise ValueError(
-                "OptimizedHultiHeadAttention requires a [B, S, H, D] cache with seq_dim=1"
+                "OptimizedMultiHeadAttention requires a [B, S, H, D] cache with seq_dim=1"
             )
         # Public leading dimensions such as batch and video view collapse into
         # one B axis before projection; cached K/V must use the same flattening.
@@ -872,7 +872,7 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
         # The accelerated path accepts native FP16/BF16 CUDA inputs.
         if not x.is_cuda or x.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
-                "OptimizedHultiHeadAttention requires CUDA FP16 or BF16 inputs"
+                "OptimizedMultiHeadAttention requires CUDA FP16 or BF16 inputs"
             )
         self._validate_cuda_device(x.device)
 
@@ -882,7 +882,7 @@ class OptimizedHultiHeadAttention(MultiHeadAttention[BlockKVCache]):
             raise RuntimeError("call kv_cache.before_update() before attention")
         if kv_cache.seq_dim != 1 or kv_cache._k.ndim != 4:
             raise ValueError(
-                "OptimizedHultiHeadAttention requires a [B, S, H, D] cache with seq_dim=1"
+                "OptimizedMultiHeadAttention requires a [B, S, H, D] cache with seq_dim=1"
             )
         if x.shape[-2] != kv_cache.chunk_size:
             raise ValueError(
@@ -1115,7 +1115,7 @@ __all__ = [
     "QuantizationOption",
     "SDPABackend",
     "OptimizedImplConfig",
-    "OptimizedHultiHeadAttention",
+    "OptimizedMultiHeadAttention",
     "flash_attention_2",
     "flash_attention_2_tma",
     "is_tma_flash_attention_supported",
