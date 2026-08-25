@@ -633,3 +633,31 @@ def test_native_cudnn_fp8_sdpa_returns_independent_outputs(
 
     assert first.data_ptr() != second.data_ptr()
     torch.testing.assert_close(first.float(), retained)
+
+
+@torch.inference_mode()
+def test_native_cudnn_fp8_sdpa_replays_inside_cuda_graph(
+    cuda_device: torch.device,
+) -> None:
+    """Replay cuDNN FP8 attention with ordered input and output operations."""
+    shape = (1, 1, 16, 16)
+    query = torch.zeros(shape, device=cuda_device, dtype=torch.float8_e4m3fn)
+    key = torch.zeros_like(query)
+    value = torch.empty_like(query)
+    source = torch.ones_like(query)
+    native_cudnn_fp8_sdpa(query, key, source)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+        value.copy_(source)
+        output = native_cudnn_fp8_sdpa(query, key, value).float()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.ones_like(output))
+
+    source.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.zeros_like(output))

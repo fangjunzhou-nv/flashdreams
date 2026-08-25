@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import weakref
 from collections.abc import Callable
 from functools import lru_cache
 
@@ -27,7 +28,7 @@ from torch import Tensor
 
 
 @lru_cache(maxsize=256)
-def _build_cudnn_fp8_sdpa(
+def _build_cudnn_fp8_sdpa_plan(
     device: torch.device,
     stream: int,
     query_shape: tuple[int, ...],
@@ -36,8 +37,12 @@ def _build_cudnn_fp8_sdpa(
     key_stride: tuple[int, ...],
     value_shape: tuple[int, ...],
     value_stride: tuple[int, ...],
-) -> Callable[[Tensor, Tensor, Tensor], Tensor]:
-    """Build one shape-, layout-, device-, and stream-specialized FP8 graph."""
+    capture_ready: bool,
+) -> tuple[
+    Callable[[Tensor, Tensor, Tensor], Tensor],
+    Callable[[Tensor, Tensor, Tensor], Tensor] | None,
+]:
+    """Build one shape-, layout-, device-, and stream-specialized FP8 plan."""
     try:
         cudnn = importlib.import_module("cudnn")
     except ModuleNotFoundError as error:
@@ -104,33 +109,159 @@ def _build_cudnn_fp8_sdpa(
     amax_o_desc.set_output(False).set_dim(list(amax_o.shape)).set_stride(
         list(amax_o.stride())
     )
+    if capture_ready:
+        graph.select_behavior_notes(
+            [cudnn.behavior_note.SUPPORTS_CUDA_GRAPH_NATIVE_API]
+        )
     graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     scale = torch.ones_like(amax_s)
     workspace = torch.empty(
         graph.get_workspace_size(), dtype=torch.uint8, device=device
     )
 
+    def variant_pack(
+        query: Tensor, key: Tensor, value: Tensor, output: Tensor
+    ) -> dict[object, Tensor]:
+        return {
+            query_desc: query,
+            key_desc: key,
+            value_desc: value,
+            **{descriptor: scale for descriptor in scale_descriptors},
+            output_desc: output,
+            amax_s_desc: amax_s,
+            amax_o_desc: amax_o,
+        }
+
     def execute(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
         output = torch.empty_strided(
             query_shape, query_stride, dtype=torch.float8_e4m3fn, device=device
         )
-        graph.execute(
-            {
-                query_desc: query,
-                key_desc: key,
-                value_desc: value,
-                **{descriptor: scale for descriptor in scale_descriptors},
-                output_desc: output,
-                amax_s_desc: amax_s,
-                amax_o_desc: amax_o,
-            },
-            workspace,
-        )
+        graph.execute(variant_pack(query, key, value, output), workspace)
         return output
+
+    if not capture_ready:
+        return execute, None
+
+    try:
+        cuda_runtime = importlib.import_module("cuda.bindings.runtime")
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            "quantized cuDNN SDPA CUDA graph capture requires cuda-bindings"
+        ) from error
+
+    capture_handle = cudnn.create_handle()
+    cudnn.set_stream(capture_handle, stream)
+    success = cuda_runtime.cudaError_t.cudaSuccess
+    active_capture = cuda_runtime.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
+    update_flags = cuda_runtime.cudaStreamUpdateCaptureDependenciesFlags
+
+    def checked_cuda_call(operation: str, result):
+        error, *values = result
+        if error != success:
+            raise RuntimeError(f"{operation} failed with {error}")
+        return values
+
+    def capture_execute(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        output = torch.empty_strided(
+            query_shape, query_stride, dtype=torch.float8_e4m3fn, device=device
+        )
+        (child_graph,) = checked_cuda_call(
+            "cudaGraphCreate", cuda_runtime.cudaGraphCreate(0)
+        )
+        try:
+            pointer_map = {
+                descriptor.get_uid(): tensor.data_ptr()
+                for descriptor, tensor in variant_pack(
+                    query, key, value, output
+                ).items()
+            }
+            graph.populate_cuda_graph(
+                capture_handle,
+                pointer_map,
+                workspace.data_ptr(),
+                int(child_graph),
+            )
+            capture_stream = torch.cuda.current_stream(device).cuda_stream
+            capture_info = checked_cuda_call(
+                "cudaStreamGetCaptureInfo",
+                cuda_runtime.cudaStreamGetCaptureInfo(capture_stream),
+            )
+            status, _, parent_graph, dependencies, _, dependency_count = capture_info
+            if status != active_capture:
+                raise RuntimeError("cuDNN FP8 SDPA requires active CUDA capture")
+            (child_node,) = checked_cuda_call(
+                "cudaGraphAddChildGraphNode",
+                cuda_runtime.cudaGraphAddChildGraphNode(
+                    parent_graph,
+                    dependencies,
+                    dependency_count,
+                    child_graph,
+                ),
+            )
+            checked_cuda_call(
+                "cudaStreamUpdateCaptureDependencies",
+                cuda_runtime.cudaStreamUpdateCaptureDependencies(
+                    capture_stream,
+                    [child_node],
+                    None,
+                    1,
+                    update_flags.cudaStreamSetCaptureDependencies,
+                ),
+            )
+        finally:
+            cuda_runtime.cudaGraphDestroy(child_graph)
+        return output
+
+    weakref.finalize(capture_execute, cudnn.destroy_handle, capture_handle)
+    return execute, capture_execute
+
+
+@lru_cache(maxsize=256)
+def _build_cudnn_fp8_sdpa(
+    device: torch.device,
+    query_shape: tuple[int, ...],
+    query_stride: tuple[int, ...],
+    key_shape: tuple[int, ...],
+    key_stride: tuple[int, ...],
+    value_shape: tuple[int, ...],
+    value_stride: tuple[int, ...],
+) -> Callable[[Tensor, Tensor, Tensor], Tensor]:
+    """Cache eager plans by stream and prepare one plan for graph capture."""
+    eager_by_stream: dict[int, Callable[[Tensor, Tensor, Tensor], Tensor]] = {}
+    capture_execute: Callable[[Tensor, Tensor, Tensor], Tensor] | None = None
+
+    def execute(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        nonlocal capture_execute
+        if torch.cuda.is_current_stream_capturing():
+            if capture_execute is None:
+                raise RuntimeError(
+                    "warm up cuDNN FP8 SDPA once before CUDA graph capture"
+                )
+            return capture_execute(query, key, value)
+
+        stream = torch.cuda.current_stream(device).cuda_stream
+        eager_execute = eager_by_stream.get(stream)
+        if eager_execute is None:
+            eager_execute, new_capture_execute = _build_cudnn_fp8_sdpa_plan(
+                device,
+                stream,
+                query_shape,
+                query_stride,
+                key_shape,
+                key_stride,
+                value_shape,
+                value_stride,
+                capture_execute is None,
+            )
+            eager_by_stream[stream] = eager_execute
+            if new_capture_execute is not None:
+                capture_execute = new_capture_execute
+        return eager_execute(query, key, value)
 
     return execute
 
 
+@torch.compiler.disable
 def native_cudnn_fp8_sdpa(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
     """Apply unscaled e4m3 attention with a cached cuDNN Frontend graph.
 
@@ -147,7 +278,6 @@ def native_cudnn_fp8_sdpa(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
     """
     execute = _build_cudnn_fp8_sdpa(
         query.device,
-        torch.cuda.current_stream(query.device).cuda_stream,
         tuple(query.shape),
         query.stride(),
         tuple(key.shape),
