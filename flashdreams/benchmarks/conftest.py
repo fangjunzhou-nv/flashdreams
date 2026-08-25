@@ -22,7 +22,6 @@ from functools import cache
 import pytest
 import torch
 import triton
-from pytest_benchmark.fixture import BenchmarkFixture
 from torch.utils.collect_env import get_nvidia_driver_version, run
 
 
@@ -51,5 +50,5 @@ def _record_gpu_environment(request: pytest.FixtureRequest) -> None:
     """Attach the shared GPU environment to every benchmark record."""
     if "benchmark" not in request.fixturenames:
         return
-    benchmark: BenchmarkFixture = request.getfixturevalue("benchmark")
+    benchmark = request.getfixturevalue("benchmark")
     benchmark.extra_info.update(_gpu_environment())

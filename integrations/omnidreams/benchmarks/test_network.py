@@ -23,6 +23,7 @@ Run the benchmark with::
 """
 
 from __future__ import annotations
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -32,7 +33,8 @@ from omnidreams.transformer.impl.network import (
     CosmosDiTNetwork,
     CosmosDiTNetworkConfig,
 )
-from pytest_benchmark.fixture import BenchmarkFixture
+if TYPE_CHECKING:
+    from pytest_benchmark.fixture import BenchmarkFixture
 
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from flashdreams.infra.acceleration import (

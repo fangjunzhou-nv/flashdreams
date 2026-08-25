@@ -23,6 +23,7 @@ Run the benchmark with::
 """
 
 from __future__ import annotations
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -31,7 +32,8 @@ from omnidreams.pipeline import OmnidreamsPipeline
 from omnidreams.runner import DEFAULT_VIDEO_HEIGHT, DEFAULT_VIDEO_WIDTH
 from omnidreams.transformer import CosmosTransformer, CosmosTransformerConfig
 from omnidreams.vae_native import OmnidreamsWanVAEEncoderConfig
-from pytest_benchmark.fixture import BenchmarkFixture
+if TYPE_CHECKING:
+    from pytest_benchmark.fixture import BenchmarkFixture
 
 from flashdreams.infra.config import derive_config
 from flashdreams.infra.diffusion.scheduler.fm import FlowMatchSchedulerConfig

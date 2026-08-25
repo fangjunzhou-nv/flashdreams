@@ -29,12 +29,16 @@ Run the manual GPU benchmarks with::
         -p no:manual_marker -m manual --benchmark-only -v
 """
 
+from __future__ import annotations
+
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 import torch.nn.functional as F
-from pytest_benchmark.fixture import BenchmarkFixture
+if TYPE_CHECKING:
+    from pytest_benchmark.fixture import BenchmarkFixture
 from torch import Tensor, nn
 
 from flashdreams.accelerated.quantization.linear import (

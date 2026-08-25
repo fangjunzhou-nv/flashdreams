@@ -25,6 +25,7 @@ Run the module benchmarks with::
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -33,7 +34,8 @@ from omnidreams.transformer.impl.modules import (
     Block,
 )
 from omnidreams.transformer.impl.network import CosmosDiTNetworkConfig
-from pytest_benchmark.fixture import BenchmarkFixture
+if TYPE_CHECKING:
+    from pytest_benchmark.fixture import BenchmarkFixture
 
 from flashdreams.accelerated.multi_head_attention.optimized import (
     OptimizedImplConfig,

@@ -23,10 +23,12 @@ Run the manual GPU benchmarks with::
 """
 
 from __future__ import annotations
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
-from pytest_benchmark.fixture import BenchmarkFixture
+if TYPE_CHECKING:
+    from pytest_benchmark.fixture import BenchmarkFixture
 from torch import Tensor
 
 from flashdreams.accelerated.quantization.quantizer import (
