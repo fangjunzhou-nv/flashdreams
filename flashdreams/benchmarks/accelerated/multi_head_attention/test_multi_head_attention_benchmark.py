@@ -41,15 +41,15 @@ from flashdreams.accelerated.multi_head_attention import (
     RoPEScope,
     RoPEStyle,
 )
-from flashdreams.accelerated.multi_head_attention.torch import TorchMultiHeadAttention
 from flashdreams.accelerated.multi_head_attention.optimized import (
+    OptimizedHultiHeadAttention,
+    OptimizedImplConfig,
     QKVFusionOption,
     QuantizationOption,
     SDPABackend,
-    OptimizedImplConfig,
-    OptimizedHultiHeadAttention,
     is_tma_flash_attention_supported,
 )
+from flashdreams.accelerated.multi_head_attention.torch import TorchMultiHeadAttention
 
 pytestmark = [
     pytest.mark.manual,

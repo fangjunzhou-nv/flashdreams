@@ -25,9 +25,9 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 
 from flashdreams.accelerated.multi_head_attention.optimized import (
+    OptimizedImplConfig,
     QKVFusionOption,
     SDPABackend,
-    OptimizedImplConfig,
 )
 from flashdreams.core.distributed.context_parallel import (
     cat_outputs_cp,

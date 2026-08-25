@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-
 import pytest
 import torch
 from torch import Tensor
@@ -31,14 +30,14 @@ from flashdreams.accelerated.multi_head_attention import (
     RoPEStyle,
 )
 from flashdreams.accelerated.multi_head_attention.cudnn import native_cudnn_fp8_sdpa
-from flashdreams.accelerated.multi_head_attention.torch import TorchMultiHeadAttention
 from flashdreams.accelerated.multi_head_attention.optimized import (
+    OptimizedHultiHeadAttention,
+    OptimizedImplConfig,
     QKVFusionOption,
     QuantizationOption,
     SDPABackend,
-    OptimizedImplConfig,
-    OptimizedHultiHeadAttention,
 )
+from flashdreams.accelerated.multi_head_attention.torch import TorchMultiHeadAttention
 from flashdreams.accelerated.quantization.linear import QuantizedNonPersistentLinear
 from flashdreams.accelerated.quantization.quantizer import (
     DTYPE_MAX,
@@ -433,7 +432,7 @@ def test_refresh_derived_weights_rejects_mixed_projection_biases(
     )
     for projection, has_bias in zip(projections, projection_biases, strict=True):
         if not has_bias:
-            projection.bias = None
+            projection.register_parameter("bias", None)
 
     with pytest.raises(
         ValueError,

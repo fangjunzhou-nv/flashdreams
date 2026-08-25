@@ -22,6 +22,7 @@ import math
 import weakref
 from collections.abc import Callable
 from functools import lru_cache
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -121,7 +122,7 @@ def _build_cudnn_fp8_sdpa_plan(
 
     def variant_pack(
         query: Tensor, key: Tensor, value: Tensor, output: Tensor
-    ) -> dict[object, Tensor]:
+    ) -> dict[Any, Tensor]:
         return {
             query_desc: query,
             key_desc: key,

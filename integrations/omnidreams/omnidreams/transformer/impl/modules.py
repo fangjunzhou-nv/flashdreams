@@ -35,10 +35,10 @@ from flashdreams.accelerated.multi_head_attention import (
     RoPEStyle,
 )
 from flashdreams.accelerated.multi_head_attention.optimized import (
+    OptimizedHultiHeadAttention,
+    OptimizedImplConfig,
     QKVFusionOption,
     SDPABackend,
-    OptimizedImplConfig,
-    OptimizedHultiHeadAttention,
 )
 from flashdreams.core.attention import BlockKVCache, ContextParallelAttention
 from flashdreams.core.attention.rope import apply_rope_freqs

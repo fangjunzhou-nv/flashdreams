@@ -46,9 +46,9 @@ from omnidreams.vae_native import (
 )
 
 from flashdreams.accelerated.multi_head_attention.optimized import (
+    OptimizedImplConfig,
     QKVFusionOption,
     SDPABackend,
-    OptimizedImplConfig,
 )
 from flashdreams.infra.config import derive_config
 from flashdreams.infra.diffusion.model import DiffusionModelConfig

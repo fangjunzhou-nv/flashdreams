@@ -25,10 +25,10 @@ import torch
 from omnidreams.transformer.impl.modules import AttentionBackend
 
 from flashdreams.accelerated.multi_head_attention.optimized import (
+    OptimizedImplConfig,
     QKVFusionOption,
     QuantizationOption,
     SDPABackend,
-    OptimizedImplConfig,
 )
 
 
@@ -100,10 +100,7 @@ BENCHMARK_CASES = [
             qkv_fusion_option=QKVFusionOption.FUSE_KV,
             sdpa_backend=SDPABackend.FA2,
             use_tma=True,
-            quantization=QuantizationOption(
-                projection=None,
-                quantized_sdpa=False
-            ),
+            quantization=QuantizationOption(projection=None, quantized_sdpa=False),
         ),
         minimum_compute_capability=(9, 0),
     ),

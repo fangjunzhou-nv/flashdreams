@@ -23,7 +23,9 @@ import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pytest
+from matplotlib.colors import CenteredNorm
 
 from scripts.benchmark.common import (
     add_plot_io_arguments,
@@ -32,8 +34,8 @@ from scripts.benchmark.common import (
     benchmark_median_ms,
     benchmark_subtitle,
     draw_relative_heatmap,
-    load_benchmark_json,
     latency_comparison_label,
+    load_benchmark_json,
     relative_matrix_with_fastest,
     save_figure,
 )
@@ -147,9 +149,13 @@ def test_heatmap_annotation_and_save(tmp_path: Path) -> None:
     output_path = tmp_path / "nested" / "heatmap.png"
     save_figure(figure, output_path)
 
-    assert image.get_array()[0].tolist() == pytest.approx([-1.0, 0.0, 1.0, 4.0])
+    image_array = image.get_array()
+    assert image_array is not None
+    assert image_array[0].tolist() == pytest.approx([-1.0, 0.0, 1.0, 4.0])
+    assert isinstance(image.norm, CenteredNorm)
     assert image.norm.vcenter == 0.0
-    assert image.norm(-1.0) == pytest.approx(1 - image.norm(1.0))
+    normalized = np.asarray(image.norm(np.asarray([-1.0, 1.0])))
+    assert normalized[0] == pytest.approx(1 - normalized[1])
     assert reference.get_color() in {"black", "white"}
     assert slower.get_color() in {"black", "white"}
     assert output_path.is_file()

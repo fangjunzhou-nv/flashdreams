@@ -33,11 +33,11 @@ from flashdreams.accelerated.multi_head_attention import (
     optimized as optimized_attention,
 )
 from flashdreams.accelerated.multi_head_attention.optimized import (
+    OptimizedHultiHeadAttention,
+    OptimizedImplConfig,
     QKVFusionOption,
     QuantizationOption,
     SDPABackend,
-    OptimizedImplConfig,
-    OptimizedHultiHeadAttention,
 )
 from integrations.omnidreams.benchmarks.cases import BENCHMARK_CASES
 from integrations.omnidreams.benchmarks.test_modules import (

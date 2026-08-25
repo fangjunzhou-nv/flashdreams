@@ -30,8 +30,8 @@ from scripts.benchmark.common import (
     benchmark_median_ms,
     benchmark_subtitle,
     draw_relative_heatmap,
-    load_benchmark_json,
     latency_comparison_label,
+    load_benchmark_json,
     relative_matrix_with_fastest,
     save_figure,
 )

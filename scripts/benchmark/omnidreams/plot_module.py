@@ -9,6 +9,7 @@ import argparse
 from pathlib import Path
 
 from scripts.benchmark.common import add_plot_io_arguments, benchmark_artifact_dir
+
 from ._plot import plot_modules
 
 _DEFAULT_OUTPUT_DIR = benchmark_artifact_dir(Path("artifacts/benchmark/omnidreams"))

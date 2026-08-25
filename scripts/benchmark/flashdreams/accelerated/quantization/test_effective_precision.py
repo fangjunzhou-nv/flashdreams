@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import runpy
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -28,14 +29,20 @@ from flashdreams.accelerated.quantization.linear import WeightGranularity
 from flashdreams.accelerated.quantization.quantizer import Granularity
 from scripts.benchmark.flashdreams.accelerated.quantization.plot_gemm import (
     _load_matrix as load_gemm_matrix,
+)
+from scripts.benchmark.flashdreams.accelerated.quantization.plot_gemm import (
     main as plot_gemm,
 )
 from scripts.benchmark.flashdreams.accelerated.quantization.plot_quantized_linear import (
     _load_matrix as load_linear_matrix,
+)
+from scripts.benchmark.flashdreams.accelerated.quantization.plot_quantized_linear import (
     main as plot_linear,
 )
 from scripts.benchmark.flashdreams.accelerated.quantization.plot_quantizer import (
     _load_results as load_quantizer_results,
+)
+from scripts.benchmark.flashdreams.accelerated.quantization.plot_quantizer import (
     main as plot_quantizer,
 )
 
@@ -44,14 +51,16 @@ pytestmark = pytest.mark.ci_cpu
 _REPO_ROOT = Path(__file__).parents[5]
 
 
-def _benchmark_globals(filename: str) -> dict[str, object]:
+def _benchmark_globals(filename: str) -> dict[str, Any]:
     return runpy.run_path(
-        _REPO_ROOT
-        / "flashdreams"
-        / "benchmarks"
-        / "accelerated"
-        / "quantization"
-        / filename
+        str(
+            _REPO_ROOT
+            / "flashdreams"
+            / "benchmarks"
+            / "accelerated"
+            / "quantization"
+            / filename
+        )
     )
 
 
@@ -94,7 +103,9 @@ def test_quantizer_dequantization_scale_matrix_and_plot(tmp_path: Path) -> None:
             for granularity in ("slice", "tensor"):
                 for scale_count in scale_counts:
                     for implementation in ("torch", "triton"):
-                        extra_info = {"implementation": implementation}
+                        extra_info: dict[str, object] = {
+                            "implementation": implementation
+                        }
                         if scale_count > 1:
                             extra_info["scale_count"] = scale_count
                         records.append(

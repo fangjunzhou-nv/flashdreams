@@ -36,15 +36,15 @@ from omnidreams.transformer.impl.network import CosmosDiTNetworkConfig
 from pytest_benchmark.fixture import BenchmarkFixture
 
 from flashdreams.accelerated.multi_head_attention.optimized import (
+    OptimizedImplConfig,
     QKVFusionOption,
     QuantizationOption,
     SDPABackend,
-    OptimizedImplConfig,
 )
 from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
 from integrations.omnidreams.benchmarks.cases import (
-    AttentionBenchmarkCase,
     BENCHMARK_CASES,
+    AttentionBenchmarkCase,
     skip_unsupported_device,
 )
 
