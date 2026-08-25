@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 import torch
+
 if TYPE_CHECKING:
     from pytest_benchmark.fixture import BenchmarkFixture
 from torch import Tensor

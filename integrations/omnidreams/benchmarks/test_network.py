@@ -23,6 +23,7 @@ Run the benchmark with::
 """
 
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 import pytest
@@ -33,6 +34,7 @@ from omnidreams.transformer.impl.network import (
     CosmosDiTNetwork,
     CosmosDiTNetworkConfig,
 )
+
 if TYPE_CHECKING:
     from pytest_benchmark.fixture import BenchmarkFixture
 

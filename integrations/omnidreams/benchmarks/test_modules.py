@@ -34,6 +34,7 @@ from omnidreams.transformer.impl.modules import (
     Block,
 )
 from omnidreams.transformer.impl.network import CosmosDiTNetworkConfig
+
 if TYPE_CHECKING:
     from pytest_benchmark.fixture import BenchmarkFixture
 

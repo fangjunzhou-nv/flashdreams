@@ -23,6 +23,7 @@ Run the benchmark with::
 """
 
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 import pytest
@@ -32,6 +33,7 @@ from omnidreams.pipeline import OmnidreamsPipeline
 from omnidreams.runner import DEFAULT_VIDEO_HEIGHT, DEFAULT_VIDEO_WIDTH
 from omnidreams.transformer import CosmosTransformer, CosmosTransformerConfig
 from omnidreams.vae_native import OmnidreamsWanVAEEncoderConfig
+
 if TYPE_CHECKING:
     from pytest_benchmark.fixture import BenchmarkFixture
 
