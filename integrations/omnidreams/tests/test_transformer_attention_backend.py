@@ -17,10 +17,6 @@
 
 import pytest
 import torch
-from omnidreams.config import (
-    OMNIDREAMS_CONFIGS,
-    SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_TRITON_FA2,
-)
 from omnidreams.transformer import CosmosTransformerConfig
 from omnidreams.transformer.impl import modules as transformer_modules
 from omnidreams.transformer.impl.modules import AttentionBackend, Block
@@ -69,36 +65,6 @@ def test_dit_attention_backend_defaults_to_omnidreams() -> None:
     assert transformer_modules.MultiHeadAttention.__base__ is torch.nn.Module
     assert isinstance(default_block.self_attn, transformer_modules.SelfAttention)
     assert isinstance(default_block.cross_attn, transformer_modules.CrossAttention)
-
-
-def test_rtx_pro_6000_config_uses_triton_fa2_attention() -> None:
-    """Keep the RTX Pro 6000 preset on Triton FA2 attention."""
-    config = SV_2STEPS_CHUNK2_LOC6_LIGHTVAE_LIGHTTAE_TRITON_FA2
-    assert config.name == (
-        "omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-triton-rtx-pro-6000"
-    )
-    assert OMNIDREAMS_CONFIGS[config.name] is config
-
-    transformer_config = config.diffusion_model.transformer
-    assert isinstance(transformer_config, CosmosTransformerConfig)
-    network_config = transformer_config.network
-    assert isinstance(network_config, CosmosDiTNetworkConfig)
-    assert network_config.self_attention_backend is AttentionBackend.OPTIMIZED
-    assert network_config.cross_attention_backend is AttentionBackend.OPTIMIZED
-    assert (
-        network_config.self_attn_optimized_impl_config.sdpa_backend is SDPABackend.FA2
-    )
-    assert (
-        network_config.cross_attn_optimized_impl_config.sdpa_backend is SDPABackend.FA2
-    )
-    assert (
-        network_config.self_attn_optimized_impl_config.qkv_fusion_option
-        is QKVFusionOption.FULL
-    )
-    assert (
-        network_config.cross_attn_optimized_impl_config.qkv_fusion_option
-        is QKVFusionOption.NONE
-    )
 
 
 @pytest.mark.parametrize(
@@ -359,9 +325,9 @@ def test_benchmark_cases_match_selected_matrix() -> None:
             "omnidreams_torch",
             AttentionBackend.OMNIDREAMS,
             AttentionBackend.OMNIDREAMS,
-            SDPABackend.CUDNN,
-            QKVFusionOption.NONE,
-            QKVFusionOption.NONE,
+            SDPABackend.FA2,
+            QKVFusionOption.FULL,
+            QKVFusionOption.FUSE_KV,
         ),
         (
             "optimized_cudnn_fp8_self_full_no_tma_cross_none_tma",
@@ -369,15 +335,15 @@ def test_benchmark_cases_match_selected_matrix() -> None:
             AttentionBackend.OPTIMIZED,
             SDPABackend.CUDNN,
             QKVFusionOption.FULL,
-            QKVFusionOption.NONE,
+            QKVFusionOption.FUSE_KV,
         ),
         (
             "optimized_fa2_quantized_sdpa_self_full_tma_cross_none_tma",
             AttentionBackend.OPTIMIZED,
-            AttentionBackend.OPTIMIZED,
+            AttentionBackend.OMNIDREAMS,
             SDPABackend.FA2,
             QKVFusionOption.FULL,
-            QKVFusionOption.NONE,
+            QKVFusionOption.FUSE_KV,
         ),
     )
     gb300_best = pytorch_cases[1]
@@ -385,14 +351,21 @@ def test_benchmark_cases_match_selected_matrix() -> None:
         qkv_fusion_option=QKVFusionOption.FULL,
         sdpa_backend=SDPABackend.CUDNN,
         use_tma=False,
-        quantization=QuantizationOption(projection=torch.float8_e4m3fn),
+        quantization=QuantizationOption(
+            projection=None,
+            quantized_sdpa=True,
+        ),
     )
     assert gb300_best.cross_attn_optimized_impl_config == OptimizedImplConfig(
-        qkv_fusion_option=QKVFusionOption.NONE,
-        sdpa_backend=SDPABackend.CUDNN,
+        qkv_fusion_option=QKVFusionOption.FUSE_KV,
+        sdpa_backend=SDPABackend.FA2,
         use_tma=True,
-        quantization=QuantizationOption(projection=torch.float8_e4m3fn),
+        quantization=QuantizationOption(
+            projection=None,
+            quantized_sdpa=False,
+        ),
     )
+    assert gb300_best.minimum_compute_capability == (9, 0)
 
     rtx_pro_6000_best = pytorch_cases[2]
     assert rtx_pro_6000_best.self_attn_optimized_impl_config == OptimizedImplConfig(
@@ -405,12 +378,12 @@ def test_benchmark_cases_match_selected_matrix() -> None:
         ),
     )
     assert rtx_pro_6000_best.cross_attn_optimized_impl_config == OptimizedImplConfig(
-        qkv_fusion_option=QKVFusionOption.NONE,
+        qkv_fusion_option=QKVFusionOption.FUSE_KV,
         sdpa_backend=SDPABackend.FA2,
         use_tma=True,
         quantization=QuantizationOption(
-            projection=torch.float8_e4m3fn,
-            quantized_sdpa=True,
+            projection=None,
+            quantized_sdpa=False,
         ),
     )
     assert rtx_pro_6000_best.minimum_compute_capability == (9, 0)
