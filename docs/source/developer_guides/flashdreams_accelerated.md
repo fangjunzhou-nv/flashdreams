@@ -510,6 +510,22 @@ With inner-scoped normalization, $m=Hd$ and all heads for a token are
 normalized together. No normalization leaves Q and K unchanged. Let
 $Q^{(n)}$ and $K^{(n)}$ denote the resulting tensors; V is never normalized.
 
+```{figure} /_static/diagrams/accelerated/per-head-rms-norm.png
+:alt: Head-scoped RMSNorm normalizes every attention head independently.
+:align: center
+:width: 100%
+
+Head-scoped RMSNorm normalizes each attention head independently with $m=d$.
+```
+
+```{figure} /_static/diagrams/accelerated/inner-rms-norm.png
+:alt: Inner-scoped RMSNorm normalizes all attention heads for a token together.
+:align: center
+:width: 100%
+
+Inner-scoped RMSNorm normalizes the complete projected inner dimension with $m=Hd$.
+```
+
 For even $d$, RoPE starts with geometrically spaced inverse frequencies. For
 a one-dimensional position and base $\Theta$ (typically $10000$), pair $r$
 uses
@@ -545,16 +561,41 @@ $(a_r,b_r)=(r,r+d/2)$ for $0 \le r < d/2$. Applying these rotations to
 $Q^{(n)}$ and $K^{(n)}$ gives $Q^\star$ and $K^\star$; disabling RoPE leaves
 them unchanged. V is not rotated.
 
+```{figure} /_static/diagrams/accelerated/split-vs-interleaved-rope.png
+:alt: Interleaved RoPE pairs adjacent features, while split RoPE pairs features from opposite halves.
+:align: center
+:width: 100%
+
+Interleaved RoPE pairs adjacent features; split-half RoPE pairs corresponding
+features from the two halves of the head dimension.
+```
+
 **Before the K/V cache update.** RoPE is applied to the current key chunk
 before it is written, so the cache stores position-embedded K. At each
 autoregressive step, only the new query and key chunk is rotated; older cached
 keys already contain their embeddings and are reused without applying RoPE
 again.
 
+```{figure} /_static/diagrams/accelerated/rope-before-kv-cache.png
+:alt: Before-cache RoPE rotates the current key chunk before writing it to the cache.
+:align: center
+:width: 100%
+
+Before-cache RoPE writes position-embedded keys to the K/V cache.
+```
+
 **After the K/V cache update.** The cache stores unrotated K. Immediately
 before attention, RoPE is applied to the current query and every visible cached
 key using angles for their current positions. The stored cache remains
 unrotated, so visible keys are rotated again on each autoregressive step.
+
+```{figure} /_static/diagrams/accelerated/rope-after-kv-cache.png
+:alt: After-cache RoPE rotates the query and all visible cached keys before attention.
+:align: center
+:width: 100%
+
+After-cache RoPE rotates visible keys while leaving cached keys unrotated.
+```
 
 For head $h$, scaled dot-product attention is
 
@@ -571,6 +612,31 @@ reference below normalizes before applying RoPE as shown above.
 In self-attention, $C = X$ and the current K/V chunk is written into a
 rolling cache before the score calculation. In cross-attention, K/V are
 precomputed from static $C$ and reused for each query.
+
+Q/K RMSNorm scope, RoPE pairing style, and RoPE cache-update scope are
+independent choices. They can be combined in any supported arrangement for
+both self-attention and cross-attention. See the
+[Generic Multi Head Attention Interface](#generic-multi-head-attention-interface)
+for configuration details.
+
+The following examples show self-attention with before-cache RoPE and
+cross-attention with after-cache RoPE.
+
+```{figure} /_static/diagrams/accelerated/self-attention-rope-before-kv.png
+:alt: Self-attention data flow with RoPE applied before the K/V cache update.
+:align: center
+:width: 100%
+
+Self-attention with RoPE before the K/V cache update.
+```
+
+```{figure} /_static/diagrams/accelerated/cross-attention-rope-after-kv.png
+:alt: Cross-attention data flow with RoPE applied after the K/V cache update.
+:align: center
+:width: 100%
+
+Cross-attention with RoPE after the K/V cache update.
+```
 
 ### Generic Multi Head Attention Interface
 
