@@ -453,8 +453,7 @@ $$
 \begin{bmatrix}
 z'_{p,a_r} \\
 z'_{p,b_r}
-\end{bmatrix}
-=
+\end{bmatrix} =
 \begin{bmatrix}
 \cos\theta_{p,r} & -\sin\theta_{p,r} \\
 \sin\theta_{p,r} & \cos\theta_{p,r}
