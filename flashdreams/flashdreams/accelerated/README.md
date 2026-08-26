@@ -402,28 +402,6 @@ forward calls.
 
 ## Optimized Multi Head Attention
 
-### Generic Multi Head Attention Interface
-
-`AttentionConfig` defines the query width, optional context width, number of
-heads, head dimension, Q/K normalization scope and epsilon, and optional
-`RoPEConfig`. A missing context width uses the query width; self-attention
-requires those widths to be equal. `RoPEConfig` selects interleaved or
-split-half feature pairing and whether key rotations occur before or after K/V
-cache storage.
-
-`MultiHeadAttention` is an adapter-friendly abstract interface. Concrete
-modules expose query, key, value, and output projection accessors plus query
-and key normalization accessors, while retaining checkpoint-native attribute
-names. `compute_kv(context, rope_freqs)` materializes a static cross-attention
-cache. `forward(x, kv_cache, rope_freqs)` accepts query tokens and either a
-prepared streaming cache or that static cache.
-
-The caller owns the `BlockKVCache` lifecycle for streaming self-attention:
-`before_update(chunk_idx)`, `forward`, then `after_update(chunk_idx)`. The
-current query chunk writes its K/V into the rolling cache before it is queried.
-Cross-attention instead calls `compute_kv` once for static context and reuses
-the finalized cache without rolling-cache update bookkeeping.
-
 ### Multi Head Attention Definition
 
 Let query tokens be $X \in \mathbb{R}^{B \times L \times C_Q}$ and
@@ -439,75 +417,295 @@ V = \operatorname{reshape}(CW_V + b_V),
 $$
 
 where each reshaped tensor has shape $[B, L, H, d]$ for $Q$ or
-$[B, S, H, d]$ for $K$ and $V$. For head $h$, scaled dot-product
-attention is
+$[B, S, H, d]$ for $K$ and $V$.
+
+Optional Q/K RMS normalization maps a feature vector
+$z \in \mathbb{R}^{m}$ to
 
 $$
-A_h = \operatorname{softmax}\left(\frac{Q_hK_h^\mathsf{T}}{\sqrt d}\right)V_h,
+\operatorname{RMSNorm}_{\gamma}(z)
+= \gamma \odot
+\frac{z}{\sqrt{\frac{1}{m}\sum_{i=1}^{m}z_i^2 + \epsilon}},
+$$
+
+where $\gamma \in \mathbb{R}^{m}$ is the learned elementwise weight. With
+head-scoped normalization, $m=d$ and each head is normalized independently.
+With inner-scoped normalization, $m=Hd$ and all heads for a token are
+normalized together. No normalization leaves Q and K unchanged. Let
+$Q^{(n)}$ and $K^{(n)}$ denote the resulting tensors; V is never normalized.
+
+For even $d$, RoPE starts with geometrically spaced inverse frequencies. For
+a one-dimensional position and base $\Theta$ (typically $10000$), pair $r$
+uses
+
+$$
+\omega_r = \Theta^{-2r/d}, \qquad
+\theta_{p,r} = p\,\omega_r, \qquad 0 \le r < d/2.
+$$
+
+Optional extrapolation changes the effective base $\Theta$. Video models can
+apply the same construction independently to temporal, height, and width
+coordinates, allocate feature pairs to each axis, and concatenate the resulting
+angles. FlashDreams receives these expanded angles as `rope_freqs` shaped
+$[L,1,1,d]$. Given angle $\theta_{p,r}$, RoPE rotates pair $r$ as
+
+$$
+\begin{bmatrix}
+z'_{p,a_r} \\
+z'_{p,b_r}
+\end{bmatrix}
+=
+\begin{bmatrix}
+\cos\theta_{p,r} & -\sin\theta_{p,r} \\
+\sin\theta_{p,r} & \cos\theta_{p,r}
+\end{bmatrix}
+\begin{bmatrix}
+z_{p,a_r} \\
+z_{p,b_r}
+\end{bmatrix}.
+$$
+
+Interleaved RoPE pairs $(a_r,b_r)=(2r,2r+1)$; split-half RoPE pairs
+$(a_r,b_r)=(r,r+d/2)$ for $0 \le r < d/2$. Applying these rotations to
+$Q^{(n)}$ and $K^{(n)}$ gives $Q^\star$ and $K^\star$; disabling RoPE leaves
+them unchanged. V is not rotated.
+
+**Before the K/V cache update.** RoPE is applied to the current key chunk
+before it is written, so the cache stores position-embedded K. At each
+autoregressive step, only the new query and key chunk is rotated; older cached
+keys already contain their embeddings and are reused without applying RoPE
+again.
+
+**After the K/V cache update.** The cache stores unrotated K. Immediately
+before attention, RoPE is applied to the current query and every visible cached
+key using angles for their current positions. The stored cache remains
+unrotated, so visible keys are rotated again on each autoregressive step.
+
+For head $h$, scaled dot-product attention is
+
+$$
+A_h = \operatorname{softmax}\left(
+\frac{Q_h^\star(K_h^\star)^\mathsf{T}}{\sqrt d}
+\right)V_h,
 \qquad
 Y = \operatorname{concat}(A_1, \ldots, A_H)W_O + b_O.
 $$
 
-Optional Q/K normalization acts on projected Q and K, never V. RoPE rotates
-projected Q and K according to its configured pairing; implementations own the
-operation order, while the reference below normalizes before applying RoPE.
+Implementations own the exact normalization and RoPE operation order; the
+reference below normalizes before applying RoPE as shown above.
 In self-attention, $C = X$ and the current K/V chunk is written into a
 rolling cache before the score calculation. In cross-attention, K/V are
 precomputed from static $C$ and reused for each query.
 
+### Generic Multi Head Attention Interface
+
+`AttentionConfig` describes the attention geometry through the query and
+context widths, number of heads, and head dimension. It also exposes the
+RMSNorm and RoPE policies. Q/K RMSNorm can be disabled, applied independently
+per head, or applied across the complete projected inner dimension. RoPE can
+be disabled or configured with split-half or interleaved feature pairing and
+can run before or after the K/V cache update.
+
+For example, Cosmos-Predict2.5 2B self-attention uses:
+
+```python
+from flashdreams.accelerated.multi_head_attention import (
+    AttentionConfig,
+    QKNormScope,
+    RoPEConfig,
+    RoPEScope,
+    RoPEStyle,
+)
+
+cosmos_attention_config = AttentionConfig(
+    query_dim=2048,
+    context_dim=2048,
+    n_heads=16,
+    head_dim=128,
+    qk_norm_scope=QKNormScope.HEAD,
+    qk_norm_eps=1e-6,
+    rope_config=RoPEConfig(
+        style=RoPEStyle.SPLIT,
+        scope=RoPEScope.BEFORE_KV_CACHE,
+    ),
+)
+```
+
+WAN 2.1 1.3B self-attention uses:
+
+```python
+from flashdreams.accelerated.multi_head_attention import (
+    AttentionConfig,
+    QKNormScope,
+    RoPEConfig,
+    RoPEScope,
+    RoPEStyle,
+)
+
+wan_attention_config = AttentionConfig(
+    query_dim=1536,
+    context_dim=1536,
+    n_heads=12,
+    head_dim=128,
+    qk_norm_scope=QKNormScope.INNER,
+    qk_norm_eps=1e-6,
+    rope_config=RoPEConfig(
+        style=RoPEStyle.INTERLEAVED,
+        scope=RoPEScope.BEFORE_KV_CACHE,
+    ),
+)
+```
+
+`MultiHeadAttention` is an adapter-friendly abstract interface. A concrete
+implementation owns the Q, K, V, and output projection layers and the Q/K
+RMSNorm modules. These modules must retain the checkpoint-native attribute
+names so checkpoint loading resolves the expected parameter keys. The
+implementation must also expose them through the `query_projection`,
+`key_projection`, `value_projection`, `output_projection`, `query_norm`, and
+`key_norm` properties required by the shared interface.
+
+`compute_kv(context, rope_freqs)` projects a context and precomputes its K/V
+cache, which is typically used to prepare static cross-attention context.
+`forward(x, kv_cache, rope_freqs)` runs query tokens through the complete MHA
+operation: projection, optional Q/K normalization, RoPE, an optional K/V cache
+update, scaled dot-product attention, and output projection. Self-attention
+updates and attends to the streaming rolling K/V cache, while cross-attention
+attends to the context cache returned by `compute_kv` without updating it.
+
+The caller owns the `BlockKVCache` lifecycle for streaming self-attention:
+`before_update(chunk_idx)`, `forward`, then `after_update(chunk_idx)`. The
+current query chunk writes its K/V into the rolling cache before it is queried.
+Cross-attention instead calls `compute_kv` once for static context and reuses
+the finalized cache without rolling-cache update bookkeeping.
+
+For example, assume a model adapter has constructed concrete `self_attention`
+and `cross_attention` modules and allocated `self_kv_cache` for the streaming
+window:
+
+```python
+# B: flattened batch size; L: query-chunk length; S: context/cache length.
+# H: number of heads; d: head dimension; C_Q/C_C: query/context width.
+
+# Streaming self-attention updates the rolling cache once per query chunk.
+# query_chunks[i]: [..., L, C_Q].
+# query_rope_freqs[i]: [R, 1, 1, d], or None when RoPE is disabled. R = L
+# for before-cache RoPE; for after-cache RoPE, R covers the query and all
+# visible cache positions.
+# self_kv_cache K/V storage: [B, sink_size + window_size, H, d].
+self_outputs = []
+for chunk_idx, (query, rope_freqs) in enumerate(
+    zip(query_chunks, query_rope_freqs, strict=True)
+):
+    self_kv_cache.before_update(chunk_idx)
+    output = self_attention(query, self_kv_cache, rope_freqs)  # [..., L, C_Q].
+    self_outputs.append(output)
+    self_kv_cache.after_update(chunk_idx)
+# self_outputs[i]: [..., L, C_Q].
+# Visible cached K/V after each step: [B, S, H, d].
+
+# Cross-attention projects static context once and reuses its cache.
+# context: [..., S, C_C].
+# context_rope_freqs: [S, 1, 1, d] for before-cache RoPE; otherwise None.
+context_kv_cache = cross_attention.compute_kv(context, context_rope_freqs)
+# context_kv_cache K/V tensors: [B, S, H, d].
+cross_outputs = []
+for query, rope_freqs in zip(query_chunks, query_rope_freqs, strict=True):
+    # query: [..., L, C_Q]; rope_freqs: [R, 1, 1, d] or None.
+    output = cross_attention(query, context_kv_cache, rope_freqs)  # [..., L, C_Q].
+    cross_outputs.append(output)
+# cross_outputs[i]: [..., L, C_Q].
+```
+
 ### TorchMultiHeadAttention Reference
 
-`TorchMultiHeadAttention` is the portable PyTorch implementation of that
-contract. It projects Q, K, and V, flattens leading dimensions into $B$,
-and reshapes to token-major $[B, L, H, d]$ or $[B, S, H, d]$. It applies
-the configured Q/K normalization after projection: `QKNormScope.INNER` sees
-the concatenated $Hd$ features and `HEAD` sees each $d$-feature head.
-Values are not normalized.
-
-`allocate_kv_cache` creates a rolling cache shaped
-`[B, sink_size + window_size, H, d]`. For before-cache RoPE, the reference
-rotates normalized keys before storing them in either a static cache or the
-current rolling chunk. For after-cache RoPE, it stores normalized unrotated
-keys and rotates the visible cached keys when querying them. It rotates
-normalized queries before attention in both policies, selecting the appropriate
-current-query and visible-cache positions from `rope_freqs`.
-
-For self-attention, `forward` writes the projected current K/V after the
-caller has prepared the cache, then queries all visible cache entries. For
-cross-attention, `compute_kv` creates a finalized static cache and `forward`
-only queries it. The reference transposes to head-major layout for PyTorch
-`scaled_dot_product_attention` with zero dropout and non-causal attention,
-then restores token-major layout, concatenates heads, applies the output
-projection, and restores the original leading query shape.
+`TorchMultiHeadAttention` is the portable PyTorch reference implementation that
+conforms to the interface above. It is primarily used as a correctness oracle
+for `OptimizedMultiHeadAttention`.
 
 ### OptimizedMultiHeadAttention
 
-`OptimizedMultiHeadAttention` is the inference-only base for adapters that
-provide their own projection and normalization modules. Its
-`OptimizedImplConfig` selects:
+`OptimizedMultiHeadAttention` is one highly optimized MHA implementation in
+`flashdreams.accelerated`. It combines an optional Triton FlashAttention2
+kernel, an optional PyTorch cuDNN SDPA backend, an optional native FP8 cuDNN
+backend, fine-grained quantization of projections and attention, and several
+Q/K/V projection-fusion schedules.
 
-- `QKVFusionOption`: independent projections, a fused KV projection, or a
-  fully fused QKV projection (the full form requires equal query and context
-  widths).
-- `SDPABackend.CUDNN`: PyTorch cuDNN SDPA for FP16/BF16, or the cuDNN Frontend
-  FP8 path when quantized SDPA is enabled.
-- `SDPABackend.FA2`: Triton non-causal FlashAttention2. When `use_tma=True`,
-  the optimized module uses the TMA kernel only when the tensors satisfy its
-  support check; otherwise it uses the pointer-based kernel.
-- `QuantizationOption`: optional FP8 or INT8 Q/K/V projection quantization and
-  optional unscaled FP8 e4m3 SDPA.
+`OptimizedImplConfig` configures the algorithm used for each optimized
+component. Except for numerical error introduced by quantization, these choices
+do not change the mathematical MHA operation. They change how that operation is
+scheduled and executed. It can be viewed as a deliberately small scheduling
+DSL, analogous to a simplified Halide schedule.
 
-Optimized attention accepts CUDA FP16/BF16 inputs and requires compute
-capability 9.0 or newer. The FlashAttention2 kernels use token-major
-`[B, L, H, D]` queries and `[B, S, H, D]` keys and values; head dimensions
-must be powers of two from 16 through 256. TMA additionally requires
-compatible tensor-descriptor layout and alignment. The native cuDNN FP8 path
-requires the `nvidia-cudnn-frontend` package; warm it up once before CUDA graph
-capture.
+- `qkv_fusion_option` (`QKVFusionOption`, default `FULL`) controls the projection
+  GEMM schedule.
 
-Quantized SDPA directly casts Q, K, and V to FP8 e4m3 and is not an
-accuracy-preserving quantization scheme. It can make attention inaccurate, so
-validate output quality for the model and workload that use it.
+  - `NONE` runs independent Q, K, and V projections.
+  - `FUSE_KV` runs Q independently and concatenates the K/V weights into one
+    projection. It supports different query and context widths.
+  - `FULL` runs one fused QKV projection for streaming self-attention. Static
+    context projection still uses the derived fused KV projection. This option
+    requires equal query and context widths.
+
+- `sdpa_backend` (`SDPABackend`, default `CUDNN`) selects the non-causal
+  scaled-dot-product attention kernel.
+
+  - `CUDNN` uses PyTorch cuDNN SDPA for FP16/BF16 Q, K, and V. When
+    `quantized_sdpa=True`, it instead uses the native cuDNN Frontend FP8 graph,
+    which requires `nvidia-cudnn-frontend` and must be warmed up before CUDA
+    graph capture.
+  - `FA2` uses the bundled Triton FlashAttention2 implementation with
+    token-major `[B, L, H, D]` queries and `[B, S, H, D]` keys and values.
+
+- `use_tma` (`bool`, default `True`) refines the `FA2` schedule. When enabled,
+  the TMA FlashAttention2 kernel is selected only if the device, tensor layout,
+  and alignment pass its support check; otherwise execution falls back to the
+  pointer-based FlashAttention2 kernel. Setting it to `False` always selects the
+  pointer-based kernel. It has no effect on the `CUDNN` backend.
+
+- `quantization` (`QuantizationOption`) controls the precision schedule.
+
+  - `projection` (`torch.dtype | None`, default `None`) quantizes the Q/K/V
+    projection GEMMs when set to `torch.float8_e4m3fn`, `torch.float8_e5m2`, or
+    `torch.int8`. Weights use one scale per output channel, activations use one
+    scale per input slice, and projection results return to the input FP16/BF16
+    dtype. The output projection remains in native precision.
+  - `quantized_sdpa` (`bool`, default `False`) directly casts Q, K, and V to
+    unscaled `torch.float8_e4m3fn`, stores K/V caches in that dtype, and runs the
+    selected SDPA backend in FP8. The FA2 path also uses FP8 softmax
+    probabilities for the P@V product. This is not an accuracy-preserving
+    quantization scheme such as SageAttention3 and can make attention
+    inaccurate, so validate quality for each model and workload.
+
+All configurations require CUDA FP16/BF16 inputs, compute capability 9.0 or
+newer, and a power-of-two head dimension from 16 through 256.
+
+> **Why do we need a scheduling language for optimized MHA?** The generic MHA
+> interface supports variants with different query and context widths, head
+> counts, head dimensions, normalization scopes, RoPE styles, and RoPE cache
+> scopes. A schedule that performs well for one variant may be less effective
+> for another. Even within one model, self-attention and cross-attention have
+> different projection, sequence-length, and cache-reuse behavior and can prefer
+> very different schedules. The best schedule for the same MHA variant can also
+> change across hardware platforms.
+>
+> The benchmark-selected policies in
+> `integrations/omnidreams/benchmarks/cases.py` make these differences concrete:
+>
+> | Platform | Component | Implementation | Fusion | SDPA | TMA | Projection | FP8 SDPA |
+> | --- | --- | --- | --- | --- | --- | --- | --- |
+> | GB300 | Self-attention | Optimized MHA | `FULL` | `CUDNN` | Off | Native | On |
+> | GB300 | Cross-attention | Optimized MHA | `FUSE_KV` | `FA2` | On | Native | Off |
+> | RTX PRO 6000 | Self-attention | Optimized MHA | `FULL` | `FA2` | On | FP8 e4m3 | On |
+> | RTX PRO 6000 | Cross-attention | OmniDreams | N/A | N/A | N/A | N/A | N/A |
+>
+> On GB300, self-attention prefers native-precision projections with cuDNN FP8
+> SDPA, while cross-attention prefers fused KV projection with TMA
+> FlashAttention2 in native precision. On RTX PRO 6000, self-attention instead
+> prefers TMA FlashAttention2 with FP8 e4m3 projection and FP8 SDPA, while
+> cross-attention remains on the checkpoint-native OmniDreams implementation.
+> Treating `OptimizedImplConfig` as a small scheduling language makes these
+> choices easy to enumerate, benchmark, and select independently for every
+> component and hardware platform.
 
 ## OmniDreams Integration
 
