@@ -80,6 +80,14 @@ $$
 Every element is divided by $s_{\text{tensor}}$ before it is clipped to
 $[-M_t, M_t]$ and converted to $t$.
 
+```{figure} /_static/diagrams/accelerated/tensor-wise-quantization.png
+:alt: Tensor-wise quantization applies one shared scale to the complete tensor.
+:align: center
+:width: 100%
+
+Tensor-wise quantization applies one shared scale to the complete tensor.
+```
+
 Per-slice granularity computes a scale for every slice along the selected
 axis. For a matrix, `axis=0` reduces across rows and produces one scale per
 column, while `axis=1` reduces across columns and produces one scale per row:
@@ -93,6 +101,22 @@ $$
 
 Thus, `axis=0` divides each $X_{ij}$ by its column scale $s_j$, and `axis=1`
 divides it by its row scale $s_i$.
+
+```{figure} /_static/diagrams/accelerated/slice-wise-quantization-axis0.png
+:alt: Slice-wise quantization along axis zero applies one scale to each column.
+:align: center
+:width: 100%
+
+Slice-wise quantization with `axis=0` applies one scale to each column.
+```
+
+```{figure} /_static/diagrams/accelerated/slice-wise-quantization-axis1.png
+:alt: Slice-wise quantization along axis one applies one scale to each row.
+:align: center
+:width: 100%
+
+Slice-wise quantization with `axis=1` applies one scale to each row.
+```
 
 Using the same vector as the first column of a $(3, 2)$ matrix and adding a
 second column gives
@@ -174,6 +198,14 @@ $$
 > it is one of its most important missing features and should be planned for a
 > future version.
 
+```{figure} /_static/diagrams/accelerated/tile-wise-quantization.png
+:alt: Tile-wise quantization applies a separate scale to each tensor tile.
+:align: center
+:width: 100%
+
+Tile-wise quantization applies a separate scale to each tile and is planned for a future version.
+```
+
 CUDA tensors use the Triton implementation by default; CPU tensors use the
 Torch implementation. The quantizer performs scale computation in detached
 FP32 values. The returned scale tensor is FP32 and retains all input
@@ -210,6 +242,8 @@ It then casts the result to the requested output dtype (FP16 by default). With
 no scales, it directly casts $\bar X$ to that dtype. This supports, for
 example, separately applying activation and weight scales after a GEMM.
 
+#### Quantized GEMM
+
 For a quantized-GEMM example, let $Q \in \mathbb{R}^{L \times D}$ and
 $K \in \mathbb{R}^{S \times D}$ be token-major query and key matrices,
 with $L$ query tokens, $S$ key tokens, and feature width $D$. Their
@@ -220,6 +254,14 @@ matrices $\bar Q$ and $\bar K$, the scaled product is
 $$
 QK^\mathsf{T} \approx (s_Qs_K)\,(\bar Q\bar K^\mathsf{T}).
 $$
+
+```{figure} /_static/diagrams/accelerated/tensor-tensor-quantized-gemm.png
+:alt: Tensor-tensor quantized GEMM applies the two tensor scales to the quantized matrix product.
+:align: center
+:width: 100%
+
+Tensor–tensor quantized GEMM combines the two scalar scales.
+```
 
 With `Granularity.SLICE` and `axis=-1`, each token instead has a scale:
 $s_Q \in \mathbb{R}^{L \times 1}$ and
@@ -235,6 +277,31 @@ where $s_Qs_K^\mathsf{T} \in \mathbb{R}^{L \times S}$ is the outer product
 of the query and key token scales and $\odot$ is elementwise multiplication.
 These equations describe composing the tensor quantizer with a GEMM; the
 quantizer itself does not perform attention or provide a fused QK kernel.
+
+```{figure} /_static/diagrams/accelerated/slice-slice-quantized-gemm-outer.png
+:alt: Slice-slice quantized GEMM applies an outer product of row and column scales.
+:align: center
+:width: 100%
+
+Slice–slice quantized GEMM applies the outer product of the slice scales.
+```
+
+```{figure} /_static/diagrams/accelerated/slice-tensor-quantized-gemm.png
+:alt: Slice-tensor quantized GEMM combines per-slice scales with one tensor scale.
+:align: center
+:width: 100%
+
+Slice–tensor quantized GEMM combines per-slice scales with one scalar scale.
+```
+
+```{figure} /_static/diagrams/accelerated/tile-tile-quantized-gemm.png
+:alt: Tile-tile quantized GEMM scales and accumulates the products of quantized tiles.
+:align: center
+:width: 100%
+
+Tile–tile quantized GEMM scales and accumulates individual tile products. Tile
+granularity is planned and is not currently supported by the toolkit.
+```
 
 > **Inner-dimension rule for slice-quantized GEMM.** For
 > $C = AB$ with $A \in \mathbb{R}^{M \times K}$ and
@@ -253,6 +320,14 @@ quantizer itself does not perform attention or provide a fused QK kernel.
 > Transposing $K$ then moves
 > that dimension to `axis=0` of the GEMM's right operand, satisfying the same
 > rule.
+
+```{figure} /_static/diagrams/accelerated/invlid-inner-quantized-gemm.png
+:alt: Invalid slice quantization varies scales along the GEMM inner dimension.
+:align: center
+:width: 100%
+
+Invalid inner-dimension quantization cannot use a single post-GEMM scale.
+```
 
 #### Worked Slice-Quantized GEMM
 
