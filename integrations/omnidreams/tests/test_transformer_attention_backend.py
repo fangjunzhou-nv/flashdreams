@@ -29,8 +29,8 @@ from flashdreams.accelerated.multi_head_attention import (
     optimized as optimized_attention,
 )
 from flashdreams.accelerated.multi_head_attention.optimized import (
-    OptimizedMultiHeadAttention,
     OptimizedImplConfig,
+    OptimizedMultiHeadAttention,
     QKVFusionOption,
     QuantizationOption,
     SDPABackend,

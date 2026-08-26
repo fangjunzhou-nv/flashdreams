@@ -35,8 +35,8 @@ from flashdreams.accelerated.multi_head_attention import (
     RoPEStyle,
 )
 from flashdreams.accelerated.multi_head_attention.optimized import (
-    OptimizedMultiHeadAttention,
     OptimizedImplConfig,
+    OptimizedMultiHeadAttention,
     QKVFusionOption,
     SDPABackend,
 )

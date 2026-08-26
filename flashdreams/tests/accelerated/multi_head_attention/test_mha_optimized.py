@@ -31,8 +31,8 @@ from flashdreams.accelerated.multi_head_attention import (
 )
 from flashdreams.accelerated.multi_head_attention.cudnn import native_cudnn_fp8_sdpa
 from flashdreams.accelerated.multi_head_attention.optimized import (
-    OptimizedMultiHeadAttention,
     OptimizedImplConfig,
+    OptimizedMultiHeadAttention,
     QKVFusionOption,
     QuantizationOption,
     SDPABackend,
