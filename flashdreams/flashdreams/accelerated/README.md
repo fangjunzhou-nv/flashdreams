@@ -58,7 +58,7 @@ values to the nearest integers gives
 
 $$
 s = \frac{0.67}{127} \approx 0.005276, \qquad
-\bar{x} = \operatorname{round}(x / s) = [80, 70, -127].
+\bar{x} = \mathrm{round}(x / s) = [80, 70, -127].
 $$
 
 The quantized vector is therefore $[80, 70, -127]$ with scale
@@ -183,7 +183,7 @@ dimensions, with reduced dimensions kept at size one.
 provided scale in order with normal tensor broadcasting:
 
 $$
-X = \operatorname{dequantize}\left(\bar X, s^{(1)}, \ldots, s^{(m)}\right)
+X = \mathrm{dequantize}\left(\bar X, s^{(1)}, \ldots, s^{(m)}\right)
 \approx \bar X \odot \prod_{r=1}^{m}s^{(r)}.
 $$
 
@@ -411,9 +411,9 @@ $S$ the context length, $H$ the number of heads, and $d$ the head
 dimension. With inner width $Hd$, the projections are
 
 $$
-Q = \operatorname{reshape}(XW_Q + b_Q), \qquad
-K = \operatorname{reshape}(CW_K + b_K), \qquad
-V = \operatorname{reshape}(CW_V + b_V),
+Q = \mathrm{reshape}(XW_Q + b_Q), \qquad
+K = \mathrm{reshape}(CW_K + b_K), \qquad
+V = \mathrm{reshape}(CW_V + b_V),
 $$
 
 where each reshaped tensor has shape $[B, L, H, d]$ for $Q$ or
@@ -423,7 +423,7 @@ Optional Q/K RMS normalization maps a feature vector
 $z \in \mathbb{R}^{m}$ to
 
 $$
-\operatorname{RMSNorm}_{\gamma}(z)
+\mathrm{RMSNorm}_{\gamma}(z)
 = \gamma \odot
 \frac{z}{\sqrt{\frac{1}{m}\sum_{i=1}^{m}z_i^2 + \epsilon}},
 $$
@@ -484,11 +484,11 @@ unrotated, so visible keys are rotated again on each autoregressive step.
 For head $h$, scaled dot-product attention is
 
 $$
-A_h = \operatorname{softmax}\left(
+A_h = \mathrm{softmax}\left(
 \frac{Q_h^\star(K_h^\star)^\mathsf{T}}{\sqrt d}
 \right)V_h,
 \qquad
-Y = \operatorname{concat}(A_1, \ldots, A_H)W_O + b_O.
+Y = \mathrm{concat}(A_1, \ldots, A_H)W_O + b_O.
 $$
 
 Implementations own the exact normalization and RoPE operation order; the
