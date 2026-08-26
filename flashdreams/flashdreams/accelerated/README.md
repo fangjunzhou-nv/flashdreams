@@ -894,11 +894,134 @@ hardware-specific result into the model architecture.
 > around it to search schedules and replace the current manual performance
 > tuning process.
 
-## Validation and Benchmarks
+## Running, Testing, and Benchmarking
 
-The accelerated tests cover quantization and projection contracts, reference
-agreement for attention implementations, and the two FlashAttention2 kernels.
-GPU benchmarks compare attention policies and distinguish prequantized work
-from end-to-end quantization where applicable. They are manual tests and do not
-publish a single benchmark result in this library; run them on the target CUDA
-environment when evaluating a configuration.
+Run all commands below from the repository root. Config inspection and CPU
+tests do not instantiate models. Actual OmniDreams runs and benchmarks require
+a supported NVIDIA GPU, access to the model assets, and the appropriate
+integration dependencies.
+
+### Run OmniDreams with different runner configs
+
+List every installed runner or inspect a resolved config without loading its
+model:
+
+```bash
+uv run --python 3.12 --package flashdreams-omnidreams flashdreams-run --help
+uv run --python 3.12 --package flashdreams-omnidreams flashdreams-run \
+    --no-instantiate omnidreams-optimized-gb300
+```
+
+The accelerated-relevant runner configs are:
+
+| Runner | Purpose |
+| --- | --- |
+| `omnidreams` | Reference OmniDreams implementation. |
+| `omnidreams-perf` | Compile and CUDA-graph performance preset. |
+| `omnidreams-optimized-gb300` | Optimized MHA schedule selected for GB300. |
+| `omnidreams-optimized-rtx-pro-6000` | Optimized MHA schedule selected for RTX PRO 6000. |
+
+For example, run the GB300 preset in `mp4` mode with the bundled example data:
+
+```bash
+uv run --python 3.12 --package flashdreams-omnidreams flashdreams-run \
+    omnidreams-optimized-gb300 mp4 \
+    --device cuda:0 \
+    --scenario.example-data true \
+    --scenario.example-data-uuid 239560dc-33d1-11ef-9720-00044bcbccac \
+    --scenario.total-blocks 120 \
+    --output.fps 30 \
+    --output.path outputs/omnidreams-optimized-gb300.mp4
+```
+
+Replace the runner name and output path to run a different preset.
+Use `--no-instantiate` with any runner name to compare nested pipeline and
+attention configs before launching GPU work.
+
+### Run correctness tests
+
+Run the CPU-safe accelerated tests first:
+
+```bash
+uv run --project flashdreams --group test pytest \
+    flashdreams/tests/accelerated -m ci_cpu
+```
+
+On a supported CUDA system, run the optimized MHA, quantization, and Triton
+kernel tests with:
+
+```bash
+uv run --project flashdreams --group test pytest \
+    flashdreams/tests/accelerated -m ci_gpu
+```
+
+Validate the OmniDreams adapter/config plumbing and benchmark plotting helpers
+on CPU with:
+
+```bash
+uv run --project integrations/omnidreams --group test pytest \
+    integrations/omnidreams/tests/test_transformer_attention_backend.py \
+    -m ci_cpu
+
+uv run --project flashdreams --group test pytest \
+    scripts/benchmark/test_common.py -m ci_cpu
+```
+
+### Run benchmarks directly with pytest
+
+The benchmarks are manual GPU tests. Run every accelerated quantization and MHA
+benchmark directly with:
+
+```bash
+uv run --project flashdreams --group test pytest \
+    flashdreams/benchmarks/accelerated \
+    -p no:manual_marker -m manual --benchmark-only -v
+```
+
+For the OmniDreams module, network, and pipeline benchmarks, first synchronize
+the required third-party source and then run:
+
+```bash
+uv run --package flashdreams-omnidreams python \
+    integrations/omnidreams/omnidreams_singleview/tools/sync_thirdparty.py sync
+
+uv run --project integrations/omnidreams --group test pytest \
+    integrations/omnidreams/benchmarks \
+    -p no:manual_marker -m manual --benchmark-only -v
+```
+
+Direct pytest runs print results to the terminal. Add
+`--benchmark-json=<path>` when a machine-readable result is required.
+
+### Run the scripts/benchmark workflows
+
+The scripts run pytest-benchmark, save JSON artifacts, and generate comparison
+plots. Run an individual benchmark family with:
+
+```bash
+./scripts/benchmark/flashdreams/accelerated/quantization/run.sh
+./scripts/benchmark/flashdreams/accelerated/multi_head_attention/run.sh
+./scripts/benchmark/omnidreams/run.sh
+```
+
+Run all default benchmark families, or opt into every supported exhaustive
+sweep, with:
+
+```bash
+./scripts/benchmark/run_all.sh
+FLASHDREAMS_RUN_FULL_BENCHMARK=1 ./scripts/benchmark/run_all.sh
+```
+
+Recreate plots from saved default or full-sweep JSON without rerunning GPU
+measurements:
+
+```bash
+./scripts/benchmark/run_all_plot.sh
+FLASHDREAMS_RUN_FULL_BENCHMARK=1 ./scripts/benchmark/run_all_plot.sh
+```
+
+Default artifacts are written below `artifacts/benchmark/flashdreams` and
+`artifacts/benchmark/omnidreams`; exhaustive-sweep artifacts use a `full`
+subdirectory. Record the commit, runner/config, GPU and software stack, warmup
+policy, and benchmark JSON when comparing schedules. Results selected on one
+platform should not be treated as portable performance claims.
