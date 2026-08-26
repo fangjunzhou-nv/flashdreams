@@ -707,22 +707,192 @@ newer, and a power-of-two head dimension from 16 through 256.
 > choices easy to enumerate, benchmark, and select independently for every
 > component and hardware platform.
 
-## OmniDreams Integration
+## Supporting flashdreams.accelerated in an Integration
 
-OmniDreams adapts `OptimizedMultiHeadAttention` for its transformer blocks and
-selects the optimized path independently for self- and cross-attention. Its
-installed runner presets are `omnidreams-optimized-gb300` and
-`omnidreams-optimized-rtx-pro-6000`; inspect either resolved configuration
-without loading a model with:
+### Quantization
 
-```bash
-uv run flashdreams-run --no-instantiate omnidreams-optimized-gb300
-uv run flashdreams-run --no-instantiate omnidreams-optimized-rtx-pro-6000
+Use the APIs described in the [Quantization Toolkit](#quantization-toolkit) and
+follow its examples directly. `QuantizedNonPersistentLinear` should be used as
+the inference-time drop-in replacement for any regular `nn.Linear` layer; the
+[quantized forward example](#quantized-forward-example) shows both dynamic and
+prequantized activation paths.
+
+### Optimized MHA
+
+`OptimizedMultiHeadAttention` remains a generic interface: it does not know an
+integration's checkpoint parameter names, attention geometry, normalization,
+or RoPE convention. Each integration provides a thin model adapter and lets the
+shared implementation own projection fusion, quantization, K/V cache updates,
+and SDPA dispatch.
+
+#### 1. Implement the model adapter
+
+Inherit `OptimizedMultiHeadAttention` separately for each self- or
+cross-attention variant that has a different contract. The adapter must:
+
+1. Pass the correct `AttentionType` and architecture-specific `AttentionConfig`
+   to `super().__init__`.
+2. Construct the Q, K, V, output, Q-norm, and K-norm modules using the exact
+   attribute names and bias policy expected by the checkpoint.
+3. Implement all six logical properties required by `MultiHeadAttention`.
+4. Call `_initialize_derived_weights()` after the canonical checkpoint modules
+   exist. This builds nonpersistent fused or quantized execution weights and
+   installs the hook that refreshes them after checkpoint loading.
+
+For example, the OmniDreams self-attention adapter in
+`integrations/omnidreams/omnidreams/transformer/impl/modules.py` follows this
+shape:
+
+```python
+import torch.nn as nn
+
+from flashdreams.accelerated.multi_head_attention import (
+    AttentionConfig,
+    AttentionType,
+    QKNormScope,
+    RoPEConfig,
+    RoPEScope,
+    RoPEStyle,
+)
+from flashdreams.accelerated.multi_head_attention.optimized import (
+    OptimizedImplConfig,
+    OptimizedMultiHeadAttention,
+)
+
+
+class OptimizedSelfAttention(OptimizedMultiHeadAttention):
+    @property
+    def query_projection(self) -> nn.Linear:
+        return self.q_proj
+
+    @property
+    def key_projection(self) -> nn.Linear:
+        return self.k_proj
+
+    @property
+    def value_projection(self) -> nn.Linear:
+        return self.v_proj
+
+    @property
+    def output_projection(self) -> nn.Linear:
+        return self.output_proj
+
+    @property
+    def query_norm(self) -> nn.Module:
+        return self.q_norm
+
+    @property
+    def key_norm(self) -> nn.Module:
+        return self.k_norm
+
+    def __init__(self, optimized_impl_config: OptimizedImplConfig) -> None:
+        attention_config = AttentionConfig(
+            query_dim=2048,
+            context_dim=2048,
+            n_heads=16,
+            head_dim=128,
+            qk_norm_scope=QKNormScope.HEAD,
+            qk_norm_eps=1e-6,
+            rope_config=RoPEConfig(
+                style=RoPEStyle.SPLIT,
+                scope=RoPEScope.BEFORE_KV_CACHE,
+            ),
+        )
+        super().__init__(
+            attention_type=AttentionType.SELF_ATTENTION,
+            attention_config=attention_config,
+            optimized_impl_config=optimized_impl_config,
+        )
+
+        inner_dim = attention_config.inner_dim
+        self.q_proj = nn.Linear(2048, inner_dim, bias=False)
+        self.k_proj = nn.Linear(2048, inner_dim, bias=False)
+        self.v_proj = nn.Linear(2048, inner_dim, bias=False)
+        self.output_proj = nn.Linear(inner_dim, 2048, bias=False)
+        self.q_norm = nn.RMSNorm(128, eps=1e-6)
+        self.k_norm = nn.RMSNorm(128, eps=1e-6)
+        self._initialize_derived_weights()
 ```
 
-Those presets encode device-specific policies selected by the OmniDreams
-attention benchmarks. They are configuration choices, not portable performance
-claims for other models, shapes, or hardware.
+Those values describe OmniDreams self-attention: 2048-wide tokens, 16 heads,
+128 features per head, per-head Q/K RMSNorm, and split RoPE applied before the
+K/V cache update. Its cross-attention adapter exposes the same six properties
+but uses a different architecture policy:
+
+```python
+omnidreams_cross_attention_config = AttentionConfig(
+    query_dim=2048,
+    context_dim=1024,
+    n_heads=16,
+    head_dim=128,
+    qk_norm_scope=QKNormScope.HEAD,
+    qk_norm_eps=1e-6,
+    rope_config=None,
+)
+```
+
+Use `nn.Identity` for `query_norm` and `key_norm` when Q/K normalization is
+disabled. With `QKNormScope.HEAD`, the RMSNorm width is `head_dim`; with
+`QKNormScope.INNER`, it is `n_heads * head_dim`. The optimized base then
+provides `allocate_kv_cache`, `compute_kv`, and the complete `forward` path.
+Preserve any additional interface required by the integration's existing call
+sites; for example, OmniDreams also implements its context-parallel methods.
+
+#### 2. Select the adapter in each model component
+
+Instantiate the optimized adapter at the same point where the original
+attention module was constructed. OmniDreams makes this choice independently
+for self-attention and cross-attention in every transformer block, then passes
+the corresponding `OptimizedImplConfig` into each adapter. The block's forward
+and cache lifecycle do not change because both implementations conform to the
+same MHA interface.
+
+#### 3. Expose the optimization schedule to higher-level configuration
+
+An integration may hard-code one `OptimizedImplConfig` inside its concrete
+adapter. That is valid, but it commits every model component and every hardware
+platform to that one schedule. Prefer separate self-attention and
+cross-attention fields on the integration's network config:
+
+```python
+from dataclasses import dataclass, field
+
+from flashdreams.accelerated.multi_head_attention.optimized import (
+    OptimizedImplConfig,
+    QKVFusionOption,
+    SDPABackend,
+)
+
+
+@dataclass
+class MyNetworkConfig:
+    self_attn_optimized_impl_config: OptimizedImplConfig = field(
+        default_factory=lambda: OptimizedImplConfig(
+            qkv_fusion_option=QKVFusionOption.FULL,
+            sdpa_backend=SDPABackend.FA2,
+        )
+    )
+    cross_attn_optimized_impl_config: OptimizedImplConfig = field(
+        default_factory=lambda: OptimizedImplConfig(
+            qkv_fusion_option=QKVFusionOption.FUSE_KV,
+            sdpa_backend=SDPABackend.FA2,
+        )
+    )
+```
+
+Thread these fields from the network config into every block and then into the
+concrete attention adapters. Platform-specific pipeline or runner configs can
+override them independently after benchmarking. This is the pattern used by
+OmniDreams: its GB300 and RTX PRO 6000 variants select different self-attention
+schedules, and the RTX PRO 6000 variant keeps its original cross-attention
+implementation. Exposing the schedules at this level avoids baking one
+hardware-specific result into the model architecture.
+
+> **Future direction.** FlashDreams should define a more general declarative,
+> nested configuration system and scheduling DSL. `OptimizedImplConfig` should
+> be refactored into that common DSL, and an autotuning system should be built
+> around it to search schedules and replace the current manual performance
+> tuning process.
 
 ## Validation and Benchmarks
 
