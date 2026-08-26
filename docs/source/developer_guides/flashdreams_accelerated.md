@@ -354,6 +354,7 @@ The result is returned as `out_dtype` (FP16 by default), including after any
 internal BF16 FP8 rowwise GEMM result is cast, and the optional bias is applied
 in that output dtype.
 
+(quantized-forward-example)=
 #### Quantized Forward Example
 
 The layer can quantize a full-precision input during `forward`, or reuse an
