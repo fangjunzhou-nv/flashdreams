@@ -63,11 +63,7 @@ def test_plot_representative_modules_and_pipeline(tmp_path: Path) -> None:
     _write_results(
         pipeline_input,
         [
-            _record(group, implementation, median)
-            for group in (
-                "lingbot-dit-network",
-                "lingbot-full-pipeline-generate",
-            )
+            _record("lingbot-full-pipeline-generate", implementation, median)
             for implementation, median in (
                 ("torch", 1.0),
                 ("optimized-self-cross", 0.7),
@@ -80,7 +76,7 @@ def test_plot_representative_modules_and_pipeline(tmp_path: Path) -> None:
 
     assert (output_dir / "modules.png").is_file()
     assert (output_dir / "dit_block.png").is_file()
-    assert (output_dir / "network_pipeline.png").is_file()
+    assert (output_dir / "pipeline_generate.png").is_file()
 
 
 def test_plot_full_block_search_as_heatmap(tmp_path: Path) -> None:

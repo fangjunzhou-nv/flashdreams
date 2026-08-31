@@ -18,7 +18,6 @@ fi
 mkdir -p "$artifact_dir"
 
 uv run --project integrations/lingbot --group test pytest \
-    integrations/lingbot/benchmarks/test_network.py \
     integrations/lingbot/benchmarks/test_pipeline.py \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json="$artifact_dir/pipeline.json"

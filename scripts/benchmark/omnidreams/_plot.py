@@ -43,11 +43,8 @@ _PIPELINE_GENERATE_PANEL = (
     "omnidreams-full-pipeline-generate",
     "Pipeline generate",
 )
-_END_TO_END_PANELS = (
-    ("omnidreams-dit-network", "Network eval"),
-    _PIPELINE_GENERATE_PANEL,
-)
-_PANELS = (*_ATTENTION_PANELS, _DIT_BLOCK_PANEL, *_END_TO_END_PANELS)
+_PIPELINE_PANELS = (_PIPELINE_GENERATE_PANEL,)
+_PANELS = (*_ATTENTION_PANELS, _DIT_BLOCK_PANEL, *_PIPELINE_PANELS)
 
 _NATIVE_LABELS = {
     "omnidreams-torch": "PyTorch\nOmnidreams\nBF16",
@@ -280,7 +277,7 @@ def _write_bar_figure(
         subtitle: Benchmark environment summary.
     """
     end_to_end = all(
-        panel in (*_END_TO_END_PANELS, _DIT_BLOCK_PANEL) for panel in panels
+        panel in (*_PIPELINE_PANELS, _DIT_BLOCK_PANEL) for panel in panels
     )
     reference_configuration = "omnidreams-torch" if end_to_end else "omnidreams"
     configuration_label = (
@@ -545,27 +542,14 @@ def plot_modules(input_path: Path, output_dir: Path) -> None:
     print(f"Wrote {block_output}")
 
 
-def plot_pipeline(
-    input_path: Path,
-    output_dir: Path,
-    *,
-    pipeline_generate_only: bool = False,
-) -> None:
-    """Generate network and pipeline benchmark figures."""
-    panels = (
-        (_PIPELINE_GENERATE_PANEL,) if pipeline_generate_only else _END_TO_END_PANELS
-    )
-    values, configurations, subtitle = _load_results(input_path, panels)
-    if pipeline_generate_only:
-        output_path = output_dir / "pipeline_generate.png"
-        title = "Omnidreams pipeline generate benchmark"
-    else:
-        output_path = output_dir / "network_pipeline.png"
-        title = "Omnidreams network and pipeline benchmarks"
+def plot_pipeline(input_path: Path, output_dir: Path) -> None:
+    """Generate the full-pipeline benchmark figure."""
+    values, configurations, subtitle = _load_results(input_path, _PIPELINE_PANELS)
+    output_path = output_dir / "pipeline_generate.png"
     _write_bar_figure(
         output_path,
-        title,
-        panels,
+        "Omnidreams pipeline generate benchmark",
+        _PIPELINE_PANELS,
         values,
         configurations,
         subtitle,

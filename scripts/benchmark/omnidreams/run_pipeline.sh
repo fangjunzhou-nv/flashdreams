@@ -21,7 +21,6 @@ uv run --package flashdreams-omnidreams python \
     integrations/omnidreams/omnidreams_singleview/tools/sync_thirdparty.py sync
 
 uv run --project integrations/omnidreams --group test pytest \
-    integrations/omnidreams/benchmarks/test_network.py \
     integrations/omnidreams/benchmarks/test_pipeline.py \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json="$artifact_dir/pipeline.json"

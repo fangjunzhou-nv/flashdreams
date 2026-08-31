@@ -32,10 +32,7 @@ _PIPELINE_GENERATE_PANEL = (
     "lingbot-full-pipeline-generate",
     "Pipeline generate",
 )
-_END_TO_END_PANELS = (
-    ("lingbot-dit-network", "Network eval"),
-    _PIPELINE_GENERATE_PANEL,
-)
+_PIPELINE_PANELS = (_PIPELINE_GENERATE_PANEL,)
 
 _FUSION_LABELS = {
     "none": "None",
@@ -114,7 +111,7 @@ def _attention_configuration_label(implementation: str) -> str:
 
 
 def _end_to_end_configuration_label(implementation: str) -> str:
-    """Format one network, pipeline, or representative block case."""
+    """Format one pipeline or representative block case."""
     return _END_TO_END_LABELS.get(
         implementation,
         "\n".join(implementation.split("-")),
@@ -370,27 +367,14 @@ def plot_modules(input_path: Path, output_dir: Path) -> None:
     print(f"Wrote {block_output}")
 
 
-def plot_pipeline(
-    input_path: Path,
-    output_dir: Path,
-    *,
-    pipeline_generate_only: bool = False,
-) -> None:
-    """Generate network and pipeline benchmark figures."""
-    panels = (
-        (_PIPELINE_GENERATE_PANEL,) if pipeline_generate_only else _END_TO_END_PANELS
-    )
-    values, configurations, subtitle = _load_results(input_path, panels)
-    if pipeline_generate_only:
-        output_path = output_dir / "pipeline_generate.png"
-        title = "LingBot pipeline generate benchmark"
-    else:
-        output_path = output_dir / "network_pipeline.png"
-        title = "LingBot network and pipeline benchmarks"
+def plot_pipeline(input_path: Path, output_dir: Path) -> None:
+    """Generate the full-pipeline benchmark figure."""
+    values, configurations, subtitle = _load_results(input_path, _PIPELINE_PANELS)
+    output_path = output_dir / "pipeline_generate.png"
     _write_bar_figure(
         output_path,
-        title,
-        panels,
+        "LingBot pipeline generate benchmark",
+        _PIPELINE_PANELS,
         values,
         configurations,
         subtitle,
