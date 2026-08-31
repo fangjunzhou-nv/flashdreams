@@ -14,6 +14,7 @@ from flashdreams.runtime_v2.slangpy_ui_renderer import (
     _UIRenderer,
 )
 from flashdreams.runtime_v2.step_result import StepResult
+from flashdreams.runtime_v2.ui_compositing import prepare_ui_back_buffer
 from flashdreams.runtime_v2.user_input_events import UserInputEvents
 
 _StateT = TypeVar("_StateT")
@@ -86,6 +87,7 @@ class SlangPyUILoop(IUILoop[_StateT], ABC, Generic[_StateT]):
             back_buffer = self.step_ui(ui, index, current_events)
 
         overlay = self.renderer.render(step_index, events, draw)
+        back_buffer = prepare_ui_back_buffer(back_buffer, overlay)
         frame = self._presentation_manager.composite(back_buffer, overlay)
         return StepResult(
             step_index=step_index,

@@ -13,6 +13,7 @@ DRIVING_SUPPORTED_KEYS = frozenset(
 )
 WSAD_SUPPORTED_KEYS = frozenset({"w", "a", "s", "d"})
 KEY_ALIASES = {
+    " ": "space",
     "arrowup": "w",
     "arrowleft": "a",
     "arrowdown": "s",
@@ -59,8 +60,10 @@ class SparseInputSnapshot:
 
 
 def normalize_key(key: str) -> str:
-    normalized = key.strip().lower()
-    return KEY_ALIASES.get(normalized, normalized)
+    normalized = key.lower()
+    if normalized.strip() == "spacebar":
+        return "space"
+    return KEY_ALIASES.get(normalized, normalized.strip())
 
 
 @dataclass(slots=True)

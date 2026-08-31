@@ -36,9 +36,13 @@ from flashdreams.runtime_v2.step_result import StepResult
 from flashdreams.runtime_v2.user_input_event import (
     CloseUserInputEvent,
     FocusUserInputEvent,
+    GamepadUserInputEvent,
+    GameWheelUserInputEvent,
     KeyboardInputState,
     KeyboardUserInputEvent,
     MouseUserInputEvent,
+    TouchUserInputEvent,
+    XRControllerUserInputEvent,
 )
 from flashdreams.runtime_v2.video_tensor import VideoTensorLayout
 from flashdreams.runtime_v2.webrtc_client_window import WebRTCClientWindow
@@ -160,6 +164,8 @@ async def test_window_buffers_browser_events_until_drained() -> None:
                 assert "status.hidden = true" in connection_handler
                 assert '"disconnected"' not in connection_handler
                 assert '["failed", "closed"]' in connection_handler
+                assert "navigator.getGamepads" in browser_script
+                assert 'type: "touch"' in browser_script
 
         window.open(_session_desc())
         peer, channel, _ = await _connect_browser(window)
@@ -169,15 +175,66 @@ async def test_window_buffers_browser_events_until_drained() -> None:
             json.dumps({"type": "mouse", "action": "move", "x": 0.25, "y": 0.75})
         )
         channel.send(json.dumps({"type": "focus", "focused": True}))
+        channel.send(
+            json.dumps(
+                {
+                    "type": "touch",
+                    "action": "move",
+                    "touch_id": 3,
+                    "x": 0.4,
+                    "y": 0.6,
+                    "pressure": 0.75,
+                    "primary": True,
+                }
+            )
+        )
+        channel.send(
+            json.dumps(
+                {
+                    "type": "gamepad",
+                    "action": "state",
+                    "index": 1,
+                    "controller_id": "standard pad",
+                    "mapping": "standard",
+                    "axes": [-0.5, 0.25],
+                    "buttons": [0.0, 1.0],
+                    "pressed": [False, True],
+                }
+            )
+        )
+        channel.send(
+            json.dumps(
+                {
+                    "type": "game_wheel",
+                    "action": "state",
+                    "index": 2,
+                    "id": "wheel",
+                    "steering": -0.25,
+                    "throttle": 0.8,
+                    "brake": 0.1,
+                }
+            )
+        )
+        channel.send(
+            json.dumps(
+                {
+                    "type": "xr_controller",
+                    "action": "state",
+                    "handedness": "right",
+                    "position": [1, 2, 3],
+                    "orientation": [0, 0, 0, 1],
+                }
+            )
+        )
 
         events = []
         for _ in range(100):
             events.extend(window.get_user_input_events().get_events())
-            if len(events) == 4:
+            if len(events) == 8:
                 break
             await asyncio.sleep(0.01)
 
-        assert len(events) == 4
+        assert len(events) == 8
         keyboard_events = [
             event for event in events if isinstance(event, KeyboardUserInputEvent)
         ]
@@ -194,6 +251,32 @@ async def test_window_buffers_browser_events_until_drained() -> None:
             event for event in events if isinstance(event, FocusUserInputEvent)
         )
         assert focus.focused
+        touch = next(
+            event for event in events if isinstance(event, TouchUserInputEvent)
+        )
+        assert (touch.touch_id, touch.x, touch.y, touch.pressure, touch.primary) == (
+            3,
+            0.4,
+            0.6,
+            0.75,
+            True,
+        )
+        gamepad = next(
+            event for event in events if isinstance(event, GamepadUserInputEvent)
+        )
+        assert gamepad.axes == (-0.5, 0.25)
+        assert gamepad.buttons == (0.0, 1.0)
+        assert gamepad.pressed == (False, True)
+        wheel = next(
+            event for event in events if isinstance(event, GameWheelUserInputEvent)
+        )
+        assert (wheel.steering, wheel.throttle, wheel.brake) == (-0.25, 0.8, 0.1)
+        xr = next(
+            event for event in events if isinstance(event, XRControllerUserInputEvent)
+        )
+        assert xr.handedness == "right"
+        assert xr.position == (1.0, 2.0, 3.0)
+        assert xr.orientation == (0.0, 0.0, 0.0, 1.0)
         assert window.get_user_input_events().get_events() == []
     finally:
         if peer is not None:

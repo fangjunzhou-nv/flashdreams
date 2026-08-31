@@ -51,7 +51,8 @@ why the two loops do not share memory.
 ## Tests
 
 ```bash
-uv sync --package flashdreams-slangpy-ui-demo --group test --inexact
+uv sync --package flashdreams-slangpy-ui-demo --inexact
+uv sync --group test --inexact
 uv run --no-sync pytest integrations_v2/slangpy_ui_demo -m ci_cpu -v
 ```
 

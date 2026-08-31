@@ -9,7 +9,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import torch
 from torch import Tensor
 
 from flashdreams.runtime.keyboard import KeyboardState
@@ -125,11 +124,7 @@ class Cam2VSlangPyUILoop(SlangPyUILoop[Cam2VUIState]):
         _ensure_widgets(ui, self.state, sampled_at=sampled_at)
         _refresh_widgets(self.state, sampled_at=sampled_at)
 
-        if frame is None:
-            return None
-        if frame.is_floating_point():
-            return frame
-        return frame.to(torch.float32).mul_(2.0 / 255.0).sub_(1.0)
+        return frame
 
     def reset(self) -> None:
         """Clear UI-loop state for a new generation."""

@@ -435,10 +435,6 @@ runner_overrides:
     [
         "lingbot_mp4.yaml",
         "lingbot_webrtc.yaml",
-        "omnidreams_local_window.yaml",
-        "omnidreams_mp4.yaml",
-        "omnidreams_null.yaml",
-        "omnidreams_webrtc.yaml",
     ],
 )
 def test_documented_launch_manifests_resolve(filename: str) -> None:

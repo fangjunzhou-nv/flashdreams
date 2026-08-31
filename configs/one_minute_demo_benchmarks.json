@@ -72,7 +72,7 @@
         "uv",
         "run",
         "--project",
-        "integrations/omnidreams",
+        "integrations_v2/omnidreams",
         "python",
         "-m",
         "tools.benchmarks.strict_run",

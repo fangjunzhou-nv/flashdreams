@@ -74,6 +74,19 @@ def test_recent_frame_rate_reset_discards_previous_rollout() -> None:
     ) == pytest.approx(4.0)
 
 
+def test_recent_frame_rate_accepts_steps_below_clock_resolution() -> None:
+    tracker = RecentFrameRateTracker(window_seconds=2.0)
+
+    assert tracker.observe(completed_at=1.0, frame_count=1, elapsed_s=0.0) == float(
+        "inf"
+    )
+    assert tracker.observe(
+        completed_at=2.0,
+        frame_count=4,
+        elapsed_s=0.5,
+    ) == pytest.approx(10.0)
+
+
 @pytest.mark.parametrize("window_seconds", [0.0, -1.0, float("inf")])
 def test_recent_frame_rate_rejects_invalid_window(window_seconds: float) -> None:
     with pytest.raises(ValueError, match="window_seconds"):

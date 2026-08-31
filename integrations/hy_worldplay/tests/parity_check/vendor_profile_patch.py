@@ -39,7 +39,7 @@ Env vars (all opt-in):
 References:
     * ``integrations/lingbot/tests/parity_check/changes.patch:185-246``
       -- the in-place patch shape Ruilong cited.
-    * ``integrations/omnidreams/omnidreams/runner.py:473-478``
+    * ``integrations_v2/omnidreams/impl/world_model.py``
       -- the stats JSON dump shape both sides now share.
 """
 

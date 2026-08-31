@@ -120,6 +120,9 @@ runners = [
     "scipy>=1.11",
 ]
 local-window = [
+    # Immediate Dear ImGui bindings used by ImGuiUILoop. SlangPy supplies the
+    # Vulkan renderer and CUDA-interoperable textures.
+    "imgui-bundle==1.92.801",
     "slangpy==0.42.0",
 ]
 

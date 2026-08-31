@@ -115,11 +115,6 @@ class FocusUserInputEvent(UserInputEvent):
     """Whether the video viewport owns keyboard focus."""
 
 
-# Stubs for input modalities no client produces yet. Named so that a client
-# gaining one of these has somewhere to put it. Nothing creates or reads them
-# today, and none carries any data.
-
-
 @dataclass(frozen=True, slots=True, eq=False)
 class TouchUserInputEvent(UserInputEvent):
     """User input event for touch."""
@@ -128,6 +123,19 @@ class TouchUserInputEvent(UserInputEvent):
     def get_type_name(cls) -> str:
         """Return the event type name."""
         return "touch"
+
+    action: Literal["start", "move", "end", "cancel"] = "move"
+    """Touch action represented by this event."""
+    touch_id: int = 0
+    """Browser touch-point identifier."""
+    x: float = 0.0
+    """Horizontal touch coordinate normalized to the video viewport."""
+    y: float = 0.0
+    """Vertical touch coordinate normalized to the video viewport."""
+    pressure: float = 0.0
+    """Normalized touch pressure."""
+    primary: bool = False
+    """Whether this is the primary touch point."""
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -139,6 +147,21 @@ class GamepadUserInputEvent(UserInputEvent):
         """Return the event type name."""
         return "gamepad"
 
+    action: Literal["connected", "disconnected", "state"] = "state"
+    """Gamepad lifecycle or state action."""
+    index: int = 0
+    """Browser gamepad index."""
+    controller_id: str = ""
+    """Controller identifier supplied by the client."""
+    mapping: str = ""
+    """Controller mapping name, such as ``"standard"``."""
+    axes: tuple[float, ...] = ()
+    """Normalized gamepad axis values."""
+    buttons: tuple[float, ...] = ()
+    """Normalized analog button values."""
+    pressed: tuple[bool, ...] = ()
+    """Digital pressed state corresponding to ``buttons``."""
+
 
 @dataclass(frozen=True, slots=True, eq=False)
 class GameWheelUserInputEvent(UserInputEvent):
@@ -149,6 +172,23 @@ class GameWheelUserInputEvent(UserInputEvent):
         """Return the event type name."""
         return "game_wheel"
 
+    action: Literal["connected", "disconnected", "state"] = "state"
+    """Wheel lifecycle or state action."""
+    index: int = 0
+    """Client controller index."""
+    controller_id: str = ""
+    """Controller identifier supplied by the client."""
+    steering: float = 0.0
+    """Normalized steering value in ``[-1, 1]``."""
+    throttle: float = 0.0
+    """Normalized throttle value in ``[0, 1]``."""
+    brake: float = 0.0
+    """Normalized brake value in ``[0, 1]``."""
+    clutch: float = 0.0
+    """Normalized clutch value in ``[0, 1]``."""
+    buttons: tuple[bool, ...] = ()
+    """Digital wheel button states."""
+
 
 @dataclass(frozen=True, slots=True, eq=False)
 class XRControllerUserInputEvent(UserInputEvent):
@@ -158,6 +198,23 @@ class XRControllerUserInputEvent(UserInputEvent):
     def get_type_name(cls) -> str:
         """Return the event type name."""
         return "xr_controller"
+
+    action: Literal["connected", "disconnected", "state"] = "state"
+    """XR controller lifecycle or state action."""
+    handedness: Literal["left", "right", "none"] = "none"
+    """Hand associated with the controller."""
+    controller_id: str = ""
+    """Controller identifier supplied by the client."""
+    axes: tuple[float, ...] = ()
+    """Normalized XR controller axis values."""
+    buttons: tuple[float, ...] = ()
+    """Normalized analog button values."""
+    pressed: tuple[bool, ...] = ()
+    """Digital pressed state corresponding to ``buttons``."""
+    position: tuple[float, float, float] | None = None
+    """Optional controller position in client XR space."""
+    orientation: tuple[float, float, float, float] | None = None
+    """Optional controller quaternion in client XR space."""
 
 
 @dataclass(frozen=True, slots=True, eq=False)

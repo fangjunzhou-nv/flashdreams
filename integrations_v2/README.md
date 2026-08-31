@@ -170,7 +170,7 @@ window never sends a close event. And `reset` raises by default, so implement it
 even when the body is one line — a browser client can ask for one at any time.
 
 Register no UI loop unless you need one. The default composites every model
-channel into one frame, which is what all of these except `slangpy_ui_demo` do.
+channel into one frame, which is what most demos need (Refer to `slangpy_ui_demo` for more complex behavior via `SlangPyUILoop`; Refer to `interactive_drive` for more complex behavior via `ImGuiUILoop`).
 
 ## Running it
 

@@ -27,8 +27,9 @@ the Lingbot specialization logs its warmup/steady phase, frame count,
 synchronized step wall time, and chunk FPS. Model metrics retain the
 warmup-excluded cumulative `steady_state_fps` metric for benchmark comparisons.
 
-Cam2V runs SlangPy rendering, model-frame conversion, and composition on a
-high-priority CUDA presentation stream. `CONTINUOUS` runs the UI every tick so
+The v2 runtime runs Cam2V's complete UI-thread lifecycle, including SlangPy
+rendering, model-frame conversion, composition, and window writes, on its
+default high-priority CUDA presentation stream. `CONTINUOUS` runs the UI every tick so
 browser input and time-driven status changes are reflected without waiting for
 a new model frame. The UI/write path owns output cadence; WebRTC does not pace
 frames again. It keeps two unsent frames in FIFO order and evicts the oldest

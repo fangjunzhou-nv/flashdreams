@@ -50,8 +50,9 @@ Presenting it:
 
 - `blit_model_output_to_screen_loop.py` is the UI loop a session gets when it
   registers none of its own.
-- `slangpy_ui_loop.py` and `slangpy_ui_renderer.py` are the UI loop for
-  applications that draw widgets over the model output.
+- `slangpy_ui_loop.py` and `slangpy_ui_renderer.py` provide retained SlangPy
+  widgets over the model output. `imgui_ui_loop.py` and `imgui_ui_renderer.py`
+  provide immediate Dear ImGui controls rendered through SlangPy.
 - `mp4_client_window.py` and `webrtc_client_window.py` are the two windows.
 - `mp4_output_sink.py`, `metrics_output_sink.py`, `video_encoder.py` and
   `video_tensor.py` are what output is written through.
@@ -149,10 +150,23 @@ neither thread waits on the other to notice.
 
 ## `PresentationManager`
 
-The model thread publishes a list of channels per step into a bounded queue
-(`max_pending`, two by default). The UI thread calls `advance` once per tick,
-which walks the frames within the chunk it is already showing before taking
-another off the queue.
+The model thread publishes a list of channels per step into a bounded chunk
+queue. The queue holds one pending chunk by default. Once the UI thread takes
+that chunk, its remaining frames live in the active presented chunk rather than
+the queue; an empty queue with an active chunk means presentation is keeping up.
+
+`publish` observes model-step timing for cadence, and the UI thread calls
+`advance` once per tick so the manager can decide whether the next presentable
+model frame is due. If the pending chunk queue is full, `advance` ignores the
+normal cadence and drains the active chunk so backlog does not build behind it.
+
+When CUDA is available, the default `PresentationManager` creates a stream at
+the device's highest available priority. `run_session` keeps that one stream
+current for the entire UI-thread lifecycle, including session and window
+initialization, input collection, UI rendering, window writes, and cleanup.
+Constructing the manager with an explicit CPU device disables the CUDA stream.
+Stream priority lets short UI work overtake queued lower-priority kernels, but
+does not preempt a kernel that is already executing.
 
 Frame cadence initially uses `frames_per_second_for_step`, then follows the
 throughput of model steps completed over the trailing two seconds. The estimate
@@ -179,10 +193,9 @@ ready:
 
 For output that has to be compared frame by frame, use `BLOCK` with
 `ON_DEMAND`: together they keep every frame in the presentation manager
-and present each exactly once in order. Steps that could not be kept are counted
+and present each exactly once in order. Chunks that could not be kept are counted
 in `dropped_for_space` and `discarded_at_reset`, and logged when the run ends.
-Both count model steps rather than frames, so one step of twelve frames counts
-once.
+Both counters use model chunks as their unit.
 
 ## Presenting and writing
 
@@ -190,11 +203,18 @@ A UI loop reads model frames through `presented_model_frame` and
 `presented_model_frames`, composites whatever it wants, and returns one
 `StepResult` that `run_session` writes to the window.
 
+The ImGui and SlangPy UI loops prepare the optional model back buffer before
+composition: integer `[0, 255]` frames are normalized to the renderer's
+floating-point range, frames are moved to the renderer's device, and dimensions
+are resized to the rendered overlay. `PresentationManager.composite` then
+enforces matching dimensions and device instead of silently repairing them.
+
 The default UI loop, `BlitModelOutputToScreenLoop`, composites every model
 channel in list order as if they were image layers and reshapes the result into
-the session's layout. `SlangPyUILoop` is the alternative, for widgets drawn over
-the model output; it returns a `[1, C, H, W]` frame, so a session using it
-declares a `tchw` layout.
+the session's layout.
+
+`SlangPyUILoop` is the alternative for SlangPy's retained
+widget subset. `ImGuiUILoop` exposes the complete ImGui API. Both return a `[1, C, H, W]` frame, so an `ISession` using either should declare a `tchw` output layout.
 
 `IClientWindow` is both an `InputSource` and an `OutputSink`, so a window is
 written to with the same three calls as any sink: `open` with the session

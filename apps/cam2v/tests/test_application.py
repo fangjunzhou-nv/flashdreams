@@ -458,6 +458,11 @@ def test_slangpy_overlay_tracks_controls_and_model_status() -> None:
     """Keep immediate input display in UI-loop-owned state."""
     state = Cam2VUIState(total_blocks=4, target_fps=16, warmup_blocks=1)
     presentation_manager = PresentationManager()
+    presentation_manager.configure(
+        backpressure_mode=BackpressureMode.BLOCK,
+        stop=threading.Event(),
+        put_timeout=0.01,
+    )
     presentation_manager.publish(
         0,
         [
@@ -469,7 +474,7 @@ def test_slangpy_overlay_tracks_controls_and_model_status() -> None:
             )
         ],
     )
-    assert presentation_manager.advance(0)[0]
+    assert presentation_manager.advance(0, now=1.0)[0]
     ui = SimpleNamespace(
         screen=object(),
         Window=Mock(return_value=object()),
@@ -606,7 +611,7 @@ def test_slangpy_overlay_tracks_controls_and_model_status() -> None:
     assert not state.held_keys
     assert state.active_keys_widget.text == "Active keys: none"
 
-    assert presentation_manager.advance(0)[0]
+    assert presentation_manager.advance(0, now=1.1)[0]
     ui_loop.step(6, UserInputEvents([]))
     displayed = [widget.text for widget in state.status_widgets]
     assert "Presented: 2 frames (24 generated)" in displayed
@@ -618,6 +623,7 @@ def test_cam2v_session_registers_the_shared_slangpy_ui_loop() -> None:
         pipeline=_Pipeline(),
         session_desc=SessionDesc(
             output_layout=VideoTensorLayout.tchw,
+            backpressure_mode=BackpressureMode.BLOCK,
             presentation_mode=PresentationMode.CONTINUOUS,
             frames_per_second_for_step=16,
             video_width=8,

@@ -232,7 +232,8 @@ short ping comment.
   locally is the easiest way to avoid surprises.
 - Prefer small, well-named functions over long functions with comments
   explaining each block. Comments should explain *why*, not *what*.
-- Tests live in `flashdreams/tests/` and `integrations/*/tests/`. Use
+- Tests live in `flashdreams/tests/`, `integrations/*/tests/`, and
+  `integrations_v2/*/tests/`. Use
   `pytest` and prefer existing fixtures over hand-rolled setup. See
   [Testing](#testing) for marker requirements.
 - Every source file added by a contribution must include the SPDX
@@ -330,7 +331,7 @@ package name with `--package` to sync only that package's dependencies:
 uv sync --package flashdreams-omnidreams --extra dev
 
 # Run a script/test from that integration only
-uv run --package flashdreams-omnidreams pytest integrations/omnidreams/tests/ -m ci_gpu
+uv run --package flashdreams-omnidreams pytest integrations_v2/omnidreams/tests/ -m ci_gpu
 ```
 
 This avoids pulling in (and compiling) dependencies that other
@@ -346,12 +347,12 @@ Available integration packages:
 | `integrations/flashvsr` | `flashdreams-flashvsr` |
 | `integrations/hy_worldplay` | `flashdreams-hy-worldplay` |
 | `integrations/lingbot` | `flashdreams-lingbot` |
-| `integrations/omnidreams` | `flashdreams-omnidreams` |
+| `integrations_v2/omnidreams` | `flashdreams-omnidreams` |
 | `integrations/self_forcing` | `flashdreams-self-forcing` |
 | `integrations/wan21` | `flashdreams-wan21` |
 | `integrations/wan22` | `flashdreams-wan22` |
 
-The nested `integrations/omnidreams/ludus-renderer` workspace package is
+The nested `integrations_v2/omnidreams/impl/ludus-renderer` workspace package is
 named `ludus-renderer` and is installed as part of Omnidreams workflows
 that need it.
 

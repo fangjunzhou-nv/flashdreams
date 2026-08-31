@@ -23,8 +23,8 @@ if [[ "${FLASHDREAMS_RUN_FULL_BENCHMARK:-0}" == "1" ]]; then
 fi
 mkdir -p "$artifact_dir"
 
-uv run --project integrations/omnidreams --group test pytest \
-    integrations/omnidreams/benchmarks/test_modules.py \
+uv run --project integrations_v2/omnidreams --group test pytest \
+    integrations_v2/omnidreams/benchmarks/test_modules.py \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json="$artifact_dir/module.json"
 

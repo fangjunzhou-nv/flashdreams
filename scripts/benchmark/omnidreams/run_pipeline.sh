@@ -18,10 +18,11 @@ fi
 mkdir -p "$artifact_dir"
 
 uv run --package flashdreams-omnidreams python \
-    integrations/omnidreams/omnidreams_singleview/tools/sync_thirdparty.py sync
+    integrations_v2/omnidreams/impl/omnidreams_singleview/tools/sync_thirdparty.py sync
 
-uv run --project integrations/omnidreams --group test pytest \
-    integrations/omnidreams/benchmarks/test_pipeline.py \
+uv run --project integrations_v2/omnidreams --group test pytest \
+    integrations_v2/omnidreams/benchmarks/test_network.py \
+    integrations_v2/omnidreams/benchmarks/test_pipeline.py \
     -p no:manual_marker -m manual --benchmark-only -v "$@" \
     --benchmark-json="$artifact_dir/pipeline.json"
 

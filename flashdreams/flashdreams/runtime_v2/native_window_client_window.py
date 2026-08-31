@@ -25,6 +25,7 @@ from flashdreams.runtime_v2.session_desc import SessionDesc
 from flashdreams.runtime_v2.step_result import StepResult
 from flashdreams.runtime_v2.user_input_event import (
     CloseUserInputEvent,
+    GamepadUserInputEvent,
     KeyboardInputState,
     KeyboardUserInputEvent,
     MouseUserInputEvent,
@@ -65,6 +66,27 @@ _MODIFIER_KEY_NAMES = {
 }
 """Map physical SlangPy modifiers to browser ``KeyboardEvent.key`` values."""
 
+_STANDARD_GAMEPAD_BUTTON_BITS: tuple[int | None, ...] = (
+    1,  # A
+    2,  # B
+    3,  # X
+    4,  # Y
+    5,  # left bumper
+    6,  # right bumper
+    None,  # left trigger
+    None,  # right trigger
+    7,  # back
+    8,  # start
+    10,  # left stick
+    11,  # right stick
+    12,  # d-pad up
+    14,  # d-pad down
+    15,  # d-pad left
+    13,  # d-pad right
+    9,  # guide
+)
+"""SlangPy button bit indices in the browser standard-gamepad order."""
+
 
 class NativeWindowClientWindow(IClientWindow):
     """Present UI output through a main-thread GLFW window."""
@@ -97,7 +119,9 @@ class NativeWindowClientWindow(IClientWindow):
         self._close_event_enqueued = False
         self._presenter: _SlangPyNativeWindowPresenter | None = None
         self._poll_input_events: list[UserInputEvent] | None = None
-        self._pending_printable_keys: deque[tuple[str, int]] = deque()
+        self._pending_printable_keys: deque[tuple[str, KeyboardUserInputEvent]] = (
+            deque()
+        )
         self._pressed_key_values: dict[str, str] = {}
 
     def open(self, session_desc: SessionDesc) -> None:
@@ -126,6 +150,8 @@ class NativeWindowClientWindow(IClientWindow):
             presenter.set_input_callbacks(
                 on_keyboard_event=self._on_keyboard_event,
                 on_mouse_event=self._on_mouse_event,
+                on_gamepad_event=self._on_gamepad_event,
+                on_gamepad_state=self._on_gamepad_state,
             )
         except BaseException:
             presenter.close()
@@ -144,15 +170,27 @@ class NativeWindowClientWindow(IClientWindow):
         """Pump GLFW and return native input events not yet read."""
         presenter = self._presenter
         if presenter is not None:
+            pending_before_poll = tuple(self._pending_printable_keys)
             self._poll_input_events = []
             try:
                 presenter.process_events()
+                # ponytail: Text delayed by more than one poll can still arrive
+                # as a second press. Split physical and text runtime events if a
+                # client needs a longer coalescing window.
+                pending_to_flush = (
+                    tuple(self._pending_printable_keys)
+                    if presenter.should_close
+                    else pending_before_poll
+                )
+                for pending in pending_to_flush:
+                    if pending in self._pending_printable_keys:
+                        self._pending_printable_keys.remove(pending)
+                        self._put_input(pending[1])
                 if presenter.should_close:
                     self._on_window_closed()
                 polled_input_events = self._poll_input_events
             finally:
                 self._poll_input_events = None
-                self._pending_printable_keys.clear()
             for event in polled_input_events:
                 self._put_input(event)
 
@@ -221,23 +259,10 @@ class NativeWindowClientWindow(IClientWindow):
         if _is_keyboard_input(event):
             text = _keyboard_input_text(event)
             if text is not None:
-                poll_input_events = self._poll_input_events
-                if self._pending_printable_keys and poll_input_events is not None:
-                    physical_key, event_index = self._pending_printable_keys.pop()
+                if self._pending_printable_keys:
+                    physical_key, keyboard_event = self._pending_printable_keys.pop()
                     self._pressed_key_values[physical_key] = text
-                    poll_input_events[event_index] = KeyboardUserInputEvent(
-                        timestamp=uint64(0),
-                        key=text,
-                        state=KeyboardInputState.PRESSED,
-                    )
-                else:
-                    self._put_input(
-                        KeyboardUserInputEvent(
-                            timestamp=uint64(0),
-                            key=text,
-                            state=KeyboardInputState.PRESSED,
-                        )
-                    )
+                    self._put_input(replace(keyboard_event, key=text))
             return
 
         keyboard_event = _keyboard_event(event)
@@ -247,13 +272,7 @@ class NativeWindowClientWindow(IClientWindow):
             keyboard_event.state is KeyboardInputState.PRESSED
             and len(keyboard_event.key) == 1
         ):
-            poll_input_events = self._poll_input_events
-            if poll_input_events is not None:
-                event_index = len(poll_input_events)
-                self._put_input(keyboard_event)
-                self._pending_printable_keys.append((keyboard_event.key, event_index))
-            else:
-                self._put_input(keyboard_event)
+            self._pending_printable_keys.append((keyboard_event.key, keyboard_event))
             return
         if (
             keyboard_event.state is KeyboardInputState.RELEASED
@@ -269,6 +288,7 @@ class NativeWindowClientWindow(IClientWindow):
             )
             if pending_key is not None:
                 self._pending_printable_keys.remove(pending_key)
+                self._put_input(pending_key[1])
             key = self._pressed_key_values.pop(keyboard_event.key, keyboard_event.key)
             self._put_input(
                 KeyboardUserInputEvent(
@@ -289,6 +309,14 @@ class NativeWindowClientWindow(IClientWindow):
         )
         if mouse_event is not None:
             self._put_input(mouse_event)
+
+    def _on_gamepad_event(self, event: spy.GamepadEvent) -> None:
+        gamepad_event = _gamepad_connection_event(event)
+        if gamepad_event is not None:
+            self._put_input(gamepad_event)
+
+    def _on_gamepad_state(self, state: spy.GamepadState) -> None:
+        self._put_input(_gamepad_state_event(state))
 
     def _on_window_closed(self) -> None:
         if self._close_event_enqueued:
@@ -341,18 +369,26 @@ class _SlangPyNativeWindowPresenter:
             raise
         self._keyboard_event_callback: Callable[[spy.KeyboardEvent], None] | None = None
         self._mouse_event_callback: Callable[[spy.MouseEvent], None] | None = None
+        self._gamepad_event_callback: Callable[[spy.GamepadEvent], None] | None = None
+        self._gamepad_state_callback: Callable[[spy.GamepadState], None] | None = None
         self._window.on_keyboard_event = self._on_keyboard_event
         self._window.on_mouse_event = self._on_mouse_event
+        self._window.on_gamepad_event = self._on_gamepad_event
+        self._window.on_gamepad_state = self._on_gamepad_state
 
     def set_input_callbacks(
         self,
         *,
         on_keyboard_event: Callable[[spy.KeyboardEvent], None] | None = None,
         on_mouse_event: Callable[[spy.MouseEvent], None] | None = None,
+        on_gamepad_event: Callable[[spy.GamepadEvent], None] | None = None,
+        on_gamepad_state: Callable[[spy.GamepadState], None] | None = None,
     ) -> None:
         """Bind runtime input callbacks to the SlangPy window."""
         self._keyboard_event_callback = on_keyboard_event
         self._mouse_event_callback = on_mouse_event
+        self._gamepad_event_callback = on_gamepad_event
+        self._gamepad_state_callback = on_gamepad_state
 
     @property
     def should_close(self) -> bool:
@@ -376,8 +412,27 @@ class _SlangPyNativeWindowPresenter:
         if self._closed:
             return
         self._closed = True
-        self._presentation.close()
-        self._window.close()
+        window = self._window
+        presentation = self._presentation
+
+        # SlangPy keeps the assigned bound methods alive. Clear them before
+        # releasing the presentation context so the window cannot retain this
+        # presenter, its CUDA-mapped Torch tensor, and the backing SGL device
+        # in a reference cycle until interpreter shutdown.
+        window.on_keyboard_event = None
+        window.on_mouse_event = None
+        window.on_gamepad_event = None
+        window.on_gamepad_state = None
+        self._keyboard_event_callback = None
+        self._mouse_event_callback = None
+        self._gamepad_event_callback = None
+        self._gamepad_state_callback = None
+        self._presentation = cast(Any, None)
+
+        try:
+            presentation.close()
+        finally:
+            window.close()
 
     def _on_keyboard_event(self, event: spy.KeyboardEvent) -> None:
         """Forward one keyboard event to the runtime callback."""
@@ -388,6 +443,16 @@ class _SlangPyNativeWindowPresenter:
         """Forward one mouse event to the runtime callback."""
         if self._mouse_event_callback is not None:
             self._mouse_event_callback(event)
+
+    def _on_gamepad_event(self, event: spy.GamepadEvent) -> None:
+        """Forward one gamepad lifecycle or button event."""
+        if self._gamepad_event_callback is not None:
+            self._gamepad_event_callback(event)
+
+    def _on_gamepad_state(self, state: spy.GamepadState) -> None:
+        """Forward one gamepad state snapshot."""
+        if self._gamepad_state_callback is not None:
+            self._gamepad_state_callback(state)
 
 
 class _PresentationContext:
@@ -455,7 +520,22 @@ class _PresentationContext:
 
     def close(self) -> None:
         """Wait for pending presentation work before releasing resources."""
-        self._device.wait_for_idle()
+        device = self._device
+        if device is None:
+            return
+        device.wait_for_idle()
+
+        # The Torch tensor is an external-memory view owned by the SlangPy
+        # buffer. Destroy the view first, followed by its backing resources and
+        # finally the device. Letting the cycle reach Py_Finalize reverses this
+        # relationship and can terminate inside sgl.dll on Windows.
+        self._cuda_rgba = None
+        self._cuda_buffer = None
+        self._display_texture = cast(Any, None)
+        self._surface = cast(Any, None)
+        self._device = cast(Any, None)
+        self._render_device = torch.device("cpu")
+        self._has_cuda_submission = False
 
     def _frame_on_render_device(self, frame: Tensor) -> Tensor:
         """Return ``frame`` on the device owned by this context."""
@@ -652,6 +732,69 @@ def _mouse_event(
             wheel_y=wheel_y,
         )
     return None
+
+
+def _gamepad_connection_event(
+    event: spy.GamepadEvent,
+) -> GamepadUserInputEvent | None:
+    if event.is_connect():
+        action = "connected"
+    elif event.is_disconnect():
+        action = "disconnected"
+    else:
+        return None
+    return GamepadUserInputEvent(
+        timestamp=uint64(0),
+        action=action,
+        index=0,
+        mapping="standard",
+    )
+
+
+def _gamepad_state_event(state: spy.GamepadState) -> GamepadUserInputEvent:
+    axes = tuple(
+        _clamp(float(value), low=-1.0, high=1.0)
+        for value in (state.left_x, state.left_y, state.right_x, state.right_y)
+    )
+    # SlangPy reports trigger axes in [-1, 1]; gamepad buttons use [0, 1].
+    left_trigger, right_trigger = (
+        (_clamp(float(value), low=-1.0, high=1.0) + 1.0) / 2.0
+        for value in (state.left_trigger, state.right_trigger)
+    )
+    button_bits = int(state.buttons)
+    pressed = tuple(
+        (
+            left_trigger > 0.0
+            if index == 6
+            else right_trigger > 0.0
+            if index == 7
+            else bit is not None and bool(button_bits & (1 << bit))
+        )
+        for index, bit in enumerate(_STANDARD_GAMEPAD_BUTTON_BITS)
+    )
+    buttons = tuple(
+        (
+            left_trigger
+            if index == 6
+            else right_trigger
+            if index == 7
+            else float(pressed[index])
+        )
+        for index in range(len(_STANDARD_GAMEPAD_BUTTON_BITS))
+    )
+    return GamepadUserInputEvent(
+        timestamp=uint64(0),
+        action="state",
+        index=0,
+        mapping="standard",
+        axes=axes,
+        buttons=buttons,
+        pressed=pressed,
+    )
+
+
+def _clamp(value: float, *, low: float, high: float) -> float:
+    return min(high, max(low, value))
 
 
 __all__ = ["NativeWindowClientWindow"]

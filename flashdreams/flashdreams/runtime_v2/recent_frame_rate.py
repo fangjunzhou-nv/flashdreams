@@ -81,9 +81,10 @@ class RecentFrameRateSnapshot:
         )
         if not recent:
             return 0.0
-        return sum(item.frame_count for item in recent) / sum(
-            item.elapsed_s for item in recent
-        )
+        elapsed_s = sum(item.elapsed_s for item in recent)
+        if elapsed_s == 0.0:
+            return math.inf
+        return sum(item.frame_count for item in recent) / elapsed_s
 
 
 class RecentFrameRateTracker:
@@ -133,8 +134,8 @@ class RecentFrameRateTracker:
         elapsed_s = float(elapsed_s)
         if not math.isfinite(completed_at):
             raise ValueError("completed_at must be finite.")
-        if not math.isfinite(elapsed_s) or elapsed_s <= 0.0:
-            raise ValueError("elapsed_s must be finite and > 0.")
+        if not math.isfinite(elapsed_s) or elapsed_s < 0.0:
+            raise ValueError("elapsed_s must be finite and >= 0.")
         if self._observations and completed_at < self._observations[-1].completed_at:
             raise ValueError("completed_at must not precede the latest observation.")
 

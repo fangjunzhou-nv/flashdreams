@@ -33,8 +33,6 @@ def _runner_config(
     launch_capability = None
     if runner_name.startswith("lingbot-world"):
         launch_capability = "lingbot.launch:LAUNCH_CAPABILITY"
-    elif runner_name == "omnidreams" or runner_name.startswith("omnidreams-"):
-        launch_capability = "omnidreams.launch:LAUNCH_CAPABILITY"
     pipeline = SimpleNamespace(
         name=pipeline_name or runner_name,
         diffusion_model=SimpleNamespace(
@@ -128,84 +126,6 @@ def test_lingbot_launch_rejects_unknown_integration_fields() -> None:
             mode="webrtc",
             options=LaunchOptions(scenario={"typo": True}),
         )
-
-
-def test_omnidreams_webrtc_is_rejected_for_multi_view() -> None:
-    config = _runner_config(
-        runner_name="omnidreams-mv-2steps-chunk4-loc8-pshuffle-lighttae",
-        num_views=4,
-    )
-
-    assert available_launch_modes(config) == ("run", "mp4", "null")
-    with pytest.raises(
-        LaunchModeUnavailableError,
-        match="Supported modes: run, mp4, null",
-    ):
-        resolve_launch(config, mode="webrtc")
-
-
-def test_omnidreams_webrtc_honors_explicit_network_precedence() -> None:
-    resolved = resolve_launch(
-        _runner_config(
-            runner_name="omnidreams",
-        ),
-        mode="webrtc",
-        options=LaunchOptions(
-            host="127.0.0.1",
-            port=9011,
-            output={"host": "0.0.0.0", "port": 8082},
-        ),
-    )
-
-    assert resolved.summary["host"] == "127.0.0.1"
-    assert resolved.summary["port"] == 9011
-
-
-def test_omnidreams_mp4_short_slug_uses_default_output_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from omnidreams.demo import app
-
-    calls: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        app, "launch_from_runner", lambda **kwargs: calls.append(kwargs)
-    )
-    config = _runner_config(
-        runner_name="omnidreams",
-        pipeline_name="omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae",
-    )
-
-    resolved = resolve_launch(config, mode="mp4")
-
-    assert resolved.summary == {
-        "runner": "omnidreams",
-        "mode": "mp4",
-        "device": "cuda:1",
-        "output_path": Path("outputs/omnidreams.mp4"),
-    }
-    resolved.launch()
-    assert calls[0]["config"] is config
-    assert calls[0]["mode"] == "mp4"
-    assert calls[0]["output"] == {"path": Path("outputs/omnidreams.mp4")}
-
-
-def test_omnidreams_local_window_accepts_legacy_world_manifest() -> None:
-    config = _runner_config(
-        runner_name="omnidreams-perf",
-        pipeline_name="omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-perf",
-    )
-    manifest = Path("custom.yaml")
-    options = LaunchOptions(legacy_world_manifest=manifest)
-
-    assert available_launch_modes(config, options) == (
-        "run",
-        "mp4",
-        "null",
-        "webrtc",
-        "local-window",
-    )
-    resolved = resolve_launch(config, mode="local-window", options=options)
-    assert resolved.summary["world_model_manifest"] == manifest
 
 
 def test_capabilities_extend_launch_without_shared_routing_changes(

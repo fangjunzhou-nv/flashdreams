@@ -440,10 +440,10 @@ def test_shipped_one_minute_demo_scenarios_load(tmp_path: Path) -> None:
         context=_render_context(tmp_path, scenario_id=lingbot.id)
     )
     assert "--output-dir" not in rendered
-    assert _command_value(rendered, "--output.path") == str(
+    assert Path(_command_value(rendered, "--output.path")) == (
         tmp_path / lingbot.id / "lingbot-world-fast-taehv-one-minute.mp4"
     )
-    assert _command_value(rendered, "--output.stats-path") == str(
+    assert Path(_command_value(rendered, "--output.stats-path")) == (
         tmp_path / lingbot.id / "stats_lingbot_world_fast_taehv_one_minute.json"
     )
 
@@ -453,7 +453,7 @@ def test_shipped_one_minute_demo_scenarios_load(tmp_path: Path) -> None:
         "uv",
         "run",
         "--project",
-        "integrations/omnidreams",
+        "integrations_v2/omnidreams",
         "python",
         "-m",
         "tools.benchmarks.strict_run",
@@ -470,60 +470,6 @@ def test_shipped_one_minute_demo_scenarios_load(tmp_path: Path) -> None:
     assert "--pipeline.diffusion-model.seed" in omnidreams.command
     assert omnidreams.warmup_steps == 4
     assert omnidreams.requires_runtime_stats is True
-
-
-def test_shipped_omnidreams_demo_replay_scenarios_load() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    scenarios = load_scenario_file(
-        repo_root / "configs" / "omnidreams_demo_replay_benchmarks.json"
-    )
-
-    assert set(scenarios) == {
-        "omnidreams-sv-runner-baseline",
-        "omnidreams-sv-demo-replay",
-    }
-
-    baseline = scenarios["omnidreams-sv-runner-baseline"]
-    assert baseline.report_group is not None
-    assert baseline.report_group.id == "omnidreams-demo"
-    assert _command_value(baseline.command, "--total-blocks") == "226"
-    assert "omnidreams" in baseline.command
-    assert "omnidreams-perf" not in baseline.command
-    assert baseline.warmup_steps == 1
-    assert baseline.quality_baseline_compare is False
-
-    demo = scenarios["omnidreams-sv-demo-replay"]
-    assert demo.output_dir_arg is None
-    assert demo.command[:5] == (
-        "uv",
-        "run",
-        "--project",
-        "integrations/omnidreams",
-        "flashdreams-run",
-    )
-    assert demo.command[5:7] == ("omnidreams", "mp4")
-    assert "omnidreams-demo" not in demo.command
-    assert _command_value(demo.command, "--scenario.example-data") == "true"
-    assert _command_value(demo.command, "--scenario.total-blocks") == "226"
-    assert _command_value(demo.command, "--output.path") == (
-        "{output_dir}/omnidreams-sv-demo-replay.mp4"
-    )
-    assert _command_value(demo.command, "--output.stats-path") == (
-        "{output_dir}/stats_omnidreams_sv_demo_replay.json"
-    )
-    assert demo.warmup_steps == 4
-    assert demo.requires_runtime_stats is True
-    rendered = demo.rendered_command(
-        context=_render_context(repo_root, scenario_id=demo.id)
-    )
-    assert "--output-dir" not in rendered
-    assert _command_value(rendered, "--output.path") == str(
-        repo_root / demo.id / "omnidreams-sv-demo-replay.mp4"
-    )
-    assert "omnidreams-sv-2steps-chunk2-loc6-lightvae-lighttae-perf" not in (
-        demo.command
-    )
-    assert demo.quality_baseline_compare is False
 
 
 def test_shipped_deterministic_quality_scenarios_load(tmp_path: Path) -> None:
@@ -543,7 +489,7 @@ def test_shipped_deterministic_quality_scenarios_load(tmp_path: Path) -> None:
         "uv",
         "run",
         "--project",
-        "integrations/omnidreams",
+        "integrations_v2/omnidreams",
         "python",
         "-m",
         "tools.benchmarks.strict_run",
@@ -594,7 +540,7 @@ def test_shipped_deterministic_quality_scenarios_load(tmp_path: Path) -> None:
         context=_render_context(tmp_path, scenario_id=lingbot.id)
     )
     assert "--output-dir" not in rendered_lingbot
-    assert _command_value(rendered_lingbot, "--output.path") == str(
+    assert Path(_command_value(rendered_lingbot, "--output.path")) == (
         tmp_path / lingbot.id / "lingbot-world-fast-taehv-quality-smoke.mp4"
     )
     assert lingbot.report_group is not None
@@ -690,7 +636,7 @@ def test_shipped_v2_model_scenarios_load(tmp_path: Path) -> None:
         context=_render_context(tmp_path, scenario_id=quality.id)
     )
     assert "--output-dir" not in rendered
-    assert _command_value(rendered, "--output-path") == str(
+    assert Path(_command_value(rendered, "--output-path")) == (
         tmp_path / quality.id / f"{quality.id}.mp4"
     )
 
@@ -1635,7 +1581,7 @@ def test_quality_baseline_can_be_disabled_per_scenario(tmp_path: Path) -> None:
         "quality_baseline_compare is disabled for this scenario"
     )
     assert review_result["candidate_video"] == "scenarios/review-runner/review.mp4"
-    assert review_result["baseline_video"] == str(baseline_video.resolve())
+    assert Path(review_result["baseline_video"]) == baseline_video.resolve()
     assert "metrics_path" not in review_result
     assert "quality_score" not in scenario_manifest["metric_summary"]
     assert not (
